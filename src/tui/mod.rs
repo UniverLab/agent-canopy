@@ -14,6 +14,7 @@ mod event;
 mod gamification;
 pub(crate) mod mcp_client;
 pub(crate) mod prompt_templates;
+pub(crate) mod selection;
 pub(crate) mod terminal_history;
 mod ui;
 mod whimsg;

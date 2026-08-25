@@ -354,6 +354,7 @@ mod tests {
     fn make_running_loop(id: &str) -> Loop {
         Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: id.to_string(),
             name: format!("loop-{id}"),
             description: None,

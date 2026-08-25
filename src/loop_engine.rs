@@ -18,6 +18,13 @@ use crate::domain::models::Cli;
 // Five bounces of the same (spec,node) pair is enough signal that a spec
 // needs a human or a redesign; ten burned entire quota windows ping-ponging.
 const DEFAULT_MAX_ITERATIONS_PER_NODE: usize = 5;
+/// Default cross-run attempt budget (C19): how many separate loop executions
+/// a spec may fail with a genuine verdict before the loop is marked blocked
+/// instead of quietly costing another quota window on relaunch. Deliberately
+/// lower than [`DEFAULT_MAX_ITERATIONS_PER_NODE`] — these are whole attempts
+/// (one per relaunch), not node cycles within a single one. Overridable via
+/// [`LoopEngine::with_spec_attempt_limit`] (`CanopyConfig::spec_attempt_limit`).
+const DEFAULT_MAX_SPEC_ATTEMPTS: usize = 3;
 const DEFAULT_INFRA_RETRY_LIMIT: u32 = 2;
 const DEFAULT_INFRA_CRASH_MAX_SECONDS: u64 = 60;
 const DEFAULT_INFRA_BACKOFF_SECONDS: u64 = 30;
@@ -45,6 +52,8 @@ pub struct LoopEngine {
     /// degrades to a WARN + note per skill, exactly like a store that's
     /// there but can't reach its sources.
     dynamic_skills: Option<Arc<crate::dynamic_skills::SkillStore>>,
+    /// Cross-run attempt budget (C19) — see [`DEFAULT_MAX_SPEC_ATTEMPTS`].
+    spec_attempt_limit: usize,
 }
 
 /// Where a spec's sequential graph cursor currently is: at a single ordinary
@@ -80,6 +89,16 @@ enum SpecExecutionOutcome {
     /// terminated it (a newer attempt, or the dispatch that won the loop
     /// claim after a reset) is what now drives the loop.
     Superseded,
+    /// C19: this spec has now failed with a genuine verdict often enough,
+    /// across separate loop executions, to exceed its persisted cross-run
+    /// attempt budget ([`LoopEngine::spec_attempt_limit`]). Unlike `Failed`,
+    /// which invites another relaunch, this converts the dispatch's outcome
+    /// into a paused, human-visible blocker — see
+    /// [`LoopEngine::block_loop`] — so an unsatisfiable spec stops quietly
+    /// costing another quota window on every reset. The `String` is the
+    /// blocker text, naming the spec, the attempt count, and the last
+    /// failure.
+    Blocked(String),
 }
 
 struct NodeExecution {
@@ -113,6 +132,7 @@ impl LoopEngine {
             notification_service,
             ensemble_concurrency: Arc::new(Semaphore::new(DEFAULT_ENSEMBLE_CONCURRENCY_CAP)),
             dynamic_skills: None,
+            spec_attempt_limit: DEFAULT_MAX_SPEC_ATTEMPTS,
         }
     }
 
@@ -122,6 +142,15 @@ impl LoopEngine {
     /// forever.
     pub fn with_ensemble_concurrency_cap(mut self, cap: usize) -> Self {
         self.ensemble_concurrency = Arc::new(Semaphore::new(cap.max(1)));
+        self
+    }
+
+    /// Override the default cross-run attempt budget (C19) — e.g. from
+    /// `CanopyConfig::spec_attempt_limit` at daemon startup. `limit` is
+    /// floored at 1 so a misconfigured `0` can't block every spec on its
+    /// very first genuine failure.
+    pub fn with_spec_attempt_limit(mut self, limit: usize) -> Self {
+        self.spec_attempt_limit = limit.max(1);
         self
     }
 
@@ -408,6 +437,10 @@ impl LoopEngine {
                                     )?;
                                     return Ok(());
                                 }
+                                SpecExecutionOutcome::Blocked(blocker) => {
+                                    self.block_loop(&loop_id, Some(claimed_at), &blocker)?;
+                                    return Ok(());
+                                }
                             }
                         }
                     }
@@ -444,11 +477,58 @@ impl LoopEngine {
                             self.fail_loop(&loop_id, Some(claimed_at), Some(&spec.name), &summary)?;
                             return Ok(());
                         }
+                        SpecExecutionOutcome::Blocked(blocker) => {
+                            self.block_loop(&loop_id, Some(claimed_at), &blocker)?;
+                            return Ok(());
+                        }
                     }
                 }
             }
             None => {
+                // A terminal (Completed/Failed/Skipped) placeholder a PRIOR
+                // spec-less dispatch left behind is purged before deciding
+                // whether THIS dispatch needs a fresh one — never a
+                // still-live one (Pending/Running/Interrupted), which is
+                // exactly the row a resume of that same attempt needs to
+                // find via `list_loop_specs` below. Deferring the purge to
+                // here (the start of the NEXT dispatch) rather than doing it
+                // the moment the prior attempt finished is what lets that
+                // attempt's `loop_runs` history survive long enough to be
+                // inspected (`loop_get`/`loop_node_runs_list`) — deleting it
+                // immediately would cascade its `loop_runs` rows away (FK
+                // `ON DELETE CASCADE`) before anyone could look.
                 for spec in self.db.list_loop_specs(&loop_id)? {
+                    if is_no_spec_placeholder(&spec)
+                        && matches!(
+                            spec.status,
+                            LoopSpecStatus::Completed
+                                | LoopSpecStatus::Failed
+                                | LoopSpecStatus::Skipped
+                        )
+                    {
+                        self.db.delete_loop_spec(&spec.id)?;
+                    }
+                }
+
+                let mut specs = self.db.list_loop_specs(&loop_id)?;
+                // `empty_launch_check` already established this loop has a
+                // top-level graph to fall back on (it's the only way this
+                // dispatch got past it with zero bound specs), so give this
+                // attempt a single placeholder spec to run against — every
+                // per-spec mechanic below (the NOT NULL `loop_runs.spec_id`
+                // FK, resumability, `spec_start_head`) needs a real
+                // `loop_specs` row to hang off of, and this is the one place
+                // in the whole dispatch that knows "zero bound specs" just
+                // meant "no spec was ever attached", not "nothing to run".
+                // See `no_spec_placeholder` for why its blank name is what
+                // makes `{{spec_content}}`/`{{spec_name}}` resolve to ""
+                // instead of leaking a fabricated spec into the prompt.
+                if specs.is_empty() {
+                    let placeholder = no_spec_placeholder(&loop_id);
+                    self.db.insert_loop_spec(&placeholder)?;
+                    specs = vec![placeholder];
+                }
+                for spec in specs {
                     if self.is_paused(&loop_id)? {
                         return Ok(());
                     }
@@ -469,6 +549,10 @@ impl LoopEngine {
                         }
                         SpecExecutionOutcome::Failed(summary) => {
                             self.fail_loop(&loop_id, Some(claimed_at), Some(&spec.name), &summary)?;
+                            return Ok(());
+                        }
+                        SpecExecutionOutcome::Blocked(blocker) => {
+                            self.block_loop(&loop_id, Some(claimed_at), &blocker)?;
                             return Ok(());
                         }
                     }
@@ -657,13 +741,14 @@ impl LoopEngine {
     ///
     /// Emptiness is defined per launch mode:
     /// - Bound specs (`queue_id` is `None`): the loop has *zero* specs bound
-    ///   to it at all — mirrors the incident exactly (a loop whose specs all
-    ///   live in a queue has no bound specs). Deliberately not "every bound
-    ///   spec is already completed/skipped" — a loop's own bound specs
-    ///   belong to it 1:1, so if they're all done the loop genuinely is
-    ///   finished (see the zero-execution completion path in
-    ///   `run_loop_dispatch`, which still completes but never fires the
-    ///   hook).
+    ///   to it AND *zero* top-level graph nodes to fall back on. A graph is a
+    ///   runnable thing on its own (the 2026-08-19 report): a loop with no
+    ///   specs but a real top-level graph still has something to execute, so
+    ///   it is not empty. Deliberately not "every bound spec is already
+    ///   completed/skipped" — a loop's own bound specs belong to it 1:1, so
+    ///   if they're all done the loop genuinely is finished (see the
+    ///   zero-execution completion path in `run_loop_dispatch`, which still
+    ///   completes but never fires the hook).
     /// - A queue (`queue_id` is `Some`): the queue has no `pending` member *and*
     ///   no other non-terminal (`running`/`failed`) member left either — i.e.
     ///   [`Database::queue_has_incomplete_members`] is false. Unlike bound
@@ -671,7 +756,8 @@ impl LoopEngine {
     ///   easily point at by mistake, so "every member already done" is
     ///   treated as an error here rather than a silent, do-nothing
     ///   completion (regression (b): a queue run where every member is
-    ///   already completed).
+    ///   already completed). Unaffected by the spec-less carve-out above —
+    ///   a queue run always needs actual queue members.
     pub fn empty_launch_check(
         &self,
         loop_id: &str,
@@ -686,7 +772,10 @@ impl LoopEngine {
 
         let is_empty = match queue_id {
             Some(queue_id) => !self.db.queue_has_incomplete_members(queue_id)?,
-            None => self.db.list_loop_specs(loop_id)?.is_empty(),
+            None => {
+                self.db.list_loop_specs(loop_id)?.is_empty()
+                    && self.db.list_loop_nodes_for_loop(loop_id)?.is_empty()
+            }
         };
         if !is_empty {
             return Ok(None);
@@ -879,6 +968,27 @@ impl LoopEngine {
             head
         };
 
+        // C15: `spec_committed_head` follows the exact same same-attempt-vs-
+        // fresh-attempt rule as `spec_start_head` above — a genuine resume of
+        // this same in-flight attempt keeps whatever this attempt already
+        // recorded (a commit the committer made before a daemon restart must
+        // still count), while every other case (including a spec stuck
+        // `running` from an abandoned prior attempt) starts fresh so a stale
+        // committed-head from an unrelated earlier attempt can never pass a
+        // check for an attempt that hasn't committed anything itself yet.
+        //
+        // Unlike `spec_start_head`, this is *not* frozen for the whole
+        // attempt: it is updated in place (both here and in the DB, kept in
+        // sync) every time a `commit_rights: true` node's own execution
+        // moves HEAD, so a check node placed anywhere after the committer
+        // sees the latest value.
+        let mut spec_committed_head = if is_resume && spec.status == LoopSpecStatus::Running {
+            spec_details.spec.spec_committed_head.clone()
+        } else {
+            self.db.set_loop_spec_committed_head(&spec.id, None)?;
+            None
+        };
+
         self.db.update_loop_spec_status(
             &spec.id,
             LoopSpecStatus::Running,
@@ -952,6 +1062,28 @@ impl LoopEngine {
                     spec.name,
                     cursor_label(&cursor, &ensembles)
                 );
+                // C19: every bounce that grew this counter was a genuine
+                // fail-edge routing decision, not an in-flight infra retry
+                // (those never touch `iterations` — see its increment
+                // above) — so reaching the per-node budget always reflects
+                // repeated real verdicts, never pure infrastructure noise.
+                if let Some(blocker) = self.record_spec_attempt(spec, &summary, false)? {
+                    if let Some(run) = self.db.list_loop_runs_for_spec(&spec.id)?.last() {
+                        self.set_run_blocker(
+                            &run.id,
+                            run.status,
+                            run.output.as_ref().unwrap_or(&serde_json::json!({})),
+                            &blocker,
+                        )?;
+                    }
+                    self.db.update_loop_spec_status(
+                        &spec.id,
+                        LoopSpecStatus::Failed,
+                        None,
+                        Some(chrono::Utc::now()),
+                    )?;
+                    return Ok(SpecExecutionOutcome::Blocked(blocker));
+                }
                 self.db.update_loop_spec_status(
                     &spec.id,
                     LoopSpecStatus::Failed,
@@ -1057,6 +1189,18 @@ impl LoopEngine {
                     )
                     .await;
 
+                    // C15: mirror of the watch above, but for the node the
+                    // graph actually trusts to commit rather than every node
+                    // that must not. Captured only when this node carries
+                    // `commit_rights: true` — otherwise there is nothing to
+                    // attribute a HEAD move to, so `spec_committed_head`
+                    // stays whatever it already was.
+                    let committer_head_before = if node_has_commit_rights(node) {
+                        capture_workdir_head(workdir).await
+                    } else {
+                        None
+                    };
+
                     let (final_execution, run) = loop {
                         let execution = self
                             .execute_node(
@@ -1065,6 +1209,7 @@ impl LoopEngine {
                                 node,
                                 previous_output.as_ref(),
                                 spec_start_head.as_deref(),
+                                spec_committed_head.as_deref(),
                                 &run_id,
                                 workdir,
                                 resume_candidate.as_deref(),
@@ -1204,6 +1349,26 @@ impl LoopEngine {
                         None => final_execution,
                     };
 
+                    // C15: if this node carries commit rights and its own
+                    // execution moved HEAD, that new HEAD is evidence this
+                    // *run* itself committed — record it regardless of the
+                    // node's own pass/fail verdict (an infra crash right
+                    // after a successful commit still leaves the commit
+                    // behind, and it must still count). Persisted eagerly so
+                    // a daemon restart before the next node dispatches never
+                    // loses it, and kept in sync with the in-memory value
+                    // handed to every check node from here on in this
+                    // dispatch.
+                    if let Some(head_before) = committer_head_before.as_deref() {
+                        if let Some(head_after) = capture_workdir_head(workdir).await {
+                            if head_after != head_before {
+                                self.db
+                                    .set_loop_spec_committed_head(&spec.id, Some(&head_after))?;
+                                spec_committed_head = Some(head_after);
+                            }
+                        }
+                    }
+
                     if self.is_paused(&lp.id)? {
                         return Ok(SpecExecutionOutcome::Paused);
                     }
@@ -1337,6 +1502,31 @@ impl LoopEngine {
                     });
                 }
                 None => {
+                    // C19: this dead-end Fail is what just ended the
+                    // attempt — check it directly for the infra markers
+                    // `is_infra_crash`/`agent_finished_execution` already
+                    // write, rather than re-deriving "did an agent actually
+                    // produce a verdict".
+                    let is_infra = execution_is_infra_failure(&final_execution.output);
+                    if let Some(blocker) =
+                        self.record_spec_attempt(spec, &final_execution.summary, is_infra)?
+                    {
+                        if let Some(terminal_run_id) = run_id.as_deref() {
+                            self.set_run_blocker(
+                                terminal_run_id,
+                                final_execution.status,
+                                &final_execution.output,
+                                &blocker,
+                            )?;
+                        }
+                        self.db.update_loop_spec_status(
+                            &spec.id,
+                            LoopSpecStatus::Failed,
+                            None,
+                            Some(chrono::Utc::now()),
+                        )?;
+                        return Ok(SpecExecutionOutcome::Blocked(blocker));
+                    }
                     self.db.update_loop_spec_status(
                         &spec.id,
                         LoopSpecStatus::Failed,
@@ -1384,6 +1574,70 @@ impl LoopEngine {
         self.db
             .update_loop_run_result(run_id, final_execution.status, Some(&output), None)?;
         Ok(())
+    }
+
+    /// Overwrite (not merge-and-preserve, unlike [`Self::record_terminal_blocker`])
+    /// `run_id`'s `output.blocker` with C19's cross-run budget text. Called
+    /// only once [`Self::record_spec_attempt`] has confirmed the budget is
+    /// actually exceeded, at which point this attempt's blocker is strictly
+    /// more informative than whatever dead-end text (if any) is already
+    /// there — naming the spec, the attempt count, and the last failure
+    /// rather than just this one node.
+    fn set_run_blocker(
+        &self,
+        run_id: &str,
+        status: LoopRunStatus,
+        output: &Value,
+        blocker: &str,
+    ) -> Result<()> {
+        let mut merged = output.clone();
+        match merged.as_object_mut() {
+            Some(map) => {
+                map.insert("blocker".to_string(), Value::String(blocker.to_string()));
+            }
+            None => merged = serde_json::json!({ "blocker": blocker }),
+        }
+        self.db
+            .update_loop_run_result(run_id, status, Some(&merged), None)?;
+        Ok(())
+    }
+
+    /// C19: called from [`Self::run_spec`] every time a spec is about to end
+    /// this attempt as `Failed`, with `is_infra_failure` (from
+    /// [`execution_is_infra_failure`]) telling it whether the terminating
+    /// execution reflects a genuine verdict or an infrastructure failure
+    /// that never produced one — an infra failure touches nothing and
+    /// returns `None` immediately.
+    ///
+    /// A genuine failure increments the spec's own persisted
+    /// `cross_run_attempts` counter (`loop_specs.cross_run_attempts`) —
+    /// unlike the per-node `iterations` map `run_spec` builds fresh on every
+    /// call, this survives `loop_reset`, a relaunch, and a daemon restart,
+    /// which is the entire point: an unsatisfiable spec must not get a
+    /// fresh budget every time an operator resets and relaunches after a
+    /// quota failure. Once the count reaches `self.spec_attempt_limit`,
+    /// returns `Some(blocker text)` naming the spec, the attempt count, and
+    /// `summary` (the last failure) — the caller is responsible for
+    /// recording it and converting this attempt's outcome to `Blocked`
+    /// instead of `Failed`.
+    fn record_spec_attempt(
+        &self,
+        spec: &LoopSpec,
+        summary: &str,
+        is_infra_failure: bool,
+    ) -> Result<Option<String>> {
+        if is_infra_failure {
+            return Ok(None);
+        }
+        let attempts = self.db.increment_loop_spec_cross_run_attempts(&spec.id)?;
+        if (attempts as usize) < self.spec_attempt_limit {
+            return Ok(None);
+        }
+        Ok(Some(format!(
+            "Spec '{}' failed {} time(s) across separate loop executions (limit {}); last \
+             failure: {}",
+            spec.name, attempts, self.spec_attempt_limit, summary
+        )))
     }
 
     /// Run an ensemble's members concurrently (F1), wait for every one of
@@ -1731,7 +1985,6 @@ impl LoopEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     async fn execute_node(
         &self,
         lp: &crate::domain::loops::Loop,
@@ -1739,6 +1992,7 @@ impl LoopEngine {
         node: &LoopNode,
         previous_output: Option<&Value>,
         spec_start_head: Option<&str>,
+        spec_committed_head: Option<&str>,
         run_id: &str,
         workdir: &str,
         resume_session_id: Option<&str>,
@@ -1746,7 +2000,17 @@ impl LoopEngine {
     ) -> Result<NodeExecution> {
         match node.kind {
             LoopNodeKind::Check => {
-                execute_check_node(&self.db, run_id, lp, spec, node, spec_start_head, workdir).await
+                execute_check_node(
+                    &self.db,
+                    run_id,
+                    lp,
+                    spec,
+                    node,
+                    spec_start_head,
+                    spec_committed_head,
+                    workdir,
+                )
+                .await
             }
             LoopNodeKind::Gate => execute_gate_node(node, previous_output),
             LoopNodeKind::Agent => {
@@ -1863,11 +2127,11 @@ impl LoopEngine {
     }
 
     /// Notify that `loop_id` has become blocked on a node needing human
-    /// intervention (`loop_report_blocker`). This is the only "loop
-    /// finished" case not driven from within [`Self::run_loop_dispatch`] —
-    /// the daemon's `loop_report_blocker` tool owns the actual state
-    /// transition (pausing the loop, recording the blocker on the run) and
-    /// calls this to fire the matching notification.
+    /// intervention. Called both by the daemon's `loop_report_blocker` tool
+    /// (which owns that state transition itself — pausing the loop,
+    /// recording the blocker on the run) and by [`Self::block_loop`] (C19),
+    /// so there is one notification path for every way a loop can end up
+    /// blocked.
     pub fn notify_blocked(&self, loop_id: &str, summary: &str) -> Result<()> {
         let loop_name = self
             .db
@@ -1877,6 +2141,50 @@ impl LoopEngine {
         self.notification_service
             .notify_loop_finished(&loop_name, LoopFinishOutcome::Blocked { summary });
         Ok(())
+    }
+
+    /// C19: the `Blocked` counterpart to [`Self::fail_loop`] — same
+    /// stale-dispatch guard (a reset + relaunch that's already claimed the
+    /// loop must not be paused out from under it) and the same B12 sweep of
+    /// any run still `running` under `loop_id`, but pauses the loop instead
+    /// of failing it and fires [`Self::notify_blocked`] instead of the
+    /// ordinary failed-loop notification. This is what a spec that exceeded
+    /// its persisted cross-run attempt budget routes through: unlike
+    /// `Failed`, `Paused` is not accepted by a pending autorun
+    /// ([`crate::domain::loops::Loop::is_autorun_due`] already excludes it
+    /// unless `paused_by_reconciliation`, which `update_loop_status` always
+    /// clears) and is refused by `loop_run` once it carries a blocker (see
+    /// the daemon's `loop_run` tool) — exactly the "not started again until
+    /// a human clears it" FR4 asks for, reusing the loop_report_blocker
+    /// mechanism wholesale rather than inventing a parallel one.
+    fn block_loop(
+        &self,
+        loop_id: &str,
+        dispatch_started_at: Option<chrono::DateTime<chrono::Utc>>,
+        blocker: &str,
+    ) -> Result<()> {
+        if let Some(expected) = dispatch_started_at {
+            let current_started_at = self.db.get_loop(loop_id)?.and_then(|lp| lp.started_at);
+            let still_current =
+                current_started_at.is_some_and(|at| at.timestamp() == expected.timestamp());
+            if !still_current {
+                tracing::info!(
+                    "Loop '{}' block from a stale dispatch (claimed at {}) ignored — a newer \
+                     dispatch has since taken over; this attempt's own run row already records \
+                     its own outcome.",
+                    loop_id,
+                    expected.to_rfc3339()
+                );
+                return Ok(());
+            }
+        }
+
+        self.db
+            .update_loop_status(loop_id, LoopStatus::Paused, None, None)?;
+        for run in self.db.list_running_loop_runs(loop_id).unwrap_or_default() {
+            self.terminate_run(&run, "spec exceeded cross-run attempt budget");
+        }
+        self.notify_blocked(loop_id, blocker)
     }
 
     /// `(done, total)` specs for `loop_id`'s current run — the loop's bound
@@ -2057,6 +2365,26 @@ fn is_infra_crash(
         && attempt < retry_limit
 }
 
+/// C19: whether `output` reflects an infrastructure failure — a crash,
+/// empty response, or dropped/never-filed report — rather than a genuine
+/// verdict an agent (or check/gate) actually produced. Reuses the exact
+/// markers [`is_infra_crash`]/`agent_finished_execution` already write
+/// (`infra_crash`, `no_output`, `failure_kind: "no_report"`) instead of
+/// re-deriving the distinction — see [`LoopEngine::record_spec_attempt`],
+/// the only caller: an infra failure never consumes the persisted cross-run
+/// attempt budget.
+fn execution_is_infra_failure(output: &Value) -> bool {
+    output
+        .get("infra_crash")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || output
+            .get("no_output")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        || output.get("failure_kind").and_then(Value::as_str) == Some("no_report")
+}
+
 /// Persist a crashed agent attempt with B19 `infra_attempt`/`infra_crash`
 /// markers, wait the doubling backoff (`backoff_secs * 2^attempt`), then
 /// insert a fresh `Running` run row for the retry and return its id. `attempt`
@@ -2105,6 +2433,7 @@ async fn begin_infra_retry(
     Ok(run_id)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_check_node(
     db: &Database,
     run_id: &str,
@@ -2112,6 +2441,7 @@ async fn execute_check_node(
     spec: &LoopSpec,
     node: &LoopNode,
     spec_start_head: Option<&str>,
+    spec_committed_head: Option<&str>,
     workdir: &str,
 ) -> Result<NodeExecution> {
     let raw_command = node
@@ -2121,7 +2451,9 @@ async fn execute_check_node(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("Check node '{}' is missing a command.", node.name))?;
-    let command = raw_command.replace("{{spec_start_head}}", spec_start_head.unwrap_or(""));
+    let command = raw_command
+        .replace("{{spec_start_head}}", spec_start_head.unwrap_or(""))
+        .replace("{{spec_committed_head}}", spec_committed_head.unwrap_or(""));
     let success_condition = node
         .config
         .get("success_condition")
@@ -2614,6 +2946,7 @@ async fn spawn_and_wait_cli_process(
     timeout_minutes: u64,
     session_id: Option<&str>,
     resume_session_id: Option<&str>,
+    trust_workdir: bool,
     on_pid: impl FnOnce(u32),
 ) -> Result<CliProcessOutcome, SpawnError> {
     // A resume (RS2) uses the by-id resume flag and continues an existing
@@ -2627,6 +2960,14 @@ async fn spawn_and_wait_cli_process(
             .build_command_with_session(prompt, model, Some(workdir), session_id)
             .map_err(|error| SpawnError::from_build(&error))?,
     };
+    // Only appended when the caller opted in (per node.config["trust_workdir"])
+    // AND the harness has a registered trust flag — never a silent default
+    // (see [`CliConfig::trust_flag`]).
+    if trust_workdir {
+        if let Some(flag) = strategy.trust_flag.as_deref() {
+            command.arg(flag);
+        }
+    }
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
 
@@ -2729,6 +3070,12 @@ async fn run_agent_process(
         None
     };
 
+    // Opt-in only (per node config), never a default — see [`CliConfig::trust_flag`].
+    let trust_workdir = node
+        .config
+        .get("trust_workdir")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let outcome = spawn_and_wait_cli_process(
         strategy,
         prompt,
@@ -2737,6 +3084,7 @@ async fn run_agent_process(
         timeout_minutes,
         session_id.as_deref(),
         resume_session_id,
+        trust_workdir,
         |pid| {
             let _ = db.set_loop_run_pid(run_id, pid as i64, crate::system::boot_id().as_deref());
         },
@@ -2807,6 +3155,29 @@ async fn run_agent_process(
     }
 }
 
+/// Shape-matches a harness's stderr against an "untrusted working directory"
+/// refusal — the class of failure that produced exit 0, empty stdout, and
+/// this stderr in the 2026-08-13 `gitkit-composition` incident:
+///
+/// ```text
+/// Warning: /home/.../gitkit is not trusted; project configuration (.agents/)
+///          will be ignored. Re-run with --trust to trust this folder temporarily.
+/// ```
+///
+/// `.agents/` is where MCP server configuration lives, so a harness hitting
+/// this silently loses every tool it needed — including the two calls
+/// (`loop_complete_node`/`loop_report_blocker`) it would need to report that
+/// loss. Matches on the *shape* of the refusal (an explicit "not trusted"
+/// verdict alongside project configuration being ignored) rather than this
+/// one CLI's exact sentence, since a different harness or a future wording
+/// change must still be caught — see [`agent_finished_execution`], which
+/// keeps the stderr verbatim in the report so a wording drift is visible
+/// there rather than silently swallowed by ever-looser matching here.
+fn is_untrusted_workdir_signal(stderr: &str) -> bool {
+    let lower = stderr.to_lowercase();
+    lower.contains("not trusted") && lower.contains("ignored")
+}
+
 /// Turn a completed (non-timeout, non-spawn-failure) CLI run into its
 /// verdict. `exit_code == 0` is necessary but not sufficient for `Pass`: a
 /// CLI that fails to start its model, prints to stderr, and still exits 0
@@ -2849,6 +3220,10 @@ async fn run_agent_process(
 ///   the *unreported* branch (see the `self_reported_execution` check at
 ///   this function's call sites), so there is no case here where an explicit
 ///   `graph_complete_node` verdict could be overridden.
+///
+/// A fourth, more specific `failure_kind` — `"untrusted_workdir"` — joins
+/// `"no_report"` in this vocabulary when [`is_untrusted_workdir_signal`]
+/// matches stderr on a `zero_exit_no_output` run (C3).
 fn agent_finished_execution(
     node: &LoopNode,
     cli: &Cli,
@@ -2866,6 +3241,11 @@ fn agent_finished_execution(
     // stop retrying every plain crash that happens not to log to stdout.
     let zero_exit_no_output = exit_code == 0 && stdout.is_empty();
     let exit_says_pass = exit_code == 0 && !zero_exit_no_output;
+    // Only meaningful within the `zero_exit_no_output` shape: a harness that
+    // produced real output warned about many things, and an untrusted-workdir
+    // mention alongside a successful result must never downgrade it (harnesses
+    // warn about all kinds of things and still finish the job).
+    let untrusted_workdir = zero_exit_no_output && is_untrusted_workdir_signal(stderr);
 
     let require_report = node
         .config
@@ -2890,7 +3270,13 @@ fn agent_finished_execution(
         "prompt_source": agent_prompt_source(&node.config),
     });
     if zero_exit_no_output {
-        let reason = if stderr.is_empty() {
+        let reason = if untrusted_workdir {
+            format!(
+                "agent produced no output because its working directory was not trusted \
+                 by the harness, so project configuration (including MCP tools) was \
+                 ignored; stderr: {stderr}"
+            )
+        } else if stderr.is_empty() {
             "agent produced no output".to_string()
         } else {
             format!("agent produced no output; stderr: {stderr}")
@@ -2898,6 +3284,12 @@ fn agent_finished_execution(
         if let Value::Object(map) = &mut output {
             map.insert("no_output".to_string(), Value::Bool(true));
             map.insert("error".to_string(), Value::String(reason));
+            if untrusted_workdir {
+                map.insert(
+                    "failure_kind".to_string(),
+                    Value::String("untrusted_workdir".to_string()),
+                );
+            }
         }
     }
     if !self_reported {
@@ -2918,6 +3310,12 @@ fn agent_finished_execution(
         summary: if no_report_override {
             format!(
                 "Agent node '{}' exited 0 but never called loop_complete_node (require_report).",
+                node.name
+            )
+        } else if untrusted_workdir {
+            format!(
+                "Agent node '{}' produced no output: the harness reported its working \
+                 directory as untrusted and ignored project configuration (exit code 0).",
                 node.name
             )
         } else if zero_exit_no_output {
@@ -3288,6 +3686,7 @@ async fn run_completion_hook_process(
         timeout_minutes,
         None,
         None,
+        false,
         |pid| {
             let _ = db.set_loop_completion_hook_run_pid(
                 hook_run_id,
@@ -4081,6 +4480,47 @@ fn ensemble_owning_node(node_id: &str, ensembles: &[EnsembleDetails]) -> Option<
         .map(|details| details.ensemble.id.clone())
 }
 
+/// The one-off spec [`LoopEngine::run_loop_dispatch`]'s bound-spec (`None`
+/// queue) branch fabricates for a spec-less run — a loop launched with zero
+/// bound specs whose top-level graph is what `empty_launch_check` let the
+/// launch through on. Its blank `name`/`description` are load-bearing, not
+/// incidental: `render_agent_prompt`/`render_resume_prompt` already fall
+/// back from `spec.description` to `spec.name` for `{{spec_content}}`, and
+/// substitute `spec.name` directly for `{{spec_name}}`, so an empty name
+/// with no description makes both resolve to `""` — honestly empty, per the
+/// "unresolved placeholder is a bug" rule — through that existing code,
+/// unchanged. `loop_add_spec` rejects an empty name for every real,
+/// user-authored spec, so `""` can never collide with one.
+fn no_spec_placeholder(loop_id: &str) -> LoopSpec {
+    LoopSpec {
+        id: uuid::Uuid::new_v4().to_string(),
+        loop_id: Some(loop_id.to_string()),
+        name: String::new(),
+        description: None,
+        position: 0,
+        parallelizable: false,
+        status: LoopSpecStatus::Pending,
+        started_at: None,
+        completed_at: None,
+        spec_start_head: None,
+        spec_committed_head: None,
+        workdir: None,
+        completed_via: None,
+        completed_via_reason: None,
+        completed_via_at: None,
+    }
+}
+
+/// Whether `spec` is the placeholder [`no_spec_placeholder`] creates — the
+/// sentinel `run_loop_dispatch`'s bound-spec path checks for at the start of
+/// every dispatch, to purge a prior spec-less run's placeholder once it's
+/// reached a terminal status (see the purge loop ahead of this branch's
+/// `list_loop_specs` call) without ever touching a still-live one a resume
+/// still needs.
+fn is_no_spec_placeholder(spec: &LoopSpec) -> bool {
+    spec.name.is_empty()
+}
+
 fn resolve_spec_start(
     nodes: &[LoopNode],
     edges: &[LoopEdge],
@@ -4156,6 +4596,7 @@ mod tests {
         let db = Arc::new(Database::new(&dir.path().join("test.db"))?);
         let lp = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf-test".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -4184,6 +4625,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -4347,6 +4789,7 @@ mod tests {
         let db = Arc::new(Database::new(&dir.path().join("test.db"))?);
         let lp = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf-test".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -4373,6 +4816,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -5009,6 +5453,332 @@ mod tests {
         assert_eq!(check_run.status, LoopRunStatus::Pass);
     }
 
+    // ── C15: spec_committed_head — tied to *this run's* committer, not to
+    // "any commit since spec_start_head" ──────────────────────────────────
+
+    /// The canonical stronger check template: clean tree, *and* this run's
+    /// own committer actually produced a commit, *and* HEAD still is that
+    /// exact commit (nothing landed on top of it unaccounted for).
+    const COMMITTED_CHECK_CMD: &str = "test -z \"$(git status --porcelain -- src/)\" \
+         && test -n \"{{spec_committed_head}}\" \
+         && test \"$(git rev-parse HEAD)\" = \"{{spec_committed_head}}\"";
+
+    #[tokio::test]
+    async fn loop_engine_committed_check_passes_when_this_runs_committer_commits() {
+        // Test 1 (spec TESTS REQUIRED): a spec that commits — the check
+        // passes.
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        init_git_repo(dir.path());
+
+        db.insert_loop_node(&rights_node(
+            &spec_id,
+            "committer",
+            COMMIT_CMD,
+            Some(true),
+            1,
+        ))
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": COMMITTED_CHECK_CMD,
+                "success_condition": "exit_code_0"
+            }),
+            position: 2,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "e-committer-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "committer".to_string(),
+            to_node: "node-check".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Always,
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(spec.status, LoopSpecStatus::Completed);
+        assert_eq!(
+            spec.spec_committed_head.as_deref(),
+            Some(git_head(dir.path()).as_str()),
+            "the committer's own resulting HEAD must be recorded"
+        );
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        let check_run = runs.iter().find(|r| r.node_id == "node-check").unwrap();
+        assert_eq!(check_run.status, LoopRunStatus::Pass);
+    }
+
+    #[tokio::test]
+    async fn loop_engine_committed_check_fails_when_nothing_committed_and_tree_clean() {
+        // Test 2 (spec TESTS REQUIRED): a spec that commits nothing, clean
+        // tree — the check fails.
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        init_git_repo(dir.path());
+
+        // Carries commit rights but never actually commits — the exact
+        // shape of the bug this gate exists to catch: an approval with no
+        // commit behind it.
+        db.insert_loop_node(&rights_node(&spec_id, "committer", "true", Some(true), 1))
+            .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": COMMITTED_CHECK_CMD,
+                "success_condition": "exit_code_0"
+            }),
+            position: 2,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "e-committer-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "committer".to_string(),
+            to_node: "node-check".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Always,
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(
+            spec.spec_committed_head, None,
+            "no commit landed, so there is nothing to record"
+        );
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        let check_run = runs.iter().find(|r| r.node_id == "node-check").unwrap();
+        assert_eq!(check_run.status, LoopRunStatus::Fail);
+    }
+
+    #[tokio::test]
+    async fn loop_engine_regression_concurrent_commit_from_outside_this_run_fails_committed_check()
+    {
+        // Test 3 (spec TESTS REQUIRED) — the regression test for the
+        // concurrent-worktree case: a commit made by something other than
+        // this spec's run, with the spec having committed nothing, must
+        // fail. This is the 2026-08-19 incident shape: a human (or another
+        // agent) commits into the same worktree while a loop is running on
+        // it. The superseded `HEAD != spec_start_head` comparison is
+        // satisfied by exactly this, which is the bug this test guards
+        // against.
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        init_git_repo(dir.path());
+        let baseline = git_head(dir.path());
+
+        // Simulate a spec already mid-attempt with its baseline already
+        // captured and persisted — same setup the B10 resume tests use, so
+        // a genuine resume (daemon restart mid-run) reuses it rather than
+        // recapturing.
+        db.update_loop_spec_status(&spec_id, LoopSpecStatus::Running, None, None)
+            .unwrap();
+        db.set_loop_spec_start_head(&spec_id, Some(&baseline))
+            .unwrap();
+
+        // The concurrent-worktree case itself: something other than this
+        // run's own committer lands a commit while the spec is in flight.
+        std::fs::write(dir.path().join("unrelated.txt"), "external change").unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Someone Else",
+                "-c",
+                "user.email=someone@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "concurrent, unrelated commit"
+            ])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        let concurrent_head = git_head(dir.path());
+        assert_ne!(
+            concurrent_head, baseline,
+            "the concurrent commit must actually have moved HEAD for this test to mean anything"
+        );
+
+        // This spec's own graph never commits anything — just the check.
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": COMMITTED_CHECK_CMD,
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        // A resumed dispatch — same path a daemon restart mid-run takes.
+        engine
+            .run_loop_dispatch(loop_id.clone(), None, None, true)
+            .await
+            .unwrap();
+
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(
+            spec.spec_committed_head, None,
+            "no node this run trusts to commit ever ran, so `spec_committed_head` \
+             must stay unset even though HEAD moved"
+        );
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        let check_run = runs.iter().find(|r| r.node_id == "node-check").unwrap();
+        assert_eq!(
+            check_run.status,
+            LoopRunStatus::Fail,
+            "the superseded `HEAD != spec_start_head` comparison alone would have passed \
+             here (HEAD moved to the concurrent commit) — the strengthened check must not"
+        );
+
+        // Proof this is a real regression test, not a vacuous one: the old
+        // comparison really would have been satisfied.
+        assert_ne!(git_head(dir.path()), baseline);
+    }
+
+    #[tokio::test]
+    async fn loop_engine_spec_committed_head_scoped_per_spec_not_shared() {
+        // Test 4 (spec TESTS REQUIRED): the marker's value is scoped to the
+        // run — two specs in one loop do not share it. A loop with two bound
+        // specs runs both, in position order, within one `run_loop` call.
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        init_git_repo(dir.path());
+
+        db.insert_loop_node(&rights_node(
+            &spec_id,
+            "committer",
+            COMMIT_CMD,
+            Some(true),
+            1,
+        ))
+        .unwrap();
+
+        // A second spec in the same loop, with its own committer that also
+        // commits.
+        let spec_b = crate::domain::loops::LoopSpec {
+            id: "spec-b".to_string(),
+            loop_id: Some(loop_id.clone()),
+            name: "Spec B".to_string(),
+            description: Some("second spec".to_string()),
+            position: 2,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+            spec_committed_head: None,
+        };
+        db.insert_loop_spec(&spec_b).unwrap();
+        db.insert_loop_node(&rights_node(
+            &spec_b.id,
+            "committer-b",
+            COMMIT_CMD,
+            Some(true),
+            1,
+        ))
+        .unwrap();
+
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+
+        let spec_a_after = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        let spec_b_after = db.get_loop_spec(&spec_b.id).unwrap().unwrap();
+        assert_eq!(spec_a_after.status, LoopSpecStatus::Completed);
+        assert_eq!(spec_b_after.status, LoopSpecStatus::Completed);
+        assert!(
+            spec_a_after.spec_committed_head.is_some(),
+            "spec A must have recorded its own commit"
+        );
+        assert!(
+            spec_b_after.spec_committed_head.is_some(),
+            "spec B must have recorded its own commit"
+        );
+        assert_ne!(
+            spec_b_after.spec_committed_head, spec_a_after.spec_committed_head,
+            "each spec must record its own commit, not share the other's"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_engine_restart_mid_run_does_not_turn_committed_check_fail_into_pass() {
+        // Test 5 (spec TESTS REQUIRED): if a restart path is reachable in a
+        // test, a restart mid-run does not turn a fail into a pass. Mirrors
+        // B10's `loop_engine_resume_dispatch_reuses_persisted_spec_start_head_even_if_stale`:
+        // a spec left `running` (as a daemon restart would leave it) with no
+        // `spec_committed_head` recorded yet must resume still lacking one —
+        // a resume must never manufacture evidence of a commit that never
+        // happened.
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        init_git_repo(dir.path());
+        let baseline = git_head(dir.path());
+
+        db.update_loop_spec_status(&spec_id, LoopSpecStatus::Running, None, None)
+            .unwrap();
+        db.set_loop_spec_start_head(&spec_id, Some(&baseline))
+            .unwrap();
+        // Deliberately left unset, as an interrupted attempt that hadn't
+        // committed yet would leave it.
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": COMMITTED_CHECK_CMD,
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        engine
+            .run_loop_dispatch(loop_id.clone(), None, None, true)
+            .await
+            .unwrap();
+
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(spec.spec_committed_head, None);
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        let check_run = runs.iter().find(|r| r.node_id == "node-check").unwrap();
+        assert_eq!(
+            check_run.status,
+            LoopRunStatus::Fail,
+            "resuming an attempt that never committed must never read as a pass"
+        );
+    }
+
     #[tokio::test]
     async fn loop_engine_completes_check_and_gate_spec() {
         let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
@@ -5103,6 +5873,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -5162,6 +5933,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -5225,6 +5997,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -5279,6 +6052,7 @@ mod tests {
     fn render_agent_prompt_includes_reporting_contract() {
         let lp = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -5305,6 +6079,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -5348,6 +6123,7 @@ mod tests {
     fn render_agent_prompt_adds_continuation_notice_only_when_spec_interrupted() {
         let lp = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -5374,6 +6150,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -5529,6 +6306,7 @@ mod tests {
         // interpolated whole; the marker must show it was cut.
         let lp = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -5555,6 +6333,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -5840,6 +6619,7 @@ mod tests {
                 &node,
                 None,
                 None,
+                None,
                 "run-pin",
                 dir.path().to_str().unwrap(),
                 None,
@@ -5894,6 +6674,7 @@ mod tests {
             session_list_format_args: None,
             session_id_pattern: None,
             session_resume_cmd: None,
+            trust_flag: None,
         }
     }
 
@@ -6035,6 +6816,7 @@ esac
             session_list_format_args: None,
             session_id_pattern: Some(r#""id"\s*:\s*"([^"]+)""#.to_string()),
             session_resume_cmd: None,
+            trust_flag: None,
         }
     }
 
@@ -6969,6 +7751,217 @@ echo done
         );
     }
 
+    /// C3: the 2026-08-13 `gitkit-composition` incident, reproduced with the
+    /// stderr the harness actually printed — exit 0, empty stdout, and a
+    /// warning that the workdir was untrusted so `.agents/` (MCP config) was
+    /// ignored. Must be classified as the specific `untrusted_workdir` cause,
+    /// not just the generic no-output case, so a human (or the resilience
+    /// node's own summary) can tell "the harness lost its tools" apart from
+    /// "the harness said nothing for some other reason".
+    #[tokio::test]
+    async fn run_agent_process_untrusted_workdir_stderr_is_classified_specifically() {
+        let (dir, db) = test_db();
+        let cli = Cli::new("test-cli");
+        let stderr_text =
+            "Warning: /home/jheisonmblivecom/Projects/UniverLab/gitkit is not trusted; \
+                            project configuration (.agents/) will be ignored. \
+                            Re-run with --trust to trust this folder temporarily.";
+        let script = write_member_script(
+            dir.path(),
+            "untrusted.sh",
+            &format!(">&2 printf '%s' '{stderr_text}'\nexit 0"),
+        );
+        let strategy = sample_strategy(&script);
+        let node = sample_agent_node();
+
+        let execution = run_agent_process(
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(execution.status, LoopRunStatus::Fail);
+        assert_eq!(
+            execution.output.get("no_output").and_then(Value::as_bool),
+            Some(true),
+            "existing no_output mechanism must still fire (this sharpens it, not replaces it)"
+        );
+        assert_eq!(
+            execution.output.get("failure_kind").and_then(Value::as_str),
+            Some("untrusted_workdir"),
+            "must join the failure_kind vocabulary alongside no_report"
+        );
+        let error_text = execution
+            .output
+            .get("error")
+            .and_then(Value::as_str)
+            .expect("must carry an error field");
+        assert!(
+            error_text.contains("not trusted"),
+            "the matched stderr text must be visible in the report: {error_text}"
+        );
+        assert!(
+            execution.summary.to_lowercase().contains("untrusted"),
+            "summary must state the cause, not read as a generic empty response: {}",
+            execution.summary
+        );
+    }
+
+    /// Guard against over-matching: an unrelated stderr on an empty-stdout,
+    /// zero-exit run must stay the generic no-output case, never picking up
+    /// the `untrusted_workdir` cause just because stdout happened to be
+    /// empty.
+    #[tokio::test]
+    async fn run_agent_process_unrelated_stderr_stays_generic_no_output() {
+        let (dir, db) = test_db();
+        let cli = Cli::new("test-cli");
+        let script = write_member_script(
+            dir.path(),
+            "unrelated.sh",
+            ">&2 printf 'Error: rate limited, try again later'\nexit 0",
+        );
+        let strategy = sample_strategy(&script);
+        let node = sample_agent_node();
+
+        let execution = run_agent_process(
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(execution.status, LoopRunStatus::Fail);
+        assert_eq!(
+            execution.output.get("no_output").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            execution.output.get("failure_kind").is_none(),
+            "unrelated stderr must not be classified as untrusted_workdir"
+        );
+    }
+
+    /// Harnesses warn about many things; an untrusted-workdir mention in
+    /// stderr alongside REAL stdout must never downgrade an otherwise
+    /// successful run — only the empty-stdout shape is diagnostic here.
+    #[tokio::test]
+    async fn run_agent_process_untrusted_warning_with_real_output_still_passes() {
+        let (dir, db) = test_db();
+        let cli = Cli::new("test-cli");
+        let stderr_text = "Warning: workdir is not trusted; project configuration will be ignored.";
+        let script = write_member_script(
+            dir.path(),
+            "warned-but-worked.sh",
+            &format!(">&2 printf '%s' '{stderr_text}'\nprintf 'all done'\nexit 0"),
+        );
+        let strategy = sample_strategy(&script);
+        let node = sample_agent_node();
+
+        let execution = run_agent_process(
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            execution.status,
+            LoopRunStatus::Pass,
+            "real stdout must pass regardless of an unrelated warning in stderr"
+        );
+        assert!(execution.output.get("no_output").is_none());
+        assert!(execution.output.get("failure_kind").is_none());
+    }
+
+    /// A harness with a registered `trust_flag` AND a node that opts in via
+    /// `trust_workdir: true` must actually receive the flag — otherwise
+    /// nothing in the registry is wired to anything a run can use.
+    #[tokio::test]
+    async fn run_agent_process_trust_flag_appended_when_configured_and_opted_in() {
+        let (dir, db) = test_db();
+        let cli = Cli::new("test-cli");
+        let capture = dir.path().join("argv.txt");
+        let script = write_member_script(
+            dir.path(),
+            "capture-argv.sh",
+            &format!("printf '%s' \"$*\" > \"{}\"\nexit 0", capture.display()),
+        );
+        let mut strategy = sample_strategy(&script);
+        strategy.trust_flag = Some("--trust".to_string());
+        let mut node = sample_agent_node();
+        node.config = serde_json::json!({"trust_workdir": true});
+
+        run_agent_process(
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+        )
+        .await
+        .unwrap();
+
+        let captured_argv = std::fs::read_to_string(&capture).unwrap();
+        assert!(
+            captured_argv.contains("--trust"),
+            "trust flag must be in argv: {captured_argv}"
+        );
+    }
+
+    /// A harness with no `trust_flag` registered must never receive one,
+    /// even when a node opts in — there is nothing to pass, and the opt-in
+    /// must be a no-op rather than an error.
+    #[tokio::test]
+    async fn run_agent_process_trust_flag_absent_when_not_configured() {
+        let (dir, db) = test_db();
+        let cli = Cli::new("test-cli");
+        let capture = dir.path().join("argv.txt");
+        let script = write_member_script(
+            dir.path(),
+            "capture-argv.sh",
+            &format!("printf '%s' \"$*\" > \"{}\"\nexit 0", capture.display()),
+        );
+        let strategy = sample_strategy(&script); // trust_flag: None
+        let mut node = sample_agent_node();
+        node.config = serde_json::json!({"trust_workdir": true});
+
+        run_agent_process(
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+        )
+        .await
+        .unwrap();
+
+        let captured_argv = std::fs::read_to_string(&capture).unwrap();
+        assert!(
+            !captured_argv.contains("--trust"),
+            "no trust flag is registered, so none must be passed: {captured_argv}"
+        );
+    }
+
+    /// Trusting a directory is opt-in per node, never a default — a harness
+    /// configured with a trust flag must NOT receive it unless the node's
+    /// own config asks for it.
+    #[tokio::test]
+    async fn run_agent_process_trust_flag_absent_when_configured_but_not_opted_in() {
+        let (dir, db) = test_db();
+        let cli = Cli::new("test-cli");
+        let capture = dir.path().join("argv.txt");
+        let script = write_member_script(
+            dir.path(),
+            "capture-argv.sh",
+            &format!("printf '%s' \"$*\" > \"{}\"\nexit 0", capture.display()),
+        );
+        let mut strategy = sample_strategy(&script);
+        strategy.trust_flag = Some("--trust".to_string());
+        let node = sample_agent_node(); // config: {} — no trust_workdir opt-in
+
+        run_agent_process(
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+        )
+        .await
+        .unwrap();
+
+        let captured_argv = std::fs::read_to_string(&capture).unwrap();
+        assert!(
+            !captured_argv.contains("--trust"),
+            "must never pass a trust flag by default without the node's opt-in: {captured_argv}"
+        );
+    }
+
     /// The inverse of the no-output fix: an agent that exits 0 and produces
     /// real stdout must keep passing exactly as before. Guards against the
     /// no-output fix becoming an overly broad check that makes well-behaved
@@ -7653,6 +8646,7 @@ echo done
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -7928,6 +8922,7 @@ echo done
         let db = Arc::new(Database::new(&dir.path().join("test.db"))?);
         let lp = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf-test".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -7968,6 +8963,7 @@ echo done
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -8190,6 +9186,7 @@ echo done
 
         let lp = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf-workdir".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -8680,6 +9677,7 @@ echo done
         // 2. Render the full prompt — elision must survive composition.
         let lp = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -8706,6 +9704,7 @@ echo done
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -9142,6 +10141,203 @@ echo done
                 .as_ref()
                 .is_none_or(|output| output.get("blocker").is_none()),
             "a passing dead-end must never record a blocker"
+        );
+    }
+
+    // ── C19: cross-run attempt budget ─────────────────────────────────
+
+    /// The regression test for the whole spec: a spec that keeps failing
+    /// with a genuine verdict — never an infra crash — across three
+    /// SEPARATE `run_loop` dispatches (not three bounces within one, which
+    /// is the pre-existing per-node `DEFAULT_MAX_ITERATIONS_PER_NODE`
+    /// budget) must end up `Blocked`, not `Failed`: the loop pauses, and the
+    /// terminating run's blocker names the spec and the attempt count.
+    #[tokio::test]
+    async fn cross_run_attempt_budget_blocks_loop_after_three_failed_executions() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "dead-end".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "dead-end".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "exit 1",
+                "success_condition": "exit_code_0",
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        // No outgoing edge from "dead-end": every execution dead-ends
+        // there as a genuine (Check-node, never infra-classified) Fail.
+
+        // Executions 1 and 2: ordinary Failed, not yet blocked.
+        for expected_attempts in 1..=2 {
+            engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+            let lp = db.get_loop(&loop_id).unwrap().unwrap();
+            assert_eq!(lp.status, LoopStatus::Failed, "attempt {expected_attempts}");
+            assert_eq!(
+                db.get_loop_spec_cross_run_attempts(&spec_id).unwrap(),
+                expected_attempts,
+                "attempt count must persist across separate executions"
+            );
+        }
+
+        // Execution 3: the budget (default 3) is now exceeded — blocked.
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        assert_eq!(db.get_loop_spec_cross_run_attempts(&spec_id).unwrap(), 3);
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(
+            lp.status,
+            LoopStatus::Paused,
+            "the third genuine failure must block the loop, not just fail it"
+        );
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        let blocker = runs
+            .last()
+            .unwrap()
+            .output
+            .as_ref()
+            .and_then(|output| output.get("blocker"))
+            .and_then(Value::as_str)
+            .expect("the terminating run must carry the C19 blocker");
+        assert!(
+            blocker.contains(&spec_id) || blocker.contains("Spec"),
+            "{blocker}"
+        );
+        assert!(
+            blocker.contains('3'),
+            "blocker must name the attempt count: {blocker}"
+        );
+    }
+
+    /// Decision 2: an infrastructure failure (here, `no_output` — an agent
+    /// that exits 0 with nothing to say) never consumes the cross-run
+    /// budget. Verified directly against `execution_is_infra_failure` /
+    /// `record_spec_attempt` — the exact pair `run_spec` consults — rather
+    /// than fighting the test-cli harness into reproducing a raw process
+    /// crash end-to-end.
+    #[tokio::test]
+    async fn infra_marked_output_does_not_consume_the_cross_run_budget() {
+        let (_dir, db, engine, _loop_id, spec_id) = loop_fixture().unwrap();
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+
+        for infra_output in [
+            serde_json::json!({"infra_crash": true, "infra_attempt": 0}),
+            serde_json::json!({"no_output": true}),
+            serde_json::json!({"failure_kind": "no_report"}),
+        ] {
+            assert!(execution_is_infra_failure(&infra_output), "{infra_output}");
+            let blocked = engine
+                .record_spec_attempt(&spec, "infra blip", true)
+                .unwrap();
+            assert!(blocked.is_none(), "an infra failure must never block");
+        }
+        assert_eq!(
+            db.get_loop_spec_cross_run_attempts(&spec_id).unwrap(),
+            0,
+            "none of the infra-flavoured failures above may have touched the counter"
+        );
+
+        // A genuine failure, by contrast, does.
+        assert!(!execution_is_infra_failure(&serde_json::json!({})));
+        engine
+            .record_spec_attempt(&spec, "a real fail", false)
+            .unwrap();
+        assert_eq!(db.get_loop_spec_cross_run_attempts(&spec_id).unwrap(), 1);
+    }
+
+    /// Decision 6: an EXPLICIT `loop_reset` of the specific spec that hit
+    /// the budget clears its count, so the next execution starts fresh
+    /// rather than being blocked on its very first fail. The counter must
+    /// still be shared across executions otherwise — this is the one
+    /// deliberate escape hatch, not a general amnesty.
+    #[tokio::test]
+    async fn explicit_spec_reset_clears_the_cross_run_attempt_count() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "dead-end".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "dead-end".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "exit 1",
+                "success_condition": "exit_code_0",
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        // Two genuine failures — one short of the default budget of 3.
+        for _ in 0..2 {
+            engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        }
+        assert_eq!(db.get_loop_spec_cross_run_attempts(&spec_id).unwrap(), 2);
+
+        // The operator names this spec explicitly — the "I fixed it" signal.
+        let outcome = db
+            .reset_loop(&loop_id, Some(std::slice::from_ref(&spec_id)))
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            crate::domain::loops::LoopResetOutcome::Reset { spec_count: 1 }
+        ));
+        assert_eq!(
+            db.get_loop_spec_cross_run_attempts(&spec_id).unwrap(),
+            0,
+            "an explicit reset of this exact spec must clear its count"
+        );
+
+        // The next execution starts fresh: one more genuine failure lands
+        // at count 1, not 3 — still an ordinary Failed, not Blocked.
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        assert_eq!(db.get_loop_spec_cross_run_attempts(&spec_id).unwrap(), 1);
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(
+            lp.status,
+            LoopStatus::Failed,
+            "must not be blocked so soon after reset"
+        );
+    }
+
+    /// The mirror image, and decision 6's other half: a BLANKET
+    /// `loop_reset` (no `specs` named) resets the spec's status like any
+    /// other, but must NOT clear its attempt count — that's exactly the
+    /// "operator resets and relaunches without fixing anything" recovery
+    /// this whole spec exists to stop from silently resetting the budget.
+    #[tokio::test]
+    async fn blanket_loop_reset_does_not_clear_the_cross_run_attempt_count() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "dead-end".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "dead-end".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "exit 1",
+                "success_condition": "exit_code_0",
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        assert_eq!(db.get_loop_spec_cross_run_attempts(&spec_id).unwrap(), 1);
+
+        db.reset_loop(&loop_id, None).unwrap();
+        assert_eq!(
+            db.get_loop_spec_cross_run_attempts(&spec_id).unwrap(),
+            1,
+            "a blanket reset must leave the persisted count untouched"
         );
     }
 
@@ -10328,9 +11524,12 @@ echo done
 
     // ── B17: empty effective spec set is a launch error, not a completion ──
 
-    /// The core incident: a loop with zero bound specs and no `queue_id`
-    /// given must refuse to launch — not silently transition to
-    /// `Completed`. Status must stay untouched and no run recorded.
+    /// A loop with *neither* bound specs *nor* a top-level graph — `bare_loop_fixture`
+    /// adds no nodes at all — has genuinely nothing to run and must still
+    /// refuse to launch, with the same message as before this fixture grew a
+    /// graph-aware carve-out (see `spec_less_run_executes_top_level_graph_once`
+    /// below for the case that carve-out actually lets through). Status must
+    /// stay untouched and no run recorded.
     #[tokio::test]
     async fn loop_engine_zero_bound_specs_and_no_queue_is_a_launch_error() {
         let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
@@ -10353,6 +11552,164 @@ echo done
         assert!(
             db.list_loop_runs_for_loop(&loop_id).unwrap().is_empty(),
             "an empty launch must record no run"
+        );
+    }
+
+    /// A loop refuses to run without a spec (2026-08-19 report): a loop is a
+    /// graph of nodes, and a graph is runnable on its own. `empty_launch_check`
+    /// must let a spec-less launch through as soon as the loop has *any*
+    /// top-level graph node — it doesn't need to inspect the graph any more
+    /// deeply than that (a malformed/disconnected graph is the author's
+    /// problem, per the loop's own decision record, not this guard's).
+    #[tokio::test]
+    async fn empty_launch_check_lets_spec_less_run_through_when_a_top_level_graph_exists() {
+        let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-only".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "only".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            engine.empty_launch_check(&loop_id, None).unwrap(),
+            None,
+            "a top-level graph node means this launch is not empty, even with zero bound specs"
+        );
+    }
+
+    /// The core fix: a loop with a valid top-level graph and zero bound specs
+    /// runs the graph exactly once and completes — not an infinite loop, not
+    /// a silent no-op. Every placeholder the agent node's prompt would have
+    /// drawn from a spec (`{{spec_content}}`, `{{spec_name}}`) must resolve to
+    /// "", never survive as a literal `{{...}}` token.
+    ///
+    /// The engine's internal placeholder spec (see `no_spec_placeholder`) is
+    /// left in place, `Completed`, right after this run — deleting it
+    /// immediately would cascade its `loop_runs` rows away (FK
+    /// `ON DELETE CASCADE`) before anyone could inspect what ran. It's
+    /// purged lazily, at the start of the *next* spec-less dispatch — proven
+    /// here by a second run reusing a fresh placeholder rather than finding
+    /// the first one still `Completed` and (like a real finished bound spec)
+    /// silently skipping it.
+    #[tokio::test]
+    async fn spec_less_run_executes_top_level_graph_once() {
+        let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+        let argv_file = dir.path().join("argv.log");
+        let script = write_argv_echo_cli(dir.path());
+        let mut env = HashMap::new();
+        env.insert(
+            "ARGV_FILE".to_string(),
+            argv_file.to_string_lossy().into_owned(),
+        );
+        env.insert("RESUME_FLAG".to_string(), "--resume".to_string());
+        let cli = argv_cli_config(&script, env, None, None, None);
+        let home = write_resume_cli_home(cli);
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-impl".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "impl".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({ "platform": "resume-cli" }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 2,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "edge-impl-check".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            from_node: "node-impl".to_string(),
+            to_node: "node-check".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Pass,
+        })
+        .unwrap();
+
+        assert!(
+            db.list_loop_specs(&loop_id).unwrap().is_empty(),
+            "sanity: this loop has no bound specs"
+        );
+
+        let guard = HomeGuard::set(home.path());
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Completed);
+
+        let specs = db.list_loop_specs(&loop_id).unwrap();
+        assert_eq!(
+            specs.len(),
+            1,
+            "the run's placeholder spec is left in place"
+        );
+        let placeholder = &specs[0];
+        assert_eq!(placeholder.status, LoopSpecStatus::Completed);
+
+        let runs = db.list_loop_runs_for_spec(&placeholder.id).unwrap();
+        assert_eq!(
+            runs.iter().filter(|r| r.node_id == "node-impl").count(),
+            1,
+            "the agent node must execute exactly once"
+        );
+        assert_eq!(
+            runs.iter().filter(|r| r.node_id == "node-check").count(),
+            1,
+            "the check node must execute exactly once"
+        );
+
+        let argv = std::fs::read_to_string(&argv_file).unwrap();
+        assert!(
+            !argv.contains("{{"),
+            "the prompt handed to the agent node must contain no unresolved placeholder: {argv}"
+        );
+
+        // A second spec-less launch must purge the first placeholder and run
+        // the graph fresh again — not find a `Completed` spec sitting in
+        // `list_loop_specs` and silently skip it like a real finished spec.
+        // `claim_loop_for_run` only refuses a claim while `Running`, so the
+        // completed status from the first run doesn't block this directly.
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        drop(guard);
+
+        let specs_after = db.list_loop_specs(&loop_id).unwrap();
+        assert_eq!(
+            specs_after.len(),
+            1,
+            "the first run's placeholder must be purged, replaced by a fresh one"
+        );
+        assert_ne!(
+            specs_after[0].id, placeholder.id,
+            "the second dispatch must not reuse the first run's placeholder id"
+        );
+        let argv = std::fs::read_to_string(&argv_file).unwrap();
+        assert_eq!(
+            argv.matches("===").count(),
+            2,
+            "the agent node must have run again on the second dispatch: {argv}"
         );
     }
 
@@ -10540,6 +11897,7 @@ echo done
     async fn render_completion_hook_prompt_substitutes_all_placeholders() {
         let lp = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf".to_string(),
             name: "MyLoop".to_string(),
             description: None,
@@ -10578,6 +11936,7 @@ echo done
     async fn render_completion_hook_prompt_empty_specs_shows_none() {
         let lp = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -11975,6 +13334,7 @@ echo done
         let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
         let lp = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf-queue-ensemble".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -12850,6 +14210,7 @@ echo done
         // Graph A: seeded as mid-run and left alone for the rest of the test.
         let loop_a = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf-graph-a".to_string(),
             name: "Graph A".to_string(),
             description: None,
@@ -12880,6 +14241,7 @@ echo done
             completed_via: None,
             completed_via_reason: None,
             completed_via_at: None,
+            spec_committed_head: None,
         };
         let node_a = LoopNode {
             id: "node-graph-a".to_string(),
@@ -12924,6 +14286,7 @@ echo done
         // full lifecycle by the engine.
         let loop_b = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf-graph-b".to_string(),
             name: "Graph B".to_string(),
             description: None,
@@ -12950,6 +14313,7 @@ echo done
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -13063,6 +14427,7 @@ echo done
 
         let loop_a = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf-signal-a".to_string(),
             name: "Graph A".to_string(),
             description: None,
@@ -13089,6 +14454,7 @@ echo done
             started_at: Some(chrono::Utc::now()),
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -13132,6 +14498,7 @@ echo done
 
         let loop_b = crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf-signal-b".to_string(),
             name: "Graph B".to_string(),
             description: None,
@@ -13158,6 +14525,7 @@ echo done
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,

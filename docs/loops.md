@@ -43,8 +43,29 @@ Agent node prompts support these placeholders:
 | `{{previous_feedback}}` | JSON output of the previous node (truncated if oversized) |
 
 Check node commands additionally support `{{spec_start_head}}` — the
-git HEAD commit at the start of the spec run, useful for verifying
-that code actually changed.
+git HEAD commit at the start of the spec run — and
+`{{spec_committed_head}}` — the git HEAD left behind by the last
+`commit_rights: true` node's own execution during *this* spec run,
+empty until one actually commits (see [Commit rights](#commit-rights)).
+
+`{{spec_start_head}}` only proves *some* commit landed since the spec
+began; it's satisfied just as well by a commit from outside this run
+sharing the same worktree (another agent, a human, a cherry-pick) as
+by this spec's own work. A check node that exists to gate "did this
+spec's work actually get committed" should use
+`{{spec_committed_head}}` instead:
+
+```bash
+test -z "$(git status --porcelain -- src/)" \
+  && test -n "{{spec_committed_head}}" \
+  && test "$(git rev-parse HEAD)" = "{{spec_committed_head}}"
+```
+
+This requires a node in the graph to declare `commit_rights: true` —
+without one, nothing ever populates `{{spec_committed_head}}` and the
+check above always fails. `{{spec_start_head}}` remains useful on its
+own for anything that only needs "did the tree change at all", where
+a concurrent commit from outside this run isn't a concern.
 
 ## Ensembles
 
@@ -147,6 +168,23 @@ run concurrently against one workdir, so a moved HEAD can't be
 attributed to a single member, and the quorum fails as a whole.
 Non-git workdirs are unaffected, as is any node that edits files
 without committing — the normal case.
+
+The same `commit_rights: true` node is also what populates
+`{{spec_committed_head}}`: whenever its own execution moves HEAD, that
+new HEAD is recorded against this spec run, overwritten each time it
+commits again (e.g. a review/retry cycle). A downstream check node
+uses it to verify *this run's own committer* landed a commit, not
+merely that HEAD differs from wherever the spec started — see
+[Template variables](#template-variables).
+
+**Editing the recommended check command text here does not retroactively
+touch any graph.** A node's `command` is whatever text was written into
+its config when the graph was authored (`loop_add_node`, or copied from
+a blueprint) — the engine reads it fresh at execution time but never
+rewrites it. A spec already using the old `{{spec_start_head}}`-only
+comparison keeps using it until someone explicitly runs
+`loop_update_node` on it; only graphs authored or edited after adopting
+`{{spec_committed_head}}` get the stronger check.
 
 ## Self-report requirement
 

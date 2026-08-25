@@ -1547,6 +1547,7 @@ mod tests {
 
         let lp = Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "lp1".to_string(),
             name: "team loop".to_string(),
             description: None,
@@ -1575,6 +1576,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,

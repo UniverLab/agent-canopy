@@ -1,7 +1,9 @@
 use anyhow::Result;
 use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
-use super::context_transfer::{active_split_session_name, resolve_session};
+use super::context_transfer::{
+    active_split_session_name, resolve_session, resolve_split_focused_terminal_like,
+};
 use super::home_preview::handle_playground_key;
 use super::knowledge_dialog::{edit_knowledge_dialog, open_knowledge_dialog};
 use super::search_picker::handle_suggestion_picker_key;
@@ -197,7 +199,83 @@ fn is_focus_cycle_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
     modifiers.contains(KeyModifiers::SHIFT) && matches!(code, KeyCode::Up | KeyCode::Down)
 }
 
+/// Keys canopy keeps for itself even while a focused child has claimed the
+/// keyboard (see [`focused_child_claimed_keyboard`]). The single source of
+/// truth for the reserved set (spec C23) — nothing below `handle_focus_shortcuts`
+/// gets to opt out of it on its own.
+///
+/// The rule for earning a place here is **frame navigation**: a key that moves
+/// between canopy's own panes rather than acting on the session's content. A
+/// multiplexer that hands the inner program its application shortcuts still has
+/// to keep the keys that get you out of, and between, its frames — otherwise
+/// entering a session is a one-way door. Everything else yields.
+///
+/// Each entry is a key plus the modifiers that must be present; a match is
+/// `modifiers.contains(required)`, not equality, so a terminal that reports
+/// extra modifiers alongside them still resolves.
+const RESERVED_FOCUS_KEYS: &[(KeyCode, KeyModifiers)] = &[
+    // Leaves focus back to the sidebar. With focus left, every other canopy
+    // shortcut is reachable again from there, so it's the one key that must
+    // survive a child claiming everything else.
+    (KeyCode::F(10), KeyModifiers::NONE),
+    // Cross-section focus navigation (`handle_agent_cycle_shortcut`): moves the
+    // selection between agents and sections without leaving focus. Reserved
+    // after C23 shipped without it and made stepping between sessions
+    // impossible from inside one.
+    (KeyCode::Up, KeyModifiers::SHIFT),
+    (KeyCode::Down, KeyModifiers::SHIFT),
+    // Split-pane focus and the sidebar tab strip (`handle_split_panel_focus_shortcut`
+    // and the global handler behind it) — the horizontal half of the same
+    // frame navigation.
+    (KeyCode::Left, KeyModifiers::SHIFT),
+    (KeyCode::Right, KeyModifiers::SHIFT),
+];
+
+fn is_reserved_focus_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    RESERVED_FOCUS_KEYS
+        .iter()
+        .any(|(reserved, required)| *reserved == code && modifiers.contains(*required))
+}
+
+/// The agent a focus shortcut would currently apply to: the focused split
+/// pane's session when a split is active, otherwise the sidebar selection.
+/// A read-only mirror of [`resolve_focused_agent`] — that one mutates
+/// `app.focus` on a miss, which a predicate must not do.
+fn currently_focused_target(app: &App) -> Option<FocusedAgent> {
+    if app.active_split_id.is_some() {
+        let (is_terminal, idx) = resolve_split_focused_terminal_like(app)?;
+        return Some(if is_terminal {
+            FocusedAgent::Terminal(idx)
+        } else {
+            FocusedAgent::Interactive(idx)
+        });
+    }
+
+    match app.selected_agent() {
+        Some(AgentEntry::Interactive(idx)) => Some(FocusedAgent::Interactive(*idx)),
+        Some(AgentEntry::Terminal(idx)) => Some(FocusedAgent::Terminal(*idx)),
+        _ => None,
+    }
+}
+
+/// True once the child running in the currently focused session has
+/// signaled it wants raw control of the keyboard: it entered the alternate
+/// screen, or it pushed Kitty keyboard protocol flags (`CSI > flags u`).
+/// Codex (spec C23) negotiates Kitty without ever using the alternate
+/// screen, so either signal alone must be sufficient — neither is dropped.
+pub(crate) fn focused_child_claimed_keyboard(app: &App) -> bool {
+    let Some(target) = currently_focused_target(app) else {
+        return false;
+    };
+    focused_agent(app, target)
+        .is_some_and(|agent| agent.in_alternate_screen() || agent.kitty_keyboard_negotiated())
+}
+
 fn handle_focus_shortcuts(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> bool {
+    if !is_reserved_focus_key(code, modifiers) && focused_child_claimed_keyboard(app) {
+        return false;
+    }
+
     handle_context_transfer_shortcut(app, code, modifiers)
         || handle_split_picker_shortcut(app, code, modifiers)
         || handle_split_panel_focus_shortcut(app, code, modifiers)
@@ -1220,5 +1298,240 @@ mod tests {
         assert!(!dismisses_exited_session(KeyCode::F(10), true, true));
         // f10, split, not exited
         assert!(!dismisses_exited_session(KeyCode::F(10), true, false));
+    }
+}
+
+// C23: `handle_focus_shortcuts` must yield every key but F10 once a focused
+// child has claimed the keyboard (alternate screen or Kitty keyboard
+// protocol push) — Codex negotiates Kitty without ever entering the
+// alternate screen, which is the reported bug. Spawns a real (harmless)
+// `cat` child and drives its `vt` / `kitty_keyboard_flags` state directly,
+// mirroring the pattern established for C6/C20.
+#[cfg(test)]
+mod focus_shortcuts_keyboard_claim_tests {
+    use super::*;
+    use crate::db::Database;
+    use crate::domain::models::{Cli, SplitGroup, SplitOrientation};
+    use chrono::Utc;
+    use ratatui::style::Color;
+    use std::sync::Arc;
+    use tempfile::{tempdir, NamedTempFile};
+
+    fn test_db() -> Arc<Database> {
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        Arc::new(Database::new(&path).expect("create test db"))
+    }
+
+    fn spawn_cat_agent(name: &str) -> InteractiveAgent {
+        InteractiveAgent::spawn(
+            Cli::new("cat"),
+            ".",
+            80,
+            24,
+            None,
+            None,
+            Color::Reset,
+            Some(name),
+            &[],
+            None,
+            None,
+            None,
+        )
+        .expect("spawn cat as a stand-in interactive child")
+    }
+
+    fn app_with_interactive_agent(agent: InteractiveAgent) -> App {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.interactive_agents = vec![agent];
+        app.agents = vec![AgentEntry::Interactive(0)];
+        app.selected = 0;
+        app.focus = Focus::Agent;
+        app
+    }
+
+    #[test]
+    fn reserved_focus_keys_are_leave_focus_and_frame_navigation() {
+        // The list is frame navigation only: leave focus, and step between
+        // canopy's own panes. Anything that acts on the session's content is
+        // the child's.
+        assert_eq!(
+            RESERVED_FOCUS_KEYS,
+            [
+                (KeyCode::F(10), KeyModifiers::NONE),
+                (KeyCode::Up, KeyModifiers::SHIFT),
+                (KeyCode::Down, KeyModifiers::SHIFT),
+                (KeyCode::Left, KeyModifiers::SHIFT),
+                (KeyCode::Right, KeyModifiers::SHIFT),
+            ]
+        );
+        assert!(is_reserved_focus_key(KeyCode::F(10), KeyModifiers::NONE));
+        assert!(!is_reserved_focus_key(
+            KeyCode::Char('t'),
+            KeyModifiers::CONTROL
+        ));
+    }
+
+    #[test]
+    fn shift_arrows_stay_with_canopy_while_a_child_claims_the_keyboard() {
+        // Regression: C23 shipped with F10 as the only reserved key, which
+        // made Shift+arrows dead from inside a focused session — there was no
+        // way to step to another agent without leaving focus first.
+        for code in [KeyCode::Up, KeyCode::Down, KeyCode::Left, KeyCode::Right] {
+            assert!(
+                is_reserved_focus_key(code, KeyModifiers::SHIFT),
+                "Shift+{code:?} is frame navigation and must stay with canopy"
+            );
+            assert!(
+                !is_reserved_focus_key(code, KeyModifiers::NONE),
+                "a bare arrow is the child's"
+            );
+        }
+    }
+
+    #[test]
+    fn kitty_negotiated_child_does_not_have_ctrl_t_consumed() {
+        // The regression test for the whole spec: Codex's real shape is
+        // Kitty-negotiated without ever entering the alternate screen.
+        let agent = spawn_cat_agent("codex-like");
+        *agent.kitty_keyboard_flags.lock().expect("lock") = Some(7);
+        assert!(agent.kitty_keyboard_negotiated());
+        assert!(!agent.in_alternate_screen());
+        let mut app = app_with_interactive_agent(agent);
+
+        let handled = handle_focus_shortcuts(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+
+        assert!(!handled, "Ctrl+T must reach the Kitty-negotiated child");
+        app.interactive_agents[0].kill();
+    }
+
+    #[test]
+    fn kitty_negotiated_child_does_not_have_a_second_shortcut_consumed() {
+        // Proves the fix is the ownership contract, not a Ctrl+T-only patch:
+        // Ctrl+S (split picker) must yield too.
+        let agent = spawn_cat_agent("codex-like-2");
+        *agent.kitty_keyboard_flags.lock().expect("lock") = Some(7);
+        let mut app = app_with_interactive_agent(agent);
+
+        let handled = handle_focus_shortcuts(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+        assert!(!handled, "Ctrl+S must reach the Kitty-negotiated child");
+        assert!(!app.split_picker_open);
+        app.interactive_agents[0].kill();
+    }
+
+    #[test]
+    fn kitty_negotiated_child_still_yields_f10_and_leaves_focus() {
+        let agent = spawn_cat_agent("codex-like-3");
+        *agent.kitty_keyboard_flags.lock().expect("lock") = Some(7);
+        let mut app = app_with_interactive_agent(agent);
+
+        let handled = handle_focus_shortcuts(&mut app, KeyCode::F(10), KeyModifiers::NONE);
+
+        assert!(handled, "F10 is the one reserved key");
+        assert!(matches!(app.focus, Focus::Preview));
+        app.interactive_agents[0].kill();
+    }
+
+    #[test]
+    fn alternate_screen_child_without_kitty_behaves_identically() {
+        let agent = spawn_cat_agent("vim-like");
+        agent.vt.lock().expect("vt lock").process(b"\x1b[?1049h");
+        assert!(agent.in_alternate_screen());
+        assert!(!agent.kitty_keyboard_negotiated());
+        let mut app = app_with_interactive_agent(agent);
+
+        assert!(!handle_focus_shortcuts(
+            &mut app,
+            KeyCode::Char('t'),
+            KeyModifiers::CONTROL
+        ));
+        assert!(!handle_focus_shortcuts(
+            &mut app,
+            KeyCode::F(4),
+            KeyModifiers::NONE
+        ));
+        assert!(handle_focus_shortcuts(
+            &mut app,
+            KeyCode::F(10),
+            KeyModifiers::NONE
+        ));
+        assert!(matches!(app.focus, Focus::Preview));
+
+        app.interactive_agents[0].kill();
+    }
+
+    #[test]
+    fn neither_signal_behaves_exactly_like_today() {
+        let agent = spawn_cat_agent("plain-shell");
+        assert!(!agent.in_alternate_screen());
+        assert!(!agent.kitty_keyboard_negotiated());
+        let mut app = app_with_interactive_agent(agent);
+
+        let handled = handle_focus_shortcuts(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+
+        assert!(
+            handled,
+            "an unclaimed child must not change today's Ctrl+T behavior"
+        );
+        app.interactive_agents[0].kill();
+    }
+
+    #[test]
+    fn no_focused_agent_is_unaffected() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.focus = Focus::Agent;
+
+        assert!(!focused_child_claimed_keyboard(&app));
+        let handled = handle_focus_shortcuts(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        // Unaffected by this spec: `handle_context_transfer_shortcut` still
+        // consumes Ctrl+T unconditionally when it matches, agent or not.
+        assert!(handled);
+    }
+
+    #[test]
+    fn split_predicate_reads_the_focused_pane_not_the_other() {
+        let left = spawn_cat_agent("left-term");
+        let right = spawn_cat_agent("right-term");
+        *right.kitty_keyboard_flags.lock().expect("lock") = Some(7);
+
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.interactive_agents = vec![left, right];
+        app.split_groups.push(SplitGroup {
+            id: "split-1".to_string(),
+            orientation: SplitOrientation::Horizontal,
+            session_a: "left-term".to_string(),
+            session_b: "right-term".to_string(),
+            created_at: Utc::now(),
+        });
+        app.active_split_id = Some("split-1".to_string());
+        app.focus = Focus::Agent;
+
+        // Right panel focused: the claimed child owns the keyboard.
+        app.split_right_focused = true;
+        assert!(!handle_focus_shortcuts(
+            &mut app,
+            KeyCode::Char('t'),
+            KeyModifiers::CONTROL
+        ));
+
+        // Left panel focused: its unclaimed child leaves Ctrl+T with canopy —
+        // the other pane's claim must not leak across.
+        app.split_right_focused = false;
+        assert!(handle_focus_shortcuts(
+            &mut app,
+            KeyCode::Char('t'),
+            KeyModifiers::CONTROL
+        ));
+
+        app.interactive_agents[0].kill();
+        app.interactive_agents[1].kill();
     }
 }

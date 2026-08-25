@@ -25,8 +25,8 @@ impl Database {
         let tx = conn.transaction()?;
 
         tx.execute(
-            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 &lp.id,
                 &lp.name,
@@ -44,6 +44,7 @@ impl Database {
                 lp.auto_continue_at.map(|value| value.timestamp()),
                 &lp.auto_continue_action,
                 lp.archived,
+                lp.paused_by_reconciliation,
             ],
         )?;
 
@@ -155,6 +156,7 @@ mod tests {
     fn draft_loop(id: &str, name: &str, workdir: &str) -> Loop {
         Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: id.to_string(),
             name: name.to_string(),
             description: Some("imported".to_string()),

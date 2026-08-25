@@ -2,10 +2,19 @@
 //!
 //! Reads JSON-RPC lines from stdin and forwards them to the daemon's
 //! Streamable HTTP endpoint with identity headers (`x-canopy-agent-id`,
-//! `x-canopy-client-name`, `x-canopy-seed-id`), writing responses back to
-//! stdout. This keeps a single daemon owning the scheduler, watchers, RAG
-//! ingestion, and sync state, while each harness session carries its own
-//! identity in `argv`/env.
+//! `x-canopy-seed-id`), writing responses back to stdout. This keeps a
+//! single daemon owning the scheduler, watchers, RAG ingestion, and sync
+//! state, while each harness session carries its own identity in
+//! `argv`/env.
+//!
+//! Deliberately does *not* send its own `x-canopy-client-name`: every
+//! platform is funneled through this sidecar (see
+//! `setup_module::platform_adapter::enforce_canopy_bridge_transport`), so a
+//! literal `"bridge"` client name would carry no distinguishing information
+//! and would shadow the real actor name — `sync_messages.agent_name` is
+//! resolved daemon-side from the session the agent_id already identifies
+//! (interactive session name + cli, e.g. "cedrus · blackbox"), which already
+//! carries the transport (`cli = "bridge"` for standalone sessions).
 //!
 //! When the daemon is unreachable the bridge degrades to spawning an
 //! embedded `canopy stdio` server so the harness still gets a working MCP
@@ -22,8 +31,8 @@ use crate::application::ports::StateRepository;
 use crate::db::Database;
 use crate::domain::db_paths::database_path;
 use crate::shared::sync_identity::{
-    CANOPY_AGENT_ID_ENV, CANOPY_AGENT_ID_HEADER, CANOPY_CLIENT_NAME_ENV, CANOPY_CLIENT_NAME_HEADER,
-    CANOPY_SEED_ID_ENV, CANOPY_SEED_ID_HEADER, CANOPY_WORKDIR_ENV,
+    CANOPY_AGENT_ID_ENV, CANOPY_AGENT_ID_HEADER, CANOPY_SEED_ID_ENV, CANOPY_SEED_ID_HEADER,
+    CANOPY_WORKDIR_ENV,
 };
 
 const MCP_SESSION_HEADER: &str = "mcp-session-id";
@@ -325,7 +334,6 @@ async fn forward_request(
     let mut request = client
         .post(endpoint)
         .header(CANOPY_AGENT_ID_HEADER, agent_id)
-        .header(CANOPY_CLIENT_NAME_HEADER, "bridge")
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .header(
             reqwest::header::ACCEPT,
@@ -451,7 +459,6 @@ async fn run_embedded_stdio(agent_id: &str, workdir: &str) -> Result<()> {
         .arg("stdio")
         .env(CANOPY_AGENT_ID_ENV, agent_id)
         .env(CANOPY_WORKDIR_ENV, workdir)
-        .env(CANOPY_CLIENT_NAME_ENV, "bridge")
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
@@ -679,6 +686,74 @@ mod tests {
 
         assert!(is_session_not_found_error(&err));
         assert_eq!(http_status_of(&err), Some(reqwest::StatusCode::NOT_FOUND));
+
+        server.abort();
+    }
+
+    /// Regression guard for the identity-shadowing bug (T39): every platform
+    /// is funneled through this sidecar, so a hardcoded `x-canopy-client-name:
+    /// bridge` header would shadow a real session's name at the daemon (see
+    /// `TaskTriggerHandler::resolve_sync_client_name`), turning "boletus ·
+    /// claude" into "boletus · claude · bridge" — two spellings of one
+    /// identity. The daemon already resolves the transport (bridge vs.
+    /// direct) from the session's own `cli` column, so this header must stay
+    /// absent.
+    #[tokio::test]
+    async fn forward_request_omits_client_name_header() {
+        use axum::extract::Request;
+        use axum::response::IntoResponse;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let saw_client_name_header = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&saw_client_name_header);
+
+        async fn handle_mcp(
+            axum::extract::State(flag): axum::extract::State<Arc<AtomicBool>>,
+            request: Request,
+        ) -> axum::response::Response {
+            if request
+                .headers()
+                .contains_key(crate::shared::sync_identity::CANOPY_CLIENT_NAME_HEADER)
+            {
+                flag.store(true, Ordering::SeqCst);
+            }
+            (
+                axum::http::StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                r#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+            )
+                .into_response()
+        }
+
+        let router = axum::Router::new()
+            .route("/mcp", axum::routing::post(handle_mcp))
+            .with_state(flag);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let endpoint = format!("http://127.0.0.1:{port}/mcp");
+        let client = Client::new();
+        forward_request(
+            &client,
+            &endpoint,
+            "sess-boletus",
+            None,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            None,
+        )
+        .await
+        .expect("forward_request should succeed against the fake daemon");
+
+        assert!(
+            !saw_client_name_header.load(Ordering::SeqCst),
+            "forward_request must not send x-canopy-client-name; the daemon \
+             resolves the display name from the session itself"
+        );
 
         server.abort();
     }

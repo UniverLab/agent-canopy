@@ -199,12 +199,38 @@ impl InteractiveAgent {
             .unwrap_or(false)
     }
 
+    /// Whether the child has pushed Kitty keyboard protocol flags (`CSI >
+    /// flags u`) at any point in the session. Tracked from a raw scan of
+    /// PTY output — see [`parse_kitty_keyboard_push`] — independent of the
+    /// vt100 parser, which has no support of its own for this protocol
+    /// (vt100 0.16.2's `perform.rs` has no `u`-terminated CSI dispatch at
+    /// all).
+    pub fn kitty_keyboard_negotiated(&self) -> bool {
+        self.kitty_keyboard_flags
+            .try_lock()
+            .map(|f| f.is_some())
+            .unwrap_or(false)
+    }
+
     /// Forward a mouse event to the PTY.
     ///
     /// Checks the child's mouse protocol mode. If mouse reporting is
     /// active, sends the event in the correct encoding (SGR or X10).
     /// Returns `true` if the event was forwarded, `false` if no mouse
     /// protocol is active (caller should handle the event internally).
+    ///
+    /// Scroll ticks are forwarded (and consumed) here only when the child
+    /// has an active mouse protocol — see [`should_forward_scroll_to_child`].
+    /// Under `MouseProtocolMode::None` this always declines and writes
+    /// nothing, even inside a full-screen child's alternate screen: this
+    /// method has no way to know the guessed fallback keystroke actually
+    /// meant anything to the child, so consuming the event here would risk
+    /// silently eating a scroll gesture the child never understood (see the
+    /// C6b writeup — this exact bug shipped once already). The alternate
+    /// screen without a mouse protocol case is instead handled by
+    /// [`Self::forward_scroll`] via `scroll_terminal_like_agent` in
+    /// `event/mod.rs`, which always runs as a fallback after this method
+    /// declines, so the tick is never silently dropped either way.
     pub fn forward_mouse(
         &self,
         kind: ratatui::crossterm::event::MouseEventKind,
@@ -222,24 +248,33 @@ impl InteractiveAgent {
             )
         };
 
-        use vt100::MouseProtocolEncoding as MPE;
+        use ratatui::crossterm::event::MouseEventKind;
         use vt100::MouseProtocolMode as MPM;
+
+        if let Some(scroll_up) = scroll_direction(kind) {
+            if !should_forward_scroll_to_child(mode) {
+                return Ok(false);
+            }
+            let seq = encode_scroll_sequence(mode, encoding, scroll_up, col, row);
+            self.write_to_pty(&seq)?;
+            return Ok(true);
+        }
 
         match mode {
             MPM::None => Ok(false),
             _ => {
                 let (btn_code, is_release) = match kind {
-                    ratatui::crossterm::event::MouseEventKind::Down(
-                        ratatui::crossterm::event::MouseButton::Left,
-                    ) => (0u8, false),
-                    ratatui::crossterm::event::MouseEventKind::Down(
-                        ratatui::crossterm::event::MouseButton::Middle,
-                    ) => (1, false),
-                    ratatui::crossterm::event::MouseEventKind::Down(
-                        ratatui::crossterm::event::MouseButton::Right,
-                    ) => (2, false),
-                    ratatui::crossterm::event::MouseEventKind::Up(_) => (3, true),
-                    ratatui::crossterm::event::MouseEventKind::Drag(_) => {
+                    MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left) => {
+                        (0u8, false)
+                    }
+                    MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Middle) => {
+                        (1, false)
+                    }
+                    MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Right) => {
+                        (2, false)
+                    }
+                    MouseEventKind::Up(_) => (3, true),
+                    MouseEventKind::Drag(_) => {
                         let base = match button {
                             ratatui::crossterm::event::MouseButton::Left => 0,
                             ratatui::crossterm::event::MouseButton::Middle => 1,
@@ -247,11 +282,9 @@ impl InteractiveAgent {
                         };
                         (base + 32, false)
                     }
-                    ratatui::crossterm::event::MouseEventKind::Moved => {
+                    MouseEventKind::Moved => {
                         return Ok(false);
                     }
-                    ratatui::crossterm::event::MouseEventKind::ScrollUp => (64, false),
-                    ratatui::crossterm::event::MouseEventKind::ScrollDown => (65, false),
                     _ => return Ok(false),
                 };
 
@@ -259,7 +292,7 @@ impl InteractiveAgent {
                 let y = row + 1;
 
                 let seq = match encoding {
-                    MPE::Sgr => {
+                    vt100::MouseProtocolEncoding::Sgr => {
                         let term = if is_release { 'm' } else { 'M' };
                         format!("\x1b[<{};{};{}{}", btn_code, x, y, term).into_bytes()
                     }
@@ -294,9 +327,13 @@ impl InteractiveAgent {
 
     /// Forward a mouse scroll event to the PTY.
     ///
-    /// Checks the child's mouse protocol mode.  If mouse reporting is
-    /// active, sends the wheel event in the correct encoding.  Otherwise
-    /// falls back to arrow-key sequences.
+    /// Only called once the caller has already established the child owns
+    /// the screen (alternate screen — see `scroll_terminal_like_agent`), so
+    /// unlike [`Self::forward_mouse`] this always sends something: the
+    /// wheel event in the child's mouse-protocol encoding if it has one
+    /// active, otherwise the [`encode_scroll_sequence`] PgUp/PgDn fallback.
+    /// Shares that encoder with `forward_mouse` so the two can't disagree
+    /// about what a given `MouseProtocolMode` means.
     pub fn forward_scroll(&self, scroll_up: bool) -> Result<()> {
         let (mode, encoding, cols) = {
             let vt = self.vt.lock().map_err(|_| anyhow::anyhow!("vt lock"))?;
@@ -308,36 +345,155 @@ impl InteractiveAgent {
             )
         };
 
-        use vt100::MouseProtocolEncoding as MPE;
-        use vt100::MouseProtocolMode as MPM;
+        let col: u16 = cols / 2;
+        let row: u16 = 10;
+        let seq = encode_scroll_sequence(mode, encoding, scroll_up, col, row);
+        self.write_to_pty(&seq)
+    }
+}
 
-        match mode {
-            MPM::None => {
-                // No mouse protocol — send PgUp/PgDn (works in most TUIs)
-                let seq: &[u8] = if scroll_up { b"\x1b[5~" } else { b"\x1b[6~" };
-                self.write_to_pty(seq)
+/// `Some(true)` for a scroll-up tick, `Some(false)` for scroll-down, `None`
+/// for any other mouse event kind.
+fn scroll_direction(kind: ratatui::crossterm::event::MouseEventKind) -> Option<bool> {
+    match kind {
+        ratatui::crossterm::event::MouseEventKind::ScrollUp => Some(true),
+        ratatui::crossterm::event::MouseEventKind::ScrollDown => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether [`InteractiveAgent::forward_mouse`] should forward a scroll tick
+/// to the child *and treat it as consumed*.
+///
+/// True only when the child has an active mouse protocol — it explicitly
+/// asked for wheel events, so canopy knows the bytes mean something to it.
+/// Under `MouseProtocolMode::None` this is always false, even inside a
+/// full-screen child's alternate screen: `forward_mouse` has no
+/// confirmation the child understands the PgUp/PgDn fallback, so it must
+/// not consume the event on that guess (that guess shipped once already —
+/// see the C6b writeup — and made scrolling over Codex a dead gesture,
+/// since forwarding *and* consuming meant canopy's own fallback scroll
+/// never got a turn). The alternate-screen-without-a-protocol case is
+/// handled separately by [`InteractiveAgent::forward_scroll`], invoked
+/// unconditionally by `scroll_terminal_like_agent` in `event/mod.rs`
+/// whenever `forward_mouse` declines — so the tick still reaches the child
+/// there, just never at the cost of silently eating canopy's own fallback.
+fn should_forward_scroll_to_child(mode: vt100::MouseProtocolMode) -> bool {
+    mode != vt100::MouseProtocolMode::None
+}
+
+/// Encode a single scroll-wheel tick as PTY bytes for the child's current
+/// mouse-protocol mode/encoding. Shared by [`InteractiveAgent::forward_mouse`]
+/// and [`InteractiveAgent::forward_scroll`] so the two paths can never
+/// disagree about what a given `MouseProtocolMode` means for a scroll tick.
+fn encode_scroll_sequence(
+    mode: vt100::MouseProtocolMode,
+    encoding: vt100::MouseProtocolEncoding,
+    scroll_up: bool,
+    col: u16,
+    row: u16,
+) -> Vec<u8> {
+    use vt100::MouseProtocolEncoding as MPE;
+    use vt100::MouseProtocolMode as MPM;
+
+    match mode {
+        MPM::None => {
+            // No mouse protocol — legacy PgUp/PgDn (`CSI 5 ~` / `CSI 6 ~`)
+            // is sent unconditionally, whether or not the child pushed
+            // Kitty keyboard protocol flags (see `kitty_keyboard_negotiated`
+            // above). This is not a fallback we chose over a "real" Kitty
+            // encoding — for an unmodified Page Up/Page Down keypress there
+            // is no other encoding to send. The Kitty keyboard protocol's
+            // own "Functional key codes" table (kovidgoyal/kitty
+            // docs/keyboard-protocol.rst) lists PAGE_UP as `5 ~` and
+            // PAGE_DOWN as `6 ~` — identical to the legacy table — because
+            // these keys only gain a distinct `CSI number u` / PUA-codepoint
+            // form under the "report all keys as escape codes" enhancement
+            // bit (0x8), and even then the codepoints listed (57421/57422)
+            // are for the *keypad* variants (KP_PAGE_UP/KP_PAGE_DOWN), not
+            // the plain keys a scroll-wheel tick maps to. So `\x1b[5~` /
+            // `\x1b[6~` already *is* "the Kitty encoding" here.
+            //
+            // A prior version of this comment claimed to have verified this
+            // live against Codex by driving a "Transcript pager" over a
+            // real PTY and observing `\x1b[5~` move its scroll position
+            // from 100% to 0%. That claim could not be reproduced: driving
+            // Codex 0.147.0 over a real PTY (TERM=xterm-256color, matching
+            // how canopy spawns children — see `apply_canopy_session_env`
+            // callers in `agent/mod.rs`) through startup, the update-skip
+            // prompt, MCP server loading, a large composer paste, and an
+            // async rate-limit/model-switch picker never produced a single
+            // `\x1b[?1049h` (enter alternate screen), and neither `\x1b[5~`
+            // nor a hand-built `\x1b[5;1u` produced any output distinguishable
+            // from Codex's own idle spinner repaint. No "Transcript pager"
+            // was reachable (Ctrl+T was a no-op). Since `forward_scroll` is
+            // only ever invoked from `in_alternate_screen()` callers, and
+            // Codex was never observed to enter that mode, this fallback
+            // path does not appear to be exercised by Codex at all in the
+            // states reachable without quota (restored 2026-09-12) — see
+            // the C20 writeup.
+            if scroll_up {
+                b"\x1b[5~".to_vec()
+            } else {
+                b"\x1b[6~".to_vec()
             }
-            _ => {
-                let button: u8 = if scroll_up { 64 } else { 65 };
-                let col: u16 = cols / 2;
-                let row: u16 = 10;
-                let single = match encoding {
-                    MPE::Sgr => format!("\x1b[<{};{};{}M", button, col + 1, row + 1).into_bytes(),
-                    _ => {
-                        vec![
-                            0x1b,
-                            b'[',
-                            b'M',
-                            button + 32,
-                            (col as u8).wrapping_add(33),
-                            (row as u8).wrapping_add(33),
-                        ]
-                    }
-                };
-                self.write_to_pty(&single)
+        }
+        _ => {
+            let button: u8 = if scroll_up { 64 } else { 65 };
+            let x = col + 1;
+            let y = row + 1;
+            match encoding {
+                MPE::Sgr => format!("\x1b[<{};{};{}M", button, x, y).into_bytes(),
+                _ => vec![
+                    0x1b,
+                    b'[',
+                    b'M',
+                    button.wrapping_add(32),
+                    (x as u8).saturating_add(32),
+                    (y as u8).saturating_add(32),
+                ],
             }
         }
     }
+}
+
+/// Scan raw PTY output for a Kitty keyboard protocol "push flags" sequence
+/// (`CSI > flags u`, e.g. `\x1b[>7u`) and return the flags value from the
+/// last one found, if any. vt100 0.16.2 has no support of its own for this
+/// protocol (no `u`-terminated CSI dispatch in its `perform.rs`), so this
+/// scan runs independently over the same bytes handed to `vt100::Parser`,
+/// in the reader thread in `agent/mod.rs`.
+///
+/// Only recognises a push sequence that lands whole inside `data`. In
+/// practice a child emits this once, in its very first burst of output —
+/// the 91-byte ground-truth capture this module's tests are built from is
+/// exactly that burst arriving in a single PTY `read()` — so a parser that
+/// tolerates the sequence splitting across reads was not worth the added
+/// complexity.
+pub(crate) fn parse_kitty_keyboard_push(data: &[u8]) -> Option<u8> {
+    let mut found = None;
+    let mut i = 0;
+    while i + 3 < data.len() {
+        if data[i] == 0x1b && data[i + 1] == b'[' && data[i + 2] == b'>' {
+            let start = i + 3;
+            let mut j = start;
+            while j < data.len() && data[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > start && j < data.len() && data[j] == b'u' {
+                if let Ok(flags) = std::str::from_utf8(&data[start..j])
+                    .unwrap_or_default()
+                    .parse::<u32>()
+                {
+                    found = Some(flags.min(u8::MAX as u32) as u8);
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    found
 }
 
 /// Pure predicate behind [`InteractiveAgent::has_recent_activity`]: was
@@ -518,5 +674,264 @@ mod submit_sequencing_tests {
         write_submitted_prompt(&mut writer, "hi", true, spec).unwrap();
 
         assert_eq!(writer.chunks.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::{encode_scroll_sequence, should_forward_scroll_to_child};
+    use vt100::{MouseProtocolEncoding as MPE, MouseProtocolMode as MPM};
+
+    // C6b: `should_forward_scroll_to_child` used to also forward (and let
+    // `forward_mouse` consume) a scroll tick under `MouseProtocolMode::None`
+    // whenever the child owned the alternate screen, on the theory that the
+    // PgUp/PgDn fallback was better than nothing. In practice `forward_mouse`
+    // had no way to confirm the child understood that fallback, so a child
+    // that didn't (or one where the guess was simply wrong) silently ate the
+    // gesture — canopy's own fallback scroll in `scroll_terminal_like_agent`
+    // never got a turn, because the event was already marked consumed. That
+    // shipped and made scrolling over a real Codex session a dead gesture.
+    // The predicate is now protocol-only; the alternate-screen fallback is
+    // handled exclusively by `forward_scroll`/`scroll_terminal_like_agent`,
+    // which never consumes anything since it isn't gated by a return value.
+
+    #[test]
+    fn no_protocol_declines_regardless_of_screen_mode() {
+        // forward_mouse must never consume a scroll tick on a guess — see
+        // the module doc above. This is the regression test for C6b.
+        assert!(!should_forward_scroll_to_child(MPM::None));
+    }
+
+    #[test]
+    fn active_protocol_forwards() {
+        assert!(should_forward_scroll_to_child(MPM::Press));
+        assert!(should_forward_scroll_to_child(MPM::PressRelease));
+        assert!(should_forward_scroll_to_child(MPM::AnyMotion));
+    }
+
+    #[test]
+    fn no_protocol_sends_pgup_pgdn_fallback() {
+        assert_eq!(
+            encode_scroll_sequence(MPM::None, MPE::Sgr, true, 5, 5),
+            b"\x1b[5~".to_vec()
+        );
+        assert_eq!(
+            encode_scroll_sequence(MPM::None, MPE::Sgr, false, 5, 5),
+            b"\x1b[6~".to_vec()
+        );
+    }
+
+    #[test]
+    fn fallback_ignores_encoding_since_none_mode_has_no_wheel_protocol() {
+        let via_sgr = encode_scroll_sequence(MPM::None, MPE::Sgr, true, 5, 5);
+        let via_default = encode_scroll_sequence(MPM::None, MPE::Default, true, 5, 5);
+        assert_eq!(via_sgr, via_default);
+    }
+
+    #[test]
+    fn sgr_encoding_reports_button_64_for_scroll_up() {
+        let seq = encode_scroll_sequence(MPM::PressRelease, MPE::Sgr, true, 9, 4);
+        assert_eq!(seq, b"\x1b[<64;10;5M".to_vec());
+    }
+
+    #[test]
+    fn sgr_encoding_reports_button_65_for_scroll_down() {
+        let seq = encode_scroll_sequence(MPM::PressRelease, MPE::Sgr, false, 9, 4);
+        assert_eq!(seq, b"\x1b[<65;10;5M".to_vec());
+    }
+}
+
+// C6b: end-to-end coverage of `InteractiveAgent::forward_mouse`'s scroll
+// branch against a real spawned child, so the regression is pinned at the
+// method boundary the router (`try_forward_mouse_to_pty` in event/mod.rs)
+// actually calls — not just at the pure predicate.
+#[cfg(test)]
+mod forward_mouse_scroll_tests {
+    use crate::domain::models::Cli;
+    use crate::tui::agent::InteractiveAgent;
+    use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+    use ratatui::style::Color;
+
+    fn spawn_cat_agent() -> InteractiveAgent {
+        InteractiveAgent::spawn(
+            Cli::new("cat"),
+            ".",
+            80,
+            24,
+            None,
+            None,
+            Color::Reset,
+            Some("forward-mouse-scroll-test-agent"),
+            &[],
+            None,
+            None,
+            None,
+        )
+        .expect("spawn cat as a stand-in interactive child")
+    }
+
+    #[test]
+    fn no_protocol_in_alternate_screen_does_not_consume() {
+        // This is the regression test for the whole C6b spec: a full-screen
+        // child with no mouse protocol (Codex, in practice) must not have
+        // its scroll ticks swallowed here on the PgUp/PgDn guess — the
+        // caller (`scroll_terminal_like_agent`) is the one that forwards
+        // that fallback, and only it may claim credit for handling it.
+        let mut agent = spawn_cat_agent();
+        agent.vt.lock().expect("vt lock").process(b"\x1b[?1049h");
+        assert!(agent.in_alternate_screen());
+
+        let consumed = agent
+            .forward_mouse(MouseEventKind::ScrollUp, MouseButton::Left, 5, 5)
+            .expect("forward_mouse should not error");
+
+        assert!(!consumed);
+        agent.kill();
+    }
+
+    #[test]
+    fn no_protocol_outside_alternate_screen_does_not_consume() {
+        let mut agent = spawn_cat_agent();
+        assert!(!agent.in_alternate_screen());
+
+        let consumed = agent
+            .forward_mouse(MouseEventKind::ScrollDown, MouseButton::Left, 5, 5)
+            .expect("forward_mouse should not error");
+
+        assert!(!consumed);
+        agent.kill();
+    }
+
+    #[test]
+    fn active_protocol_consumes_scroll_ticks() {
+        let mut agent = spawn_cat_agent();
+        // DECSET 1000 (press/release mouse mode) + 1006 (SGR encoding).
+        agent
+            .vt
+            .lock()
+            .expect("vt lock")
+            .process(b"\x1b[?1000h\x1b[?1006h");
+
+        let consumed = agent
+            .forward_mouse(MouseEventKind::ScrollUp, MouseButton::Left, 5, 5)
+            .expect("forward_mouse should not error");
+
+        assert!(consumed);
+        agent.kill();
+    }
+}
+
+// C20: pure-function coverage for `parse_kitty_keyboard_push`, the raw-byte
+// scan that stands in for vt100's lack of Kitty keyboard protocol support.
+#[cfg(test)]
+mod kitty_keyboard_push_tests {
+    use super::parse_kitty_keyboard_push;
+
+    // Ground truth: Codex 0.147.0's real negotiation burst, captured over a
+    // real PTY (see the C20 writeup) — 91 bytes, arriving in one PTY read.
+    const CODEX_NEGOTIATION: &[u8] = b"\x1b[?2004h\x1b[>4;0m\x1b[>7u\x1b[?1004h\x1b[6n\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b[?u\x1b[c\x1b[?2026h\x1b[39m\x1b[49m\x1b[0m\x1b[?25l\x1b[?2026l";
+
+    #[test]
+    fn recognises_the_codex_negotiation_burst() {
+        assert_eq!(parse_kitty_keyboard_push(CODEX_NEGOTIATION), Some(7));
+    }
+
+    #[test]
+    fn absence_leaves_it_unset() {
+        // The same burst minus the `\x1b[>7u` push — everything else here
+        // (modifyOtherKeys, focus reporting, cursor position report) must
+        // not be mistaken for a keyboard-protocol push.
+        assert_eq!(
+            parse_kitty_keyboard_push(b"\x1b[?2004h\x1b[>4;0m\x1b[?1004h\x1b[6n"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_later_push_overrides_an_earlier_one() {
+        assert_eq!(parse_kitty_keyboard_push(b"\x1b[>1u\x1b[>31u"), Some(31));
+    }
+
+    #[test]
+    fn a_push_with_no_flags_digits_is_not_mistaken_for_one() {
+        assert_eq!(parse_kitty_keyboard_push(b"\x1b[>u"), None);
+    }
+}
+
+// C20: end-to-end coverage of `InteractiveAgent::kitty_keyboard_negotiated`
+// against a real spawned child, mirroring the `forward_mouse_scroll_tests`
+// pattern above — the state must come from genuine PTY output, not a mock.
+#[cfg(test)]
+mod kitty_keyboard_negotiation_tests {
+    use crate::domain::models::Cli;
+    use crate::tui::agent::InteractiveAgent;
+    use ratatui::style::Color;
+    use std::time::{Duration, Instant};
+
+    fn spawn_cat_agent() -> InteractiveAgent {
+        InteractiveAgent::spawn(
+            Cli::new("cat"),
+            ".",
+            80,
+            24,
+            None,
+            None,
+            Color::Reset,
+            Some("kitty-keyboard-test-agent"),
+            &[],
+            None,
+            None,
+            None,
+        )
+        .expect("spawn cat as a stand-in interactive child")
+    }
+
+    fn wait_for(mut check: impl FnMut() -> bool, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if check() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn negotiated_state_is_set_once_the_child_pushes_kitty_flags() {
+        let mut agent = spawn_cat_agent();
+        assert!(!agent.kitty_keyboard_negotiated());
+
+        // `cat` echoes stdin straight back out to its own stdout, so
+        // writing the push sequence to its stdin round-trips it through the
+        // real reader thread in `agent/mod.rs` exactly as a genuine child's
+        // own output would. The PTY is in canonical mode, so a trailing
+        // newline is needed to flush the line through to `cat` — it ends up
+        // in the echoed bytes too, but the scanner only cares about the
+        // `CSI > 7 u` part.
+        agent
+            .write_to_pty(b"\x1b[>7u\n")
+            .expect("write to cat's stdin");
+
+        assert!(wait_for(
+            || agent.kitty_keyboard_negotiated(),
+            Duration::from_secs(2)
+        ));
+        agent.kill();
+    }
+
+    #[test]
+    fn negotiated_state_stays_unset_without_a_push() {
+        let mut agent = spawn_cat_agent();
+        agent
+            .write_to_pty(b"hello, no kitty push here\n")
+            .expect("write to cat's stdin");
+        // Give the reader thread a beat to process ordinary output too, so
+        // this isn't just "we didn't wait long enough".
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!agent.kitty_keyboard_negotiated());
+        agent.kill();
     }
 }

@@ -52,7 +52,8 @@ pub(super) fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App, theme: 
     }
 
     let brain_area = draw_sidebar_tabs(frame, content_below, app, theme);
-    render_brain_or_graph(frame, brain_area, app, theme);
+    let is_knowledge_tab = app.sidebar_layer == SidebarLayer::Knowledge;
+    render_brain_or_graph(frame, brain_area, app, theme, is_knowledge_tab);
 
     render_dashboard_if_present(frame, areas.dashboard, app, theme);
 
@@ -215,25 +216,104 @@ fn render_dashboard_if_present(frame: &mut Frame, area: Option<Rect>, app: &App,
     );
 }
 
-/// Leftover space below the three layers: the project relation graph when
-/// there's something to show, else Brian's Brain.
-fn render_brain_or_graph(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+/// The project graph's minimum *outer* height — what the split hands out,
+/// not what `draw_project_graph` gets to draw into. `render_titled_panel`
+/// strips the border before calling in, so with `Borders::ALL` this leaves
+/// an inner budget of 2 edge lines; with a borderless theme, all 4.
+/// `draw_project_graph` must budget the inner height it receives directly
+/// rather than subtracting border rows a second time.
+const GRAPH_MIN_HEIGHT: u16 = 4;
+
+/// How the leftover space below the three layers is carved up between the
+/// project relation graph and Brian's Brain. When the graph has nothing to
+/// show, the brain takes the whole area, as before. When it does, the graph
+/// gets its minimum first (it carries information; the brain is atmosphere),
+/// then the brain takes whatever remains, if that remainder still meets its
+/// own minimum — otherwise the graph draws alone rather than splitting into
+/// two broken panels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrainOrGraphLayout {
+    Neither,
+    GraphOnly(Rect),
+    BrainOnly(Rect),
+    Both { graph: Rect, brain: Rect },
+}
+
+fn split_brain_or_graph(area: Rect, graph_has_content: bool) -> BrainOrGraphLayout {
     if area.height == 0 {
-        return;
+        return BrainOrGraphLayout::Neither;
     }
-    if !app.project_graph_trees.is_empty() && area.height >= 4 {
-        render_titled_panel(
-            frame,
-            area,
-            " project graph ",
-            Style::default().fg(theme.dim_text),
-            Style::default().fg(theme.dim_text),
-            theme,
-            |frame, inner| draw_project_graph(frame, inner, app),
-        );
-        return;
+
+    if !graph_has_content {
+        return if area.height >= 3 && area.width >= 6 {
+            BrainOrGraphLayout::BrainOnly(area)
+        } else {
+            BrainOrGraphLayout::Neither
+        };
     }
-    render_brain_if_visible(frame, area, app);
+
+    if area.height < GRAPH_MIN_HEIGHT {
+        return BrainOrGraphLayout::Neither;
+    }
+
+    let brain_fits = area.width >= 6 && area.height >= GRAPH_MIN_HEIGHT + 3;
+    if !brain_fits {
+        return BrainOrGraphLayout::GraphOnly(area);
+    }
+
+    let graph = Rect::new(area.x, area.y, area.width, GRAPH_MIN_HEIGHT);
+    let brain = Rect::new(
+        area.x,
+        area.y + GRAPH_MIN_HEIGHT,
+        area.width,
+        area.height - GRAPH_MIN_HEIGHT,
+    );
+    BrainOrGraphLayout::Both { graph, brain }
+}
+
+fn render_graph_panel(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    render_titled_panel(
+        frame,
+        area,
+        " project graph ",
+        Style::default().fg(theme.dim_text),
+        Style::default().fg(theme.dim_text),
+        theme,
+        |frame, inner| draw_project_graph(frame, inner, app, theme),
+    );
+}
+
+/// Whether the shared strip should reserve rows for the project graph
+/// instead of handing them all to Brian's Brain: only on the Knowledge tab
+/// (C26 decision 1 — projects aren't the subject on Live/Automation), and
+/// only when there's an edge to draw (C26 decision 2 — a workspace of
+/// unrelated projects still fills `project_graph_trees` with one singleton
+/// per project, which is not "content").
+fn graph_has_content(edge_count: usize, is_knowledge_tab: bool) -> bool {
+    is_knowledge_tab && edge_count > 0
+}
+
+fn render_brain_or_graph(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    theme: &Theme,
+    is_knowledge_tab: bool,
+) {
+    let graph_has_content = graph_has_content(app.project_graph_edges.len(), is_knowledge_tab);
+    match split_brain_or_graph(area, graph_has_content) {
+        BrainOrGraphLayout::Neither => {}
+        BrainOrGraphLayout::GraphOnly(graph_area) => {
+            render_graph_panel(frame, graph_area, app, theme);
+        }
+        BrainOrGraphLayout::BrainOnly(brain_area) => {
+            render_brain_if_visible(frame, brain_area, app);
+        }
+        BrainOrGraphLayout::Both { graph, brain } => {
+            render_graph_panel(frame, graph, app, theme);
+            render_brain_if_visible(frame, brain, app);
+        }
+    }
 }
 
 // ── Layer headers ─────────────────────────────────────────────────
@@ -428,9 +508,11 @@ fn groups_list_demand(count: usize) -> u16 {
 /// remaining height — exactly one tab is visible at a time, so there's no
 /// more space-sharing between layers (`fair_section_heights` is still used
 /// *within* a tab's own sub-sections, e.g. Live's interactive/terminal/
-/// groups panels). Returns the leftover area for the project graph / Brian's
-/// Brain — now always empty, since the active tab claims the full height,
-/// but `render_brain_or_graph` already no-ops on a zero-height area.
+/// groups panels). Returns the rows the active tab did not claim, which the
+/// project graph and Brian's Brain share. `fair_section_heights` caps each
+/// sub-section at its own demand, so a tab with few agents genuinely leaves
+/// rows over; handing back a hardcoded empty rect here is what made the brain
+/// unreachable no matter how that leftover was later divided.
 fn draw_sidebar_tabs(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) -> Rect {
     let (background_indices, interactive_indices, terminal_indices) = agent_indices_by_kind(app);
 
@@ -449,12 +531,10 @@ fn draw_sidebar_tabs(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme
             theme,
         ),
         SidebarLayer::Automation => {
-            draw_automation_body(frame, remaining, app, &background_indices, theme);
+            draw_automation_body(frame, remaining, app, &background_indices, theme)
         }
         SidebarLayer::Knowledge => draw_knowledge_body(frame, remaining, app, theme),
     }
-
-    Rect::new(area.x, area.y + area.height, area.width, 0)
 }
 
 fn draw_live_body(
@@ -464,7 +544,7 @@ fn draw_live_body(
     interactive_indices: &[usize],
     terminal_indices: &[usize],
     theme: &Theme,
-) {
+) -> Rect {
     let demands = [
         card_list_demand(interactive_indices.len()),
         card_list_demand(terminal_indices.len()),
@@ -494,7 +574,7 @@ fn draw_live_body(
             " terminal ",
             terminal_indices,
             app,
-            Color::Green,
+            theme.success,
             border_style,
             theme,
         );
@@ -502,6 +582,8 @@ fn draw_live_body(
     if let Some(sub) = take_top(&mut remaining, alloc[2]) {
         render_groups_panel(frame, Some(sub), app, AgentSectionFocus::Groups, theme);
     }
+
+    remaining
 }
 
 fn draw_automation_body(
@@ -510,7 +592,7 @@ fn draw_automation_body(
     app: &mut App,
     background_indices: &[usize],
     theme: &Theme,
-) {
+) -> Rect {
     let loop_count = app.sidebar_loops().len();
     let demands = [
         card_list_demand(background_indices.len()),
@@ -553,18 +635,41 @@ fn draw_automation_body(
             |frame, inner| draw_automation_loops_list(frame, inner, app, theme),
         );
     }
+
+    remaining
 }
 
-fn draw_knowledge_body(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
-    render_titled_panel(
-        frame,
-        area,
-        " projects ",
-        Style::default().fg(theme.dim_text),
-        knowledge_border_style(app, theme),
-        theme,
-        |frame, inner| draw_projects_list(frame, inner, app, theme),
-    );
+/// Rows needed for the projects panel: 3-row cards + 1-row gap + 2-row
+/// border (see `draw_projects_list`), with a 3-row floor so the panel (and
+/// its "No registered projects" message) still shows when the list is
+/// empty. Like `card_list_demand`, a workspace with few projects leaves
+/// rows over for the project graph and Brian's Brain below it (C26) —
+/// unlike Knowledge's old behavior of always claiming the whole area,
+/// which made the graph panel unreachable no matter how many relations
+/// existed.
+fn project_list_demand(count: usize) -> u16 {
+    if count == 0 {
+        3
+    } else {
+        count as u16 * 4 + 2
+    }
+}
+
+fn draw_knowledge_body(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) -> Rect {
+    let mut remaining = area;
+    if let Some(sub) = take_top(&mut remaining, project_list_demand(app.projects.len())) {
+        render_titled_panel(
+            frame,
+            sub,
+            " projects ",
+            Style::default().fg(theme.dim_text),
+            knowledge_border_style(app, theme),
+            theme,
+            |frame, inner| draw_projects_list(frame, inner, app, theme),
+        );
+    }
+
+    remaining
 }
 
 // ── Focus/border styling ────────────────────────────────────────────
@@ -692,7 +797,7 @@ fn draw_projects_list(frame: &mut Frame, area: Rect, app: &mut App, theme: &Them
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "No registered projects",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.muted_text),
             ))),
             area,
         );
@@ -810,7 +915,7 @@ fn loop_status_icon(lp: &Loop, meta: &LoopSidebarMeta, theme: &Theme) -> (&'stat
     match lp.status {
         LoopStatus::Running => ("▶", STATUS_RUNNING),
         LoopStatus::Paused if meta.blocked => ("⛔", STATUS_FAIL),
-        LoopStatus::Paused => ("⏸", Color::Yellow),
+        LoopStatus::Paused => ("⏸", theme.warning),
         LoopStatus::Draft => ("○", theme.dim_text),
         LoopStatus::Completed => ("✓", STATUS_OK),
         LoopStatus::Failed => ("✗", STATUS_FAIL),
@@ -881,7 +986,7 @@ fn draw_automation_loops_list(frame: &mut Frame, area: Rect, app: &mut App, them
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "No loops",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.muted_text),
             ))),
             area,
         );
@@ -934,13 +1039,13 @@ fn draw_automation_loops_list(frame: &mut Frame, area: Rect, app: &mut App, them
 fn project_title_style(selected: bool, panel_focused: bool, theme: &Theme) -> Style {
     if selected && panel_focused {
         return Style::default()
-            .fg(Color::Black)
+            .fg(theme.accent_fg)
             .bg(theme.header_color)
             .add_modifier(Modifier::BOLD);
     }
     if selected {
         return Style::default()
-            .fg(Color::White)
+            .fg(theme.text_primary)
             .bg(theme.selected_bg)
             .add_modifier(Modifier::BOLD);
     }
@@ -951,7 +1056,9 @@ fn project_title_style(selected: bool, panel_focused: bool, theme: &Theme) -> St
 
 fn project_meta_style(selected: bool, theme: &Theme) -> Style {
     if selected {
-        Style::default().fg(Color::White).bg(theme.selected_bg)
+        Style::default()
+            .fg(theme.text_primary)
+            .bg(theme.selected_bg)
     } else {
         Style::default().fg(theme.dim_text)
     }
@@ -972,7 +1079,7 @@ fn draw_rag_queue(
             break;
         }
         let (icon, icon_color) = if item.status == "processing" {
-            ("◉", Color::Yellow)
+            ("◉", theme.warning)
         } else {
             ("·", theme.header_color)
         };
@@ -985,7 +1092,7 @@ fn draw_rag_queue(
                 Span::raw(" "),
                 Span::styled(
                     truncate_str(&item.source_path, area.width.saturating_sub(3) as usize),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(theme.text_primary),
                 ),
             ])),
             Rect::new(area.x, y, area.width, 1),
@@ -1049,7 +1156,7 @@ fn labeled_kv_line(label: &'static str, value: &str, theme: &Theme) -> Line<'sta
         Span::styled(
             value.to_string(),
             Style::default()
-                .fg(Color::White)
+                .fg(theme.text_primary)
                 .add_modifier(Modifier::BOLD),
         ),
     ])
@@ -1067,27 +1174,27 @@ fn rag_status_line(app: &App, theme: &Theme) -> Line<'static> {
     ) {
         RagModelStatus::Unavailable(_) => Line::from(Span::styled(
             " ✗ unavailable ",
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme.error),
         )),
         RagModelStatus::DownloadFailed(_) => Line::from(Span::styled(
             " ✗ download failed ",
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme.error),
         )),
         RagModelStatus::Downloading { .. } => Line::from(Span::styled(
             " ⬇ downloading ",
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme.warning),
         )),
         RagModelStatus::Preparing { .. } => Line::from(Span::styled(
             " ⚙ preparing ",
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme.warning),
         )),
         RagModelStatus::Paused => Line::from(Span::styled(
             " ⏸ paused ",
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme.warning),
         )),
         RagModelStatus::Ready if app.rag_info.processing_items > 0 => Line::from(Span::styled(
             " ◉ indexing ",
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme.warning),
         )),
         RagModelStatus::Ready => Line::from(Span::styled(
             " ● ready ",
@@ -1225,7 +1332,11 @@ fn draw_sidebar_card(
         name,
         Style::default()
             .add_modifier(Modifier::BOLD)
-            .fg(if selected { meta.accent } else { Color::White }),
+            .fg(if selected {
+                meta.accent
+            } else {
+                theme.text_primary
+            }),
     )];
     if is_agent_in_group(name, app) {
         name_spans.push(Span::styled(" [▣]", Style::default().fg(theme.dim_text)));
@@ -1322,7 +1433,7 @@ fn agent_card_meta<'a>(agent: &'a AgentEntry, app: &'a App, theme: &Theme) -> Ag
         AgentEntry::Orphaned(index) => {
             let session = &app.orphaned_sessions[*index];
             AgentCardMeta {
-                accent: ratatui::style::Color::DarkGray,
+                accent: theme.muted_text,
                 status_color: STATUS_FAIL,
                 agent_type: "orphan",
                 type_detail: session.cli.as_str(),
@@ -1337,7 +1448,7 @@ fn agent_card_meta<'a>(agent: &'a AgentEntry, app: &'a App, theme: &Theme) -> Ag
             work_dir: None,
         },
         AgentEntry::Corrupt(_) => AgentCardMeta {
-            accent: ratatui::style::Color::Red,
+            accent: theme.error,
             status_color: STATUS_FAIL,
             agent_type: "corrupt config",
             type_detail: "",
@@ -1496,9 +1607,9 @@ fn group_row_style(is_selected: bool, is_active: bool, theme: &Theme) -> GroupRo
         fg: if is_selected {
             theme.header_color
         } else if is_active {
-            Color::Green
+            theme.success
         } else {
-            Color::White
+            theme.text_primary
         },
         modifier: if is_active || is_selected {
             Modifier::BOLD
@@ -1506,7 +1617,7 @@ fn group_row_style(is_selected: bool, is_active: bool, theme: &Theme) -> GroupRo
             Modifier::empty()
         },
         prefix_color: if is_active {
-            Color::Green
+            theme.success
         } else {
             theme.dim_text
         },
@@ -1562,7 +1673,15 @@ fn draw_groups_list(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme)
 
 // ── Project Graph ────────────────────────────────────────────────
 
-fn draw_project_graph(frame: &mut Frame, area: Rect, app: &App) {
+/// How many edge lines fit in the panel's inner area. `inner_height` is
+/// already the post-border rect `render_titled_panel` hands to its
+/// callback — budget it directly rather than subtracting border rows a
+/// second time, which used to compute 0 at the panel's minimum height.
+fn graph_edge_row_budget(inner_height: u16, edge_count: usize) -> usize {
+    edge_count.min(inner_height as usize)
+}
+
+fn draw_project_graph(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     if app.project_graph_trees.is_empty() || app.project_graph_edges.is_empty() {
         let msg = if app.projects.len() <= 1 {
             "No relationships yet. Press Enter on a project to link."
@@ -1572,17 +1691,14 @@ fn draw_project_graph(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 msg,
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.muted_text),
             ))),
             area,
         );
         return;
     }
 
-    let edge_count = app
-        .project_graph_edges
-        .len()
-        .min(area.height.saturating_sub(2) as usize);
+    let edge_count = graph_edge_row_budget(area.height, app.project_graph_edges.len());
 
     for (i, edge) in app.project_graph_edges.iter().take(edge_count).enumerate() {
         let y = area.y + i as u16;
@@ -1603,6 +1719,7 @@ fn draw_project_graph(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 truncate_str(&label, area.width.saturating_sub(2) as usize),
+                // THEME-EXEMPT: single-use graph-edge cyan — not a recurring role.
                 Style::default().fg(Color::Cyan),
             ))),
             Rect::new(area.x, y, area.width, 1),
@@ -1658,7 +1775,7 @@ fn draw_project_relation_dialog(
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 truncate_str(error, inner.width as usize),
-                Style::default().fg(Color::Red),
+                Style::default().fg(theme.error),
             ))),
             Rect::new(inner.x, inner.y + 1, inner.width, 1),
         );
@@ -1673,7 +1790,7 @@ fn draw_project_relation_dialog(
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             format!("{}|", filter_label),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme.warning),
         ))),
         Rect::new(inner.x, inner.y + 2, inner.width, 1),
     );
@@ -1699,10 +1816,10 @@ fn draw_project_relation_dialog(
         );
         let style = if i as usize == dialog.selected_idx {
             Style::default()
-                .fg(Color::White)
+                .fg(theme.text_primary)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.muted_text)
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(name, style))),
@@ -1714,7 +1831,7 @@ fn draw_project_relation_dialog(
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "No other projects indexed.",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.muted_text),
             ))),
             Rect::new(inner.x, list_start_y, inner.width, 1),
         );
@@ -1767,6 +1884,20 @@ mod tests {
         theme: &Theme,
         active_layer: SidebarLayer,
     ) -> String {
+        render_sidebar_text_with(project_count, width, height, theme, active_layer, |_| {})
+    }
+
+    /// Like [`render_sidebar_text_on_tab`], but runs `prepare` on the App after
+    /// it is built and before the sidebar is drawn — for state the constructor
+    /// does not set up, such as an installed Brian's Brain.
+    fn render_sidebar_text_with(
+        project_count: usize,
+        width: u16,
+        height: u16,
+        theme: &Theme,
+        active_layer: SidebarLayer,
+        prepare: impl FnOnce(&mut App),
+    ) -> String {
         use crate::db::Database;
         use crate::domain::loops::{Loop, LoopStatus};
         use crate::domain::project::Project;
@@ -1793,6 +1924,7 @@ mod tests {
         }
         db.insert_loop(&Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf-probe".to_string(),
             name: "Probe Loop".to_string(),
             description: None,
@@ -1817,6 +1949,7 @@ mod tests {
             !app.sidebar_loops().is_empty(),
             "loop should be loaded from db"
         );
+        prepare(&mut app);
 
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1841,6 +1974,46 @@ mod tests {
             text.push('\n');
         }
         text
+    }
+
+    /// A brain whose every cell is On, so its glyphs are deterministic instead
+    /// of depending on the automaton's random seed.
+    fn solid_brain(rows: usize, cols: usize) -> crate::tui::brians_brain::BriansBrain {
+        use crate::tui::brians_brain::CellState;
+        let mut brain = crate::tui::brians_brain::BriansBrain::new(rows, cols, 60);
+        for row in brain.grid.iter_mut() {
+            for cell in row.iter_mut() {
+                *cell = CellState::On;
+            }
+        }
+        for row in brain.green_grid.iter_mut() {
+            for green in row.iter_mut() {
+                *green = 255;
+            }
+        }
+        brain
+    }
+
+    /// The active tab's sub-sections are each capped at their own demand, so a
+    /// tall sidebar holding one loop and no sessions leaves rows unclaimed.
+    /// Those rows belong to the brain. `draw_sidebar_tabs` used to hand back a
+    /// hardcoded zero-height rect instead, which made the brain unreachable no
+    /// matter how `split_brain_or_graph` later divided it.
+    #[test]
+    fn unclaimed_tab_rows_are_handed_to_the_brain() {
+        let text = render_sidebar_text_with(
+            0,
+            30,
+            60,
+            &Theme::classic(),
+            SidebarLayer::Automation,
+            |app| app.sidebar_brain = Some(solid_brain(40, 28)),
+        );
+
+        assert!(
+            text.contains('\u{2588}') || text.contains('\u{28ff}'),
+            "expected Brian's Brain glyphs in the sidebar's unclaimed rows, got:\n{text}"
+        );
     }
 
     #[test]
@@ -1922,6 +2095,7 @@ mod tests {
     fn bare_loop(id: &str, status: LoopStatus) -> Loop {
         Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: id.to_string(),
             name: format!("Loop {id}"),
             description: None,
@@ -1967,6 +2141,7 @@ mod tests {
             started_at: Some(started_at),
             completed_at: Some(started_at),
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -2326,7 +2501,8 @@ mod tests {
         assert_eq!(alloc[2], demands[2]);
         // Interactive absorbs all the surplus and scrolls internally.
         assert_eq!(alloc[1], 30 - demands[0] - demands[2]);
-        // The whole budget is used — no leftover rows leaking to a brain gap.
+        // Demand exceeds the budget here, so every row is spoken for and
+        // nothing is left over for the brain.
         assert_eq!(alloc.iter().sum::<u16>(), 30);
     }
 
@@ -3098,5 +3274,174 @@ mod tests {
         let line = rag_status_line(&app, &theme);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("download failed"), "got: {text:?}");
+    }
+
+    #[test]
+    fn split_shares_space_when_both_fit() {
+        let area = Rect::new(0, 0, 30, 20);
+        match split_brain_or_graph(area, true) {
+            BrainOrGraphLayout::Both { graph, brain } => {
+                assert!(graph.height >= GRAPH_MIN_HEIGHT, "graph below its minimum");
+                assert!(brain.height >= 3, "brain below its minimum");
+                assert_eq!(
+                    graph.height + brain.height,
+                    area.height,
+                    "the two sub-areas should cover the whole leftover area"
+                );
+                assert_eq!(
+                    brain.y,
+                    graph.y + graph.height,
+                    "brain should sit below the graph"
+                );
+            }
+            other => panic!("expected Both, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_gives_graph_alone_when_only_it_fits() {
+        // Tall enough for the graph (>=4) but not for graph + brain (>=7).
+        let area = Rect::new(0, 0, 30, 5);
+        match split_brain_or_graph(area, true) {
+            BrainOrGraphLayout::GraphOnly(graph) => assert_eq!(graph, area),
+            other => panic!("expected GraphOnly, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_gives_brain_alone_when_graph_is_empty() {
+        // Below the graph's own minimum, but that's moot since it has nothing to show.
+        let area = Rect::new(0, 0, 30, 3);
+        match split_brain_or_graph(area, false) {
+            BrainOrGraphLayout::BrainOnly(brain) => assert_eq!(brain, area),
+            other => panic!("expected BrainOnly, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_yields_neither_below_both_minimums() {
+        let area = Rect::new(0, 0, 30, 2);
+        assert_eq!(
+            split_brain_or_graph(area, true),
+            BrainOrGraphLayout::Neither
+        );
+    }
+
+    #[test]
+    fn split_yields_neither_on_zero_height() {
+        let area = Rect::new(0, 0, 30, 0);
+        assert_eq!(
+            split_brain_or_graph(area, true),
+            BrainOrGraphLayout::Neither
+        );
+        assert_eq!(
+            split_brain_or_graph(area, false),
+            BrainOrGraphLayout::Neither
+        );
+    }
+
+    // ── C26: graph_has_content / graph_edge_row_budget ────────────────
+
+    #[test]
+    fn graph_has_content_regression_defect_1_trees_but_no_edges() {
+        // 39 singleton trees, 0 edges: `project_graph_trees` is never empty
+        // (defect 1's false-positive signal), but with no edges there's
+        // nothing to draw, so content must read false and the split must
+        // hand the whole area to the brain.
+        assert!(!graph_has_content(0, true));
+
+        let area = Rect::new(0, 0, 30, 20);
+        match split_brain_or_graph(area, graph_has_content(0, true)) {
+            BrainOrGraphLayout::BrainOnly(brain) => assert_eq!(brain, area),
+            other => panic!("expected BrainOnly, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graph_has_content_true_with_at_least_one_edge_on_knowledge_tab() {
+        assert!(graph_has_content(1, true));
+    }
+
+    #[test]
+    fn graph_has_content_gated_to_knowledge_layer() {
+        // Same edge count, same area — only the tab differs.
+        let edge_count = 3;
+        assert!(
+            graph_has_content(edge_count, true),
+            "Knowledge should show it"
+        );
+        assert!(
+            !graph_has_content(edge_count, false),
+            "Live/Automation should not show it"
+        );
+    }
+
+    #[test]
+    fn graph_edge_row_budget_regression_defect_2() {
+        // GRAPH_MIN_HEIGHT is the *outer* height the split hands the panel;
+        // render_titled_panel strips Borders::ALL's 2 border rows before
+        // draw_project_graph ever sees the area. The old code subtracted
+        // another 2 from that already-inner height, computing 0 for a
+        // panel that has exactly one edge to show.
+        let inner_height = GRAPH_MIN_HEIGHT - 2;
+        assert_eq!(graph_edge_row_budget(inner_height, 1), 1);
+    }
+
+    #[test]
+    fn graph_edge_row_budget_truncates_to_available_rows() {
+        assert_eq!(graph_edge_row_budget(2, 5), 2);
+    }
+
+    #[test]
+    fn graph_edge_row_budget_draws_all_edges_when_rows_have_slack() {
+        assert_eq!(graph_edge_row_budget(10, 3), 3);
+    }
+
+    #[test]
+    fn knowledge_tab_with_an_edge_draws_the_graph_panel() {
+        let text = render_sidebar_text_with(
+            2,
+            34,
+            40,
+            &Theme::classic(),
+            SidebarLayer::Knowledge,
+            |app| {
+                app.project_graph_edges
+                    .push(crate::tui::app::types::ProjectGraphEdge {
+                        from_name: "project0".to_string(),
+                        to_name: "project1".to_string(),
+                        from_hash: "hash0".to_string(),
+                        to_hash: "hash1".to_string(),
+                        relation: "depends_on".to_string(),
+                    });
+            },
+        );
+        assert!(
+            text.contains("project graph"),
+            "graph panel title missing: {text}"
+        );
+        assert!(
+            text.contains("project0") && text.contains("project1"),
+            "edge label missing: {text}"
+        );
+    }
+
+    #[test]
+    fn live_tab_never_shows_the_graph_panel_even_with_edges() {
+        let text =
+            render_sidebar_text_with(2, 34, 40, &Theme::classic(), SidebarLayer::Live, |app| {
+                app.project_graph_edges
+                    .push(crate::tui::app::types::ProjectGraphEdge {
+                        from_name: "project0".to_string(),
+                        to_name: "project1".to_string(),
+                        from_hash: "hash0".to_string(),
+                        to_hash: "hash1".to_string(),
+                        relation: "depends_on".to_string(),
+                    });
+            });
+        assert!(
+            !text.contains("project graph"),
+            "graph panel must not render on Live: {text}"
+        );
     }
 }

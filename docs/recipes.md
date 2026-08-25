@@ -586,12 +586,20 @@ without a human in the loop:
 
 ```bash
 test -z "$(git status --porcelain -- src/)" || exit 1
-test "$(git rev-parse HEAD)" != "{{spec_start_head}}" || exit 1
+test -n "{{spec_committed_head}}" || exit 1
+test "$(git rev-parse HEAD)" = "{{spec_committed_head}}" || exit 1
 branch=$(git rev-parse --abbrev-ref HEAD)
 case "$branch" in main|master|develop|HEAD) echo "refusing"; exit 1;; esac
 out=$(git push origin "HEAD:$branch" 2>&1); code=$?
 printf '%s\n' "$out" | tail -5; exit $code
 ```
+
+`{{spec_committed_head}}` (not `{{spec_start_head}}`) is what makes this
+gate mean "the committer node landed this spec's own commit", not just
+"HEAD moved since the spec began" — the latter is satisfied just as
+well by a commit someone else made in the same worktree while this
+spec's loop was running. It requires the committer node above to carry
+`commit_rights: true`; see [Commit rights](loops.md#commit-rights).
 
 Two requirements. The remote must be HTTPS with a credential helper — with
 `gh` installed that is `git config credential.helper '!gh auth git-credential'`,

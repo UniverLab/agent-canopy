@@ -40,14 +40,18 @@ pub use simple_prompt::draw_simple_prompt_dialog;
 pub(crate) use super::ERROR_COLOR;
 pub(crate) use super::{centered_rect, truncate_str};
 
+// THEME-EXEMPT: the banner gradient is its own authored animation palette
+// (`BANNER_GRADIENT`), independent of classic/modern — not a theme role.
 fn gradient_wave_color(index: usize, shift: usize) -> Color {
     let gradient = crate::shared::banner::BANNER_GRADIENT;
     let len = gradient.len();
     if len == 0 {
+        // THEME-EXEMPT: see function doc above.
         return Color::White;
     }
     if len == 1 {
         let (r, g, b) = gradient[0];
+        // THEME-EXEMPT: see function doc above.
         return Color::Rgb(r, g, b);
     }
 
@@ -55,6 +59,7 @@ fn gradient_wave_color(index: usize, shift: usize) -> Color {
     let pos = (index + shift) % cycle_len;
     let gradient_idx = if pos < len { pos } else { cycle_len - pos };
     let (r, g, b) = gradient[gradient_idx];
+    // THEME-EXEMPT: see function doc above.
     Color::Rgb(r, g, b)
 }
 

@@ -165,12 +165,12 @@ fn perform_update() -> Result<bool> {
 
 fn download_and_extract(version: &str, output: &Path) -> Result<bool> {
     let (os_target, arch_target) = detect_platform()?;
-    let archive_name = format!(
-        "canopy-{}-{}-{}.tar.gz",
-        version.trim_start_matches('v'),
-        arch_target,
-        os_target
-    );
+    // `version` keeps its leading `v`: the release workflow names its assets
+    // `canopy-v2.2.0-x86_64-unknown-linux-musl.tar.gz`, matching the tag.
+    // Stripping the `v` here asked for `canopy-2.2.0-…` and got a 404 on every
+    // release ever published — the whole auto-update path was dead until
+    // someone ran it for the first time on 2026-08-10.
+    let archive_name = format!("canopy-{version}-{arch_target}-{os_target}.tar.gz");
     let url =
         format!("https://github.com/{GITHUB_REPO}/releases/download/{version}/{archive_name}");
 

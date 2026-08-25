@@ -76,7 +76,9 @@ impl App {
 
     /// Open prompt template dialog with the specified template and optional initial content.
     /// Restores any persisted session for the current workdir.
-    /// Injects an invisible system block on the first prompt per workdir (idempotent).
+    /// Injects an invisible system block on every prompt: per-turn workspace
+    /// context always, plus the session-start protocol on the first prompt
+    /// of a session (idempotent per `App::current_prompt_session_key`).
     pub fn open_simple_prompt_dialog(
         &mut self,
         initial_content: Option<std::collections::HashMap<String, String>>,
@@ -98,17 +100,27 @@ impl App {
             .map(|project| project.path);
         dialog.migrate_legacy_sections(current_project_path.as_deref());
 
-        // Determine system block idempotency: send on first prompt or on solo-mode transition
+        // The per-turn context (workspace/active missions/recent chatter) is
+        // worth its tokens every send, so it is never gated. The session-start
+        // protocol ("[START HERE — required]", the tool-usage contract, the
+        // skills list) is a one-time opening instruction: send it on the
+        // first prompt of a session, or again on a solo-mode transition.
         let is_solo = !self.sync_available();
         let state = self
-            .workdir_system_state
-            .get(&workdir)
+            .session_protocol_state
+            .get(&session_key)
             .cloned()
             .unwrap_or_default();
-        let should_send_system = !state.sent || (!state.sent_as_solo && is_solo);
-        if should_send_system {
-            dialog.system_content = Some(self.build_system_content(is_solo));
-        }
+        let should_send_protocol = !state.protocol_sent || (!state.sent_as_solo && is_solo);
+
+        let turn_context = self.build_turn_context_block();
+        let content = if should_send_protocol {
+            format!("{}\n\n{turn_context}", self.build_session_protocol_block())
+        } else {
+            turn_context
+        };
+        dialog.system_content = Some(content);
+        dialog.protocol_included = should_send_protocol;
 
         if let Some(content) = initial_content {
             for (section_name, section_content) in content {
@@ -142,8 +154,10 @@ impl App {
         self.focus = super::super::types::Focus::PromptTemplateDialog;
     }
 
-    /// Build system block content for the invisible system prompt section.
-    fn build_system_content(&self, _is_solo: bool) -> String {
+    /// Build the per-turn context block: workspace path, active missions,
+    /// and recent chatter. Genuinely changes turn to turn, so it is sent
+    /// with every prompt — never gated by session-start idempotency.
+    fn build_turn_context_block(&self) -> String {
         let mut lines: Vec<String> = Vec::new();
 
         let (workdir, intents, chatter) = self.build_system_context_parts();
@@ -151,63 +165,44 @@ impl App {
         Self::push_intents(&mut lines, &intents);
         Self::push_chatter(&mut lines, &chatter);
 
-        lines.push(String::new());
-        lines.push(
-            "You are operating within the Canopy multi-agent framework. Its MCP tools and \
-            skills are how work gets coordinated here — use them proactively, on your own \
-            initiative, not only when the user asks."
-                .to_string(),
-        );
-        lines.push(String::new());
-        lines.push("[START HERE — required]".to_string());
-        lines.push(
-            "Your FIRST action this session, before answering or touching any file, is to call \
-            get_tools(scope=\"session_start\"). It returns the workspace brief and the exact \
-            tools for the job. Do not skip it."
-                .to_string(),
-        );
-        lines.push(String::new());
-        lines.push("[USE CANOPY TOOLS AT EVERY STEP]".to_string());
-        lines.push(
-            "- Before editing files: get_tools(scope=\"file_write\", path=\"...\"), then \
-            sync_get_context to detect conflicts and sync_declare_intent to claim the work."
-                .to_string(),
-        );
-        lines.push(
-            "- Before tests/builds: get_tools(scope=\"test_run\"), then sync_broadcast the start \
-            and the PASS/FAIL result."
-                .to_string(),
-        );
-        lines.push(
-            "- When you learn a durable fact or reusable pattern: intelligence_upsert \
-            (kind=\"fact\"|\"pattern\") — never leave knowledge only in chat history."
-                .to_string(),
-        );
-        lines.push(
-            "- Session end: get_tools(scope=\"close_session\") — upsert a kind=\"session\" \
-            summary and sync_report_status. The daemon closes missions automatically."
-                .to_string(),
-        );
-        lines.push("- Scheduled tasks: report progress with agent_report.".to_string());
-        lines.push(
-            "Prefer Canopy's native intelligence/sync tools over ad-hoc shell when both can do \
-            the job."
-                .to_string(),
-        );
-        lines.push(String::new());
-        lines.push("[SKILLS — always active]".to_string());
-        lines.push(
-            "The `execution-mindset` skill governs how you operate (judgment, \
-            verify-before-reporting, security, resourcefulness, token efficiency) and applies to \
-            every task. Reach for `architect-mindset` when designing or writing specs, \
-            `code-engineering` for code work, and Canopy's own tooling skills \
-            (`canopy-intelligence`, `canopy-sync`, `canopy-loop-design`, `canopy-capabilities`) \
-            when working this MCP surface. Apply the skills directly — they are the source of \
-            truth, not this summary."
-                .to_string(),
-        );
-
         lines.join("\n")
+    }
+
+    /// Build the session-start protocol block: the opening contract
+    /// ("[START HERE — required]", the tool-usage protocol, the skills
+    /// list). Static across a session — sent once, not per turn.
+    fn build_session_protocol_block(&self) -> String {
+        "You are operating within the Canopy multi-agent framework. Its MCP tools and \
+        skills are how work gets coordinated here — use them proactively, on your own \
+        initiative, not only when the user asks.\n\
+        \n\
+        [START HERE — required]\n\
+        Your FIRST action this session, before answering or touching any file, is to call \
+        get_tools(scope=\"session_start\"). It returns the workspace brief and the exact \
+        tools for the job. Do not skip it.\n\
+        \n\
+        [USE CANOPY TOOLS AT EVERY STEP]\n\
+        - Before editing files: get_tools(scope=\"file_write\", path=\"...\"), then \
+        sync_get_context to detect conflicts and sync_declare_intent to claim the work.\n\
+        - Before tests/builds: get_tools(scope=\"test_run\"), then sync_broadcast the start \
+        and the PASS/FAIL result.\n\
+        - When you learn a durable fact or reusable pattern: intelligence_upsert \
+        (kind=\"fact\"|\"pattern\") — never leave knowledge only in chat history.\n\
+        - Session end: get_tools(scope=\"close_session\") — upsert a kind=\"session\" \
+        summary and sync_report_status. The daemon closes missions automatically.\n\
+        - Scheduled tasks: report progress with agent_report.\n\
+        Prefer Canopy's native intelligence/sync tools over ad-hoc shell when both can do \
+        the job.\n\
+        \n\
+        [SKILLS — always active]\n\
+        The `execution-mindset` skill governs how you operate (judgment, \
+        verify-before-reporting, security, resourcefulness, token efficiency) and applies to \
+        every task. Reach for `architect-mindset` when designing or writing specs, \
+        `code-engineering` for code work, and Canopy's own tooling skills \
+        (`canopy-intelligence`, `canopy-sync`, `canopy-loop-design`, `canopy-capabilities`) \
+        when working this MCP surface. Apply the skills directly — they are the source of \
+        truth, not this summary."
+            .to_string()
     }
 
     /// Extract workdir, intents, and chatter from activity state or fallback.

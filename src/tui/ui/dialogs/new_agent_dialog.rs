@@ -21,6 +21,7 @@ const CLI_PICKER_VISIBLE: usize = 6;
 const MODEL_PICKER_VISIBLE: usize = 5;
 const SESSION_PICKER_VISIBLE: usize = 6;
 const DIR_BROWSER_VISIBLE: usize = 10;
+pub(crate) const SESSION_RESUME_PICKER_VISIBLE: usize = 6;
 
 #[derive(Clone, Copy)]
 struct FieldLayout {
@@ -102,7 +103,7 @@ pub fn draw_new_agent_dialog(frame: &mut Frame, app: &App, theme: &Theme) {
         .title(dialog_title(dialog))
         .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(accent))
-        .style(Style::default().bg(Color::Rgb(15, 25, 15)));
+        .style(Style::default().bg(theme.dialog_bg));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -127,7 +128,20 @@ fn dialog_height(dialog: &NewAgentDialog, filtered_clis: &[usize]) -> u16 {
         NewTaskType::Background => 15 + dir_rows + prompt_rows,
     };
 
-    base_height + cli_picker_rows(dialog, filtered_clis.len()) + model_picker_rows(dialog)
+    base_height
+        + cli_picker_rows(dialog, filtered_clis.len())
+        + model_picker_rows(dialog)
+        + session_resume_picker_rows(dialog)
+}
+
+fn session_resume_picker_rows(dialog: &NewAgentDialog) -> u16 {
+    let Some(picker) = &dialog.session_resume_picker else {
+        return 0;
+    };
+
+    let visible = picker.sessions.len().min(SESSION_RESUME_PICKER_VISIBLE);
+    let overflow_line = usize::from(picker.sessions.len() > SESSION_RESUME_PICKER_VISIBLE);
+    (visible + overflow_line) as u16
 }
 
 fn cli_picker_rows(dialog: &NewAgentDialog, filtered_clis_len: usize) -> u16 {
@@ -404,6 +418,9 @@ fn append_interactive_sections(
 ) {
     if !dialog.is_edit_mode() {
         push_spaced_row(lines, interactive_mode_row(dialog, accent, theme));
+        // Sits between choosing Resume and CLI selection: the harness
+        // follows from whichever session is picked here.
+        append_session_resume_picker_rows(lines, dialog, theme);
     }
 
     append_cli_section(lines, dialog, accent, filtered_clis, layout.cli, theme);
@@ -488,7 +505,37 @@ fn interactive_mode_row(dialog: &NewAgentDialog, accent: Color, theme: &Theme) -
         ));
     }
 
+    if matches!(dialog.task_mode, NewTaskMode::Resume) {
+        spans.push(Span::styled(
+            session_resume_label(dialog),
+            Style::default().fg(if dialog.resume_sessions_empty {
+                Color::Yellow
+            } else {
+                Color::Cyan
+            }),
+        ));
+    }
+
     Line::from(spans)
+}
+
+/// Status text for the canopy-native resume picker: which session (and
+/// harness) is resolved, that none exist, or that the picker is open.
+fn session_resume_label(dialog: &NewAgentDialog) -> String {
+    if dialog.resume_sessions_empty {
+        return "  (no resumable sessions)".to_string();
+    }
+    if dialog.session_resume_picker.is_some() {
+        return "  ↵/↑↓ choose session to resume".to_string();
+    }
+    match &dialog.selected_resume_session {
+        Some(session) => format!(
+            "  [{}] on {}",
+            truncate_with_ellipsis(&session.name, 32),
+            session.cli
+        ),
+        None => String::new(),
+    }
 }
 
 fn append_trigger_section(
@@ -717,6 +764,54 @@ fn append_session_picker_rows(
     if total > SESSION_PICKER_VISIBLE {
         lines.push(Line::from(Span::styled(
             format!("    … {total} sessions  ↑↓ scroll  Enter accept  Esc close"),
+            Style::default().fg(theme.dim_text),
+        )));
+    }
+}
+
+/// Rows for the canopy-native session-resume picker (C12): each row shows
+/// name, harness and last-active, most-recent-first (FR 2, 3).
+fn append_session_resume_picker_rows(
+    lines: &mut Vec<Line<'static>>,
+    dialog: &NewAgentDialog,
+    theme: &Theme,
+) {
+    let Some(picker) = &dialog.session_resume_picker else {
+        return;
+    };
+
+    let total = picker.sessions.len();
+    let window = PickerWindow::new(picker.index, total, SESSION_RESUME_PICKER_VISIBLE);
+
+    for (i, session) in picker
+        .sessions
+        .iter()
+        .enumerate()
+        .skip(window.scroll)
+        .take(SESSION_RESUME_PICKER_VISIBLE)
+    {
+        let is_selected = i == picker.index;
+        let style = picker_item_style(Color::Cyan, is_selected);
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("    {} ", if is_selected { "›" } else { " " }),
+                style,
+            ),
+            Span::styled(truncate_str(&session.name, 22), style),
+            Span::styled(
+                format!("  {}", truncate_str(&session.cli, 12)),
+                picker_detail_style(is_selected, style, theme),
+            ),
+            Span::styled(
+                format!("  {}", truncate_str(&session.last_active, 20)),
+                picker_detail_style(is_selected, style, theme),
+            ),
+        ]));
+    }
+
+    if total > SESSION_RESUME_PICKER_VISIBLE {
+        lines.push(Line::from(Span::styled(
+            format!("    … {total} sessions  ↑↓ scroll  Enter resume  Esc cancel"),
             Style::default().fg(theme.dim_text),
         )));
     }

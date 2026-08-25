@@ -1970,6 +1970,11 @@ struct SpecRunInfo {
     name: String,
     current_node: Option<String>,
     blocker: Option<String>,
+    /// C19: how many separate loop executions this spec has failed with a
+    /// genuine verdict — the persisted counter behind the cross-run attempt
+    /// budget. Surfaced so an operator can see a spec approaching the limit
+    /// before it actually blocks the loop, not just after.
+    cross_run_attempts: i64,
 }
 
 fn build_spec_run_info(db: &Database, spec: &LoopSpec) -> Result<SpecRunInfo, McpError> {
@@ -1983,10 +1988,14 @@ fn build_spec_run_info(db: &Database, spec: &LoopSpec) -> Result<SpecRunInfo, Mc
         .or_else(|| runs.last())
         .map(|run| run.node_id.clone());
     let blocker = runs.last().and_then(loop_run_blocker);
+    let cross_run_attempts = db
+        .get_loop_spec_cross_run_attempts(&spec.id)
+        .map_err(internal_error)?;
     Ok(SpecRunInfo {
         name: spec.name.clone(),
         current_node,
         blocker,
+        cross_run_attempts,
     })
 }
 
@@ -2019,7 +2028,8 @@ fn build_loop_summary_json(db: &Database, lp: &Loop) -> Result<serde_json::Value
         "current_spec": current_spec.as_ref().map(|v| &v.name),
         "current_node": current_spec.as_ref().and_then(|v| v.current_node.as_ref()),
         "blocked": current_spec.as_ref().is_some_and(|v| v.blocker.is_some()),
-        "blocker": current_spec.and_then(|v| v.blocker),
+        "blocker": current_spec.as_ref().and_then(|v| v.blocker.clone()),
+        "spec_attempts": current_spec.as_ref().map(|v| v.cross_run_attempts),
         "created_at": lp.created_at.to_rfc3339(),
         "workdir": lp.workdir,
         "archived": lp.archived,
@@ -3705,6 +3715,7 @@ impl TaskTriggerHandler {
 
         let lp = Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: uuid::Uuid::new_v4().to_string(),
             name: name.to_string(),
             description: params.description.filter(|value| !value.trim().is_empty()),
@@ -3886,6 +3897,7 @@ impl TaskTriggerHandler {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -4003,6 +4015,7 @@ impl TaskTriggerHandler {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir,
             completed_via: None,
             completed_via_reason: None,
@@ -5546,6 +5559,7 @@ impl TaskTriggerHandler {
 
         let lp = Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: loop_id.clone(),
             name: final_name.clone(),
             description: document
@@ -5733,7 +5747,7 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "agent_probe",
-        description = "Actually invoke a configured platform headlessly with a trivial prompt and report whether a real, usable response comes back — the verdict is based on the response content, not the exit code, so a harness that prints its own error and exits 0 is reported broken rather than healthy. Omit `platform` to probe every platform configured in canopy (each with its own default model); pass `platform` alone to probe its default model, or `platform`+`model` together to validate the exact pair a loop node would use. On failure, reports the harness's own error text (redacted of secrets) so you learn *why* (missing API key vs. wrong model name vs. it never answered), not just that it failed. Spends real tokens/quota per platform probed — call this explicitly, never automatically or on a schedule."
+        description = "Actually invoke a configured platform headlessly with a trivial prompt and report whether a real, usable response comes back — the verdict is based on the response content, not the exit code, so a harness that prints its own error and exits 0 is reported broken rather than healthy, and a harness that silently answers with a different model than the one requested (its own \"falling back\" warning) is reported substituted rather than reachable. Omit `platform` to probe every platform configured in canopy (each with its own default model); pass `platform` alone to probe its default model, or `platform`+`model` together to validate the exact pair a loop node would use. If the platform's CLI has no way to select a model explicitly, the specific pair can't be validated end to end and is reported unknown, never reachable. On failure, reports the harness's own error text (redacted of secrets) so you learn *why* (missing API key vs. wrong model name vs. it never answered), not just that it failed. Spends real tokens/quota per platform probed — call this explicitly, never automatically or on a schedule."
     )]
     async fn agent_probe(
         &self,
@@ -5784,7 +5798,8 @@ impl TaskTriggerHandler {
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&serde_json::json!({
                 "timeout_seconds": timeout_secs,
-                "would_fail": reports.iter().filter(|r| !r.outcome.reachable()).count(),
+                "would_fail": crate::daemon::probe::would_fail_count(&reports),
+                "unknown": crate::daemon::probe::unknown_count(&reports),
                 "probes": reports.iter().map(|r| r.to_json()).collect::<Vec<_>>(),
             }))
             .unwrap_or_default(),
@@ -5793,7 +5808,7 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "loop_preflight",
-        description = "Probe every distinct platform+model pair a loop's agent nodes, ensemble members, and on_completed hook reference — before spending a real loop_run on a harness that's installed and configured but can't actually produce a response. A platform used by several nodes is probed once, not once per node; the result names every node/hook that references a failing pair. Verdict is based on response content, not exit code (see agent_probe). Spends real tokens/quota per distinct pair — call this explicitly before loop_run, never automatically."
+        description = "Probe every distinct platform+model pair a loop's agent nodes, ensemble members, and on_completed hook reference — before spending a real loop_run on a harness that's installed and configured but can't actually produce a response. A platform used by several nodes is probed once, not once per node; the result names every node/hook that references a failing pair. Verdict is based on response content, not exit code (see agent_probe): a pair the harness silently answers with a substituted model, or one whose CLI has no way to select a model explicitly, is never reported reachable — `would_fail` counts confirmed failures and `unknown` counts pairs that couldn't be validated, kept separate so an unvalidated pair is never mistaken for a passing one. Spends real tokens/quota per distinct pair — call this explicitly before loop_run, never automatically."
     )]
     async fn loop_preflight(
         &self,
@@ -5854,7 +5869,8 @@ impl TaskTriggerHandler {
                 "loop_id": params.loop_id,
                 "timeout_seconds": timeout_secs,
                 "pairs_checked": reports.len(),
-                "would_fail": reports.iter().filter(|r| !r.outcome.reachable()).count(),
+                "would_fail": crate::daemon::probe::would_fail_count(&reports),
+                "unknown": crate::daemon::probe::unknown_count(&reports),
                 "probes": probes,
             }))
             .unwrap_or_default(),
@@ -5882,6 +5898,27 @@ impl TaskTriggerHandler {
 
         if let Err(message) = loop_run_status_guard(&params.loop_id, lp.status) {
             return Ok(error_result(&message));
+        }
+
+        // C19: a loop paused with an active blocker (whether from
+        // `loop_report_blocker` or from a spec exceeding its cross-run
+        // attempt budget) needs a human, not another relaunch —
+        // `loop_run_status_guard` alone still accepts `Paused` (that's the
+        // normal resume-after-`loop_pause` path), so this is a second,
+        // narrower check on top of it. `loop_reset` always clears the
+        // loop's own status back to `draft` regardless of which specs it
+        // targeted, so this only ever refuses the exact window FR4 asks
+        // for: still-`paused`-and-blocked, not yet reset.
+        if lp.status == LoopStatus::Paused {
+            let summary = build_loop_summary_json(&self.db, &lp)?;
+            if let Some(blocker) = summary.get("blocker").and_then(|v| v.as_str()) {
+                return Ok(error_result(&format!(
+                    "Loop '{}' is blocked and cannot be relaunched via loop_run: {blocker}. \
+                     Resolve it, then loop_reset the affected spec (naming it explicitly \
+                     clears its cross-run attempt count) before relaunching.",
+                    params.loop_id
+                )));
+            }
         }
 
         // A dispatch is refused while any run of this loop is still
@@ -6585,9 +6622,12 @@ impl TaskTriggerHandler {
             .map_err(|e| internal_error(e.to_string()))?
             .map_err(|e| internal_error(e.to_string()))?;
 
-        let store = crate::rag::vector_store::VectorStore::new(dimensions)
-            .await
-            .map_err(|e| internal_error(e.to_string()))?;
+        let store = crate::rag::vector_store::VectorStore::new(
+            dimensions,
+            Some(config.rag_vector_cache_entries),
+        )
+        .await
+        .map_err(|e| internal_error(e.to_string()))?;
 
         let results = store
             .search_similar(&query_vec, limit)
@@ -7106,6 +7146,10 @@ fn loop_spec_details_json(
         // current attempt (B10) — lets debugging see exactly which HEAD a
         // check node's commit-detection compared against.
         "spec_start_head": spec.spec.spec_start_head,
+        // The HEAD this attempt's own `commit_rights: true` node last left
+        // behind (C15), if any — `{{spec_committed_head}}` in a check node.
+        // `null` means no node this run trusts to commit has moved HEAD yet.
+        "spec_committed_head": spec.spec.spec_committed_head,
         "started_at": spec.spec.started_at.map(|value| value.to_rfc3339()),
         "completed_at": spec.spec.completed_at.map(|value| value.to_rfc3339()),
         "nodes": spec.nodes.iter().map(|node| loop_node_json(node, &spec.edges)).collect::<Vec<_>>(),
@@ -7652,6 +7696,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -7815,6 +7860,7 @@ mod tests {
             started_at: None,
             completed_at: Some(chrono::Utc::now()),
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -7856,6 +7902,7 @@ mod tests {
         let loop_id = "loop-reset-test".to_string();
         db.insert_loop(&Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: loop_id.clone(),
             name: "Loop".to_string(),
             description: None,
@@ -7966,6 +8013,7 @@ mod tests {
         let loop_id = "loop-queue-reset-test".to_string();
         db.insert_loop(&Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: loop_id.clone(),
             name: "Loop".to_string(),
             description: None,
@@ -7994,6 +8042,7 @@ mod tests {
             started_at: None,
             completed_at: Some(chrono::Utc::now()),
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -8629,6 +8678,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -8810,6 +8860,7 @@ mod tests {
     fn insert_test_loop(db: &Database, id: &str) {
         db.insert_loop(&Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: id.to_string(),
             name: id.to_string(),
             description: None,
@@ -9256,6 +9307,7 @@ mod tests {
         let loop_id = "loop-with-graph".to_string();
         db.insert_loop(&Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: loop_id.clone(),
             name: "Loop".to_string(),
             description: None,
@@ -9303,6 +9355,7 @@ mod tests {
         let loop_id = "loop-with-pinned-skills".to_string();
         db.insert_loop(&Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: loop_id.clone(),
             name: "Loop".to_string(),
             description: None,
@@ -9354,6 +9407,7 @@ mod tests {
         let loop_id = "loop-with-autorun".to_string();
         db.insert_loop(&Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: loop_id.clone(),
             name: "Loop".to_string(),
             description: None,
@@ -9395,6 +9449,7 @@ mod tests {
     fn autorun_test_loop(loop_id: &str, workdir: &str, status: LoopStatus) -> Loop {
         Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: loop_id.to_string(),
             name: loop_id.to_string(),
             description: None,
@@ -10507,6 +10562,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -10871,6 +10927,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: Some("/tmp/project".to_string()),
             completed_via: None,
             completed_via_reason: None,
@@ -10901,6 +10958,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: Some("loop_reset".to_string()),
             completed_via_reason: None,
@@ -10972,6 +11030,7 @@ mod tests {
     fn make_loop_with_trigger(trigger: Option<Trigger>) -> Loop {
         Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "loop-1".to_string(),
             name: "Test Loop".to_string(),
             description: None,
@@ -11319,6 +11378,7 @@ mod additional_tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -11329,6 +11389,7 @@ mod additional_tests {
     fn insert_test_loop(db: &Database, id: &str) {
         db.insert_loop(&Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: id.to_string(),
             name: id.to_string(),
             description: None,
@@ -11883,6 +11944,7 @@ mod additional_tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -12009,6 +12071,7 @@ mod additional_tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -12540,6 +12603,7 @@ mod additional_tests {
     fn loop_trigger_json_manual() {
         let lp = Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "l1".to_string(),
             name: "l1".to_string(),
             description: None,
@@ -12564,6 +12628,7 @@ mod additional_tests {
     fn loop_trigger_json_cron() {
         let lp = Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "l1".to_string(),
             name: "l1".to_string(),
             description: None,
@@ -12680,6 +12745,7 @@ mod coverage_tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -12717,6 +12783,7 @@ mod coverage_tests {
     fn make_loop(loop_id: &str, status: LoopStatus) -> Loop {
         Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: loop_id.to_string(),
             name: loop_id.to_string(),
             description: None,
@@ -15421,6 +15488,7 @@ mod endpoint_tests {
     fn insert_test_loop(db: &Database, workdir: &std::path::Path) -> Loop {
         let lp = Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: uuid::Uuid::new_v4().to_string(),
             name: "Test Loop".to_string(),
             description: None,
@@ -15452,6 +15520,7 @@ mod endpoint_tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -17326,6 +17395,46 @@ mod endpoint_tests {
         assert_eq!(
             db.get_loop(&lp.id).unwrap().unwrap().status,
             LoopStatus::Paused
+        );
+    }
+
+    /// C19 FR4 (reusing the same blocker mechanism `loop_report_blocker`
+    /// uses): a loop paused with an active blocker must not be silently
+    /// relaunched via `loop_run` — that's the whole "not started again
+    /// until a human clears it" the budget exists for. A plain
+    /// `loop_pause` (`Paused`, no blocker) is unaffected — `loop_run`
+    /// resuming that is the normal, sanctioned path and must keep working.
+    #[tokio::test]
+    async fn loop_run_refuses_a_paused_loop_with_an_active_blocker() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let run = insert_running_node_run(&db, &lp.id);
+        let node_id = run.node_id.clone();
+
+        let blocked = handler
+            .loop_report_blocker(Parameters(LoopReportBlockerParams {
+                run_id: run.id,
+                node_id,
+                description: "waiting on human input".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&blocked), "{}", text(&blocked));
+
+        let result = handler
+            .loop_run(Parameters(LoopRunParams {
+                loop_id: lp.id.clone(),
+                queue_id: None,
+                workdir: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&result), "a blocked loop must refuse loop_run");
+        assert!(text(&result).contains("blocked"), "{}", text(&result));
+        assert_eq!(
+            db.get_loop(&lp.id).unwrap().unwrap().status,
+            LoopStatus::Paused,
+            "the refusal must not itself change the loop's status"
         );
     }
 

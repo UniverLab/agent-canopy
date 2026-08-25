@@ -571,6 +571,16 @@ pub struct Loop {
     /// migration. See `Database::{archive_loop, restore_loop}`.
     #[serde(default)]
     pub archived: bool,
+    /// Set by `reconcile_orphaned_loops` (and only by it) the moment it pauses
+    /// a loop that was left `Running` by an unclean daemon exit — never by an
+    /// operator's `loop_pause`/`loop_report_blocker`, both of which go
+    /// through `Database::update_loop_status`, which clears this on every
+    /// call. Lets [`Self::is_autorun_due`] tell the two kinds of `Paused`
+    /// apart: a pending `autorun_at` must survive a reconciliation pause
+    /// (nobody asked for the loop to stop), but must not fire on a pause the
+    /// operator actually asked for.
+    #[serde(default)]
+    pub paused_by_reconciliation: bool,
 }
 
 /// Config for a loop's `on_completed` hook — deliberately shaped like an
@@ -641,11 +651,19 @@ impl Loop {
 
     /// Whether this loop's one-shot `autorun_at` schedule is due at `now`.
     ///
-    /// True only when `autorun_at` is set, `now` has reached it, and the loop
-    /// isn't already `Running`/`Paused`. Firing must clear `autorun_at` so it
-    /// never fires twice.
+    /// True when `autorun_at` is set, `now` has reached it, and either the
+    /// loop is fireable (not `Running`/`Paused`) or it is `Paused` *because
+    /// `reconcile_orphaned_loops` put it there* after an unclean daemon exit.
+    /// That second branch is deliberate and narrow: an operator-requested
+    /// pause (`loop_pause`, `loop_report_blocker`) must still block the
+    /// schedule — [`Self::is_fireable`] is unchanged and still says so for
+    /// every other caller — but a pause reconciliation imposed on the loop's
+    /// behalf must not silently swallow a schedule nobody asked to cancel.
+    /// Firing must clear `autorun_at` so it never fires twice.
     pub fn is_autorun_due(&self, now: DateTime<Utc>) -> bool {
-        self.autorun_at.is_some_and(|at| now >= at) && self.is_fireable()
+        self.autorun_at.is_some_and(|at| now >= at)
+            && (self.is_fireable()
+                || (self.status == LoopStatus::Paused && self.paused_by_reconciliation))
     }
 
     /// Whether `auto_continue_at` has been reached at `now`, independent of
@@ -694,6 +712,20 @@ pub struct LoopSpec {
     /// isn't a git repo or the spec hasn't started yet.
     #[serde(default)]
     pub spec_start_head: Option<String>,
+    /// The workdir's git HEAD immediately after a `commit_rights: true`
+    /// node's own execution actually moved it during this attempt (C15).
+    /// Unlike `spec_start_head` — which only proves *some* commit landed
+    /// since the spec began, and is satisfied just as well by a concurrent
+    /// commit from outside this run sharing the same worktree — this is set
+    /// only when a node the graph explicitly trusts to commit is the one
+    /// whose execution moved HEAD, so `check` nodes can verify "did *this
+    /// run's own committer* land a commit" via `{{spec_committed_head}}`.
+    /// `None` until such a node commits; overwritten (not accumulated) each
+    /// time one does, so it always reflects the latest commit this attempt
+    /// itself produced. Requires the graph to name a committer
+    /// (`commit_rights: true`) — a graph that never does never populates it.
+    #[serde(default)]
+    pub spec_committed_head: Option<String>,
     /// Optional workdir tag for backlog filtering only (`spec_list`). It does
     /// not drive execution — the run that eventually assigns this spec to a
     /// loop decides the actual workdir.
@@ -1134,6 +1166,7 @@ Task:
     fn loop_with_trigger(status: LoopStatus, trigger: Option<super::Trigger>) -> super::Loop {
         super::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "wf".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -1232,6 +1265,29 @@ Task:
                 "{status:?} loop must not fire autorun_at"
             );
         }
+    }
+
+    /// C1: a loop reconciliation paused after an unclean daemon exit must
+    /// still fire its pending, due `autorun_at` — that schedule is the
+    /// resilience node's one shot at an unattended quota-reset resume, and
+    /// nobody asked for the loop to stop.
+    #[test]
+    fn past_autorun_at_is_due_on_a_reconciliation_paused_loop() {
+        let mut lp = loop_with_trigger(LoopStatus::Paused, None);
+        lp.paused_by_reconciliation = true;
+        lp.autorun_at = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
+        assert!(lp.is_autorun_due(chrono::Utc::now()));
+    }
+
+    /// C1: the operator's own pause must keep blocking the schedule even
+    /// though a reconciliation pause no longer does — `paused_by_reconciliation`
+    /// is what tells the two apart, not `Paused` alone.
+    #[test]
+    fn past_autorun_at_is_not_due_on_an_operator_paused_loop() {
+        let mut lp = loop_with_trigger(LoopStatus::Paused, None);
+        lp.paused_by_reconciliation = false;
+        lp.autorun_at = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
+        assert!(!lp.is_autorun_due(chrono::Utc::now()));
     }
 
     #[test]

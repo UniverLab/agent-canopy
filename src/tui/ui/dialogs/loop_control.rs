@@ -9,19 +9,23 @@ use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::centered_rect;
+use crate::tui::app::dialog::{LoopAutorunDialog, LoopAutorunMode};
 use crate::tui::app::types::App;
 use crate::tui::ui::theme::Theme;
 
-/// The autorun-scheduling text input (`a` on a focused loop): one free-text
-/// field — empty cancels any pending autorun, an ISO 8601 instant schedules
-/// directly, anything else is sent as a raw quota-reset message for the
-/// daemon to parse.
+/// The autorun-scheduling dialog (`a` on a focused loop): [`LoopAutorunMode::Picker`]
+/// (the default) reuses the same inline date-time picker as the prompt
+/// builder's scheduled-send control, shown alongside the local timezone and
+/// the resulting UTC instant so the conversion is visible before
+/// submission; Tab switches to [`LoopAutorunMode::QuotaMessage`], a
+/// free-text field sent verbatim to the daemon — empty cancels any pending
+/// autorun.
 pub fn draw_loop_autorun_dialog(frame: &mut Frame, app: &App, theme: &Theme) {
     let Some(dialog) = &app.loop_autorun_dialog else {
         return;
     };
 
-    let area = centered_rect(60, 8, frame.area());
+    let area = centered_rect(60, 11, frame.area());
     frame.render_widget(Clear, area);
 
     let title = format!(" Autorun: {} ", dialog.loop_name);
@@ -29,32 +33,94 @@ pub fn draw_loop_autorun_dialog(frame: &mut Frame, app: &App, theme: &Theme) {
         .title(title)
         .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(theme.header_color))
-        .style(Style::default().bg(Color::Rgb(15, 25, 15)));
+        .style(Style::default().bg(theme.dialog_bg));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let lines = vec![
-        Line::from(Span::styled(
-            "ISO instant (2026-07-10T09:00:00Z) or quota-reset text",
-            Style::default().fg(theme.dim_text),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("▸ ", Style::default().fg(theme.header_color)),
-            Span::styled(dialog.input.as_str(), Style::default().fg(Color::White)),
-            Span::styled("▏", Style::default().fg(theme.header_color)),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Enter: schedule (empty = cancel pending)  Esc: close",
-            Style::default().fg(theme.dim_text),
-        )),
-    ];
+    let mut lines = Vec::new();
+    match dialog.mode {
+        LoopAutorunMode::Picker => {
+            let offset = chrono::Local::now().format("%:z").to_string();
+            lines.push(Line::from(Span::styled(
+                format!("Pick a local time — your timezone is UTC{offset}"),
+                Style::default().fg(theme.dim_text),
+            )));
+            lines.push(Line::from(""));
+            lines.push(picker_line(dialog, theme));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("→ ", Style::default().fg(theme.dim_text)),
+                Span::styled(
+                    format!(
+                        "{} UTC",
+                        dialog.picker_resulting_utc().format("%Y-%m-%d %H:%M:%S")
+                    ),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+        }
+        LoopAutorunMode::QuotaMessage => {
+            lines.push(Line::from(Span::styled(
+                "Quota-reset text for the engine to parse (empty = cancel pending)",
+                Style::default().fg(theme.dim_text),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("▸ ", Style::default().fg(theme.header_color)),
+                Span::styled(
+                    dialog.quota_input.as_str(),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled("▏", Style::default().fg(theme.header_color)),
+            ]));
+        }
+    }
+
+    if let Some(error) = &dialog.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            error.as_str(),
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Tab: switch mode  Enter: schedule  Esc: close",
+        Style::default().fg(theme.dim_text),
+    )));
 
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }),
         Rect::new(inner.x, inner.y, inner.width, inner.height),
     );
+}
+
+/// Render the picker's year/month/day/hour/minute fields with the currently
+/// focused one highlighted, mirroring the prompt builder's inline send-at
+/// picker rendering.
+fn picker_line(dialog: &LoopAutorunDialog, theme: &Theme) -> Line<'static> {
+    use chrono::{Datelike, Timelike};
+    let v = dialog.picker.value;
+    let fields = [
+        format!("{:04}", v.year()),
+        format!("{:02}", v.month()),
+        format!("{:02}", v.day()),
+        format!("{:02}", v.hour()),
+        format!("{:02}", v.minute()),
+    ];
+    let separators = ["-", "-", " ", ":", ""];
+    let mut spans = vec![Span::styled("▸ ", Style::default().fg(theme.header_color))];
+    for (i, field) in fields.iter().enumerate() {
+        let style = if i == dialog.picker.field {
+            Style::default().fg(theme.dialog_bg).bg(theme.header_color)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        spans.push(Span::styled(field.clone(), style));
+        spans.push(Span::raw(separators[i]));
+    }
+    Line::from(spans)
 }
 
 /// The daemon's verbatim result from the last loop-control action
@@ -94,7 +160,7 @@ pub fn draw_loop_action_message(frame: &mut Frame, app: &App, theme: &Theme) {
         .title(title)
         .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(color))
-        .style(Style::default().bg(Color::Rgb(15, 25, 15)));
+        .style(Style::default().bg(theme.dialog_bg));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -119,7 +185,7 @@ pub fn draw_loop_action_message(frame: &mut Frame, app: &App, theme: &Theme) {
 mod tests {
     use super::*;
     use crate::db::Database;
-    use crate::tui::app::dialog::{LoopActionMessage, LoopAutorunDialog};
+    use crate::tui::app::dialog::LoopActionMessage;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::sync::Arc;
@@ -134,11 +200,22 @@ mod tests {
         (app, data_dir)
     }
 
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
     #[test]
-    fn autorun_dialog_renders_input_and_hints() {
+    fn autorun_dialog_picker_mode_renders_fields_and_resulting_utc() {
         let (mut app, _dir) = test_app();
-        let mut dialog = LoopAutorunDialog::new("lp1".to_string(), "Nightly review".to_string());
-        dialog.input = "resets 1pm".to_string();
+        let dialog = LoopAutorunDialog::new("lp1".to_string(), "Nightly review".to_string(), None);
         app.loop_autorun_dialog = Some(dialog);
 
         let theme = Theme::classic();
@@ -148,17 +225,52 @@ mod tests {
             .draw(|frame| draw_loop_autorun_dialog(frame, &app, &theme))
             .unwrap();
 
-        let buffer = terminal.backend().buffer().clone();
-        let mut text = String::new();
-        for y in 0..buffer.area.height {
-            for x in 0..buffer.area.width {
-                text.push_str(buffer[(x, y)].symbol());
-            }
-            text.push('\n');
-        }
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Nightly review"), "{text}");
+        assert!(text.contains("timezone"), "{text}");
+        assert!(text.contains("UTC"), "{text}");
+        assert!(text.contains("schedule"), "{text}");
+    }
+
+    #[test]
+    fn autorun_dialog_quota_message_mode_renders_typed_text() {
+        let (mut app, _dir) = test_app();
+        let mut dialog =
+            LoopAutorunDialog::new("lp1".to_string(), "Nightly review".to_string(), None);
+        dialog.mode = LoopAutorunMode::QuotaMessage;
+        dialog.quota_input = "resets 1pm".to_string();
+        app.loop_autorun_dialog = Some(dialog);
+
+        let theme = Theme::classic();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_loop_autorun_dialog(frame, &app, &theme))
+            .unwrap();
+
+        let text = buffer_text(&terminal);
         assert!(text.contains("Nightly review"), "{text}");
         assert!(text.contains("resets 1pm"), "{text}");
         assert!(text.contains("schedule"), "{text}");
+    }
+
+    #[test]
+    fn autorun_dialog_shows_inline_error() {
+        let (mut app, _dir) = test_app();
+        let mut dialog =
+            LoopAutorunDialog::new("lp1".to_string(), "Nightly review".to_string(), None);
+        dialog.error = Some("picked time is in the past".to_string());
+        app.loop_autorun_dialog = Some(dialog);
+
+        let theme = Theme::classic();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_loop_autorun_dialog(frame, &app, &theme))
+            .unwrap();
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("picked time is in the past"), "{text}");
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::db::Database;
@@ -223,14 +224,12 @@ fn handle_section_picker_key(
             handle_add_custom_section_key(dialog, input.clone(), code);
             Ok(true)
         }
-        SectionPickerMode::RemoveSection { selected } => {
+        SectionPickerMode::RemoveSection { selected, .. } => {
             handle_remove_section_picker_key(dialog, *selected, code);
             Ok(true)
         }
-        SectionPickerMode::SkillsPicker {
-            selected, entries, ..
-        } => {
-            handle_skills_picker_key(dialog, *selected, entries.len(), code);
+        SectionPickerMode::SkillsPicker { .. } => {
+            handle_skills_picker_key(dialog, code);
             Ok(true)
         }
         SectionPickerMode::ProjectPicker { .. } => {
@@ -253,12 +252,8 @@ fn handle_add_section_picker_key(
 ) -> Result<()> {
     match code {
         KeyCode::Esc => dialog.picker_mode = SectionPickerMode::None,
-        KeyCode::Up if selected > 0 => {
-            dialog.picker_mode = SectionPickerMode::AddSection {
-                selected: selected - 1,
-            };
-        }
-        KeyCode::Down => move_add_section_picker_down(dialog, selected),
+        KeyCode::Up => move_add_section_picker(dialog, selected, false),
+        KeyCode::Down => move_add_section_picker(dialog, selected, true),
         KeyCode::Enter => select_addable_section(dialog, selected, db, workdir)?,
         KeyCode::Char('c') => {
             dialog.picker_mode = SectionPickerMode::AddCustom {
@@ -271,15 +266,14 @@ fn handle_add_section_picker_key(
     Ok(())
 }
 
-fn move_add_section_picker_down(dialog: &mut SimplePromptDialog, selected: usize) {
-    let addable = dialog.get_addable_sections();
-    if selected + 1 >= addable.len() {
-        return;
-    }
-
-    dialog.picker_mode = SectionPickerMode::AddSection {
-        selected: selected + 1,
-    };
+/// Moves the highlighted row, wrapping at both ends via the shared
+/// [`crate::tui::selection`] model — up from the first entry lands on the
+/// last, down from the last lands on the first. The menu is always short
+/// enough to fit its box in full, so there is no scroll offset to track.
+fn move_add_section_picker(dialog: &mut SimplePromptDialog, selected: usize, forward: bool) {
+    let len = dialog.get_addable_sections().len();
+    let selected = crate::tui::selection::move_index(selected, len, forward);
+    dialog.picker_mode = SectionPickerMode::AddSection { selected };
 }
 
 fn select_addable_section(
@@ -324,6 +318,7 @@ fn open_skills_picker(dialog: &mut SimplePromptDialog, workdir: &Path) {
     let entries = SimplePromptDialog::collect_skills_for_picker(workdir);
     dialog.picker_mode = SectionPickerMode::SkillsPicker {
         selected: 0,
+        scroll: 0,
         entries,
         replace_id: None,
     };
@@ -374,26 +369,25 @@ fn handle_remove_section_picker_key(
 ) {
     match code {
         KeyCode::Esc => dialog.picker_mode = SectionPickerMode::None,
-        KeyCode::Up if selected > 0 => {
-            dialog.picker_mode = SectionPickerMode::RemoveSection {
-                selected: selected - 1,
-            };
-        }
-        KeyCode::Down => move_remove_section_picker_down(dialog, selected),
+        KeyCode::Up => move_remove_section_picker(dialog, selected, false),
+        KeyCode::Down => move_remove_section_picker(dialog, selected, true),
         KeyCode::Enter => select_removable_section(dialog, selected),
         _ => {}
     }
 }
 
-fn move_remove_section_picker_down(dialog: &mut SimplePromptDialog, selected: usize) {
-    let removable = dialog.get_removable_sections();
-    if selected + 1 >= removable.len() {
+/// Moves the highlighted row, wrapping at both ends and rescrolling so it
+/// stays visible — this list grows with `enabled_sections` and can exceed
+/// the viewport, unlike the fixed, short `AddSection` menu.
+fn move_remove_section_picker(dialog: &mut SimplePromptDialog, selected: usize, forward: bool) {
+    let len = dialog.get_removable_sections().len();
+    let SectionPickerMode::RemoveSection { scroll, .. } = &dialog.picker_mode else {
         return;
-    }
-
-    dialog.picker_mode = SectionPickerMode::RemoveSection {
-        selected: selected + 1,
     };
+    let visible_rows = SimplePromptDialog::remove_section_visible_rows(len);
+    let (selected, scroll) =
+        crate::tui::selection::move_selection(selected, *scroll, len, visible_rows, forward);
+    dialog.picker_mode = SectionPickerMode::RemoveSection { selected, scroll };
 }
 
 fn select_removable_section(dialog: &mut SimplePromptDialog, selected: usize) {
@@ -406,28 +400,35 @@ fn select_removable_section(dialog: &mut SimplePromptDialog, selected: usize) {
     dialog.picker_mode = SectionPickerMode::None;
 }
 
-fn handle_skills_picker_key(
-    dialog: &mut SimplePromptDialog,
-    selected: usize,
-    count: usize,
-    code: KeyCode,
-) {
+fn handle_skills_picker_key(dialog: &mut SimplePromptDialog, code: KeyCode) {
     match code {
         KeyCode::Esc => dialog.picker_mode = SectionPickerMode::None,
-        KeyCode::Up if selected > 0 => set_skills_picker_selection(dialog, selected - 1),
-        KeyCode::Down if selected + 1 < count => set_skills_picker_selection(dialog, selected + 1),
+        KeyCode::Up => move_skills_picker(dialog, false),
+        KeyCode::Down => move_skills_picker(dialog, true),
         KeyCode::Enter | KeyCode::Tab => confirm_skills_picker_selection(dialog),
         _ => {}
     }
 }
 
-fn set_skills_picker_selection(dialog: &mut SimplePromptDialog, selected: usize) {
-    if let SectionPickerMode::SkillsPicker {
-        selected: current, ..
+/// Moves the highlighted row, wrapping at both ends and rescrolling so it
+/// stays visible — this is the tools menu that used to walk its selection
+/// off screen once the skill count exceeded the viewport.
+fn move_skills_picker(dialog: &mut SimplePromptDialog, forward: bool) {
+    let SectionPickerMode::SkillsPicker {
+        selected,
+        scroll,
+        entries,
+        ..
     } = &mut dialog.picker_mode
-    {
-        *current = selected;
-    }
+    else {
+        return;
+    };
+    let len = entries.len();
+    let visible_rows = SimplePromptDialog::skills_picker_visible_rows(len);
+    let (new_selected, new_scroll) =
+        crate::tui::selection::move_selection(*selected, *scroll, len, visible_rows, forward);
+    *selected = new_selected;
+    *scroll = new_scroll;
 }
 
 fn confirm_skills_picker_selection(dialog: &mut SimplePromptDialog) {
@@ -435,6 +436,7 @@ fn confirm_skills_picker_selection(dialog: &mut SimplePromptDialog) {
         entries,
         selected,
         replace_id,
+        ..
     } = std::mem::replace(&mut dialog.picker_mode, SectionPickerMode::None)
     else {
         return;
@@ -515,6 +517,14 @@ fn pop_preset_picker_filter(dialog: &mut SimplePromptDialog) {
 /// (mirrors the Skills picker's un-replace_id path: `add_section_with_content`)
 /// so the preset becomes a normal, freely-editable field — never a locked
 /// reference — and closes the picker either way.
+///
+/// Presets under `~/.canopy/prompts/` also serve the loop engine's own role
+/// templates (implementer/reviewer/resilience), which carry `{{spec_content}}`/
+/// `{{previous_feedback}}` placeholders meant to be filled at agent-spawn
+/// time. This TUI composes ad hoc prompts with no such bindings to offer, so
+/// a preset that still carries an unfilled placeholder is refused — never
+/// inserted with the literal `{{...}}` left in — rather than silently
+/// dumping a foreign template into the user's message (spec C11).
 fn confirm_preset_picker_selection(dialog: &mut SimplePromptDialog) {
     let filtered = preset_filtered_indices(dialog);
     let SectionPickerMode::PresetPicker {
@@ -523,14 +533,27 @@ fn confirm_preset_picker_selection(dialog: &mut SimplePromptDialog) {
     else {
         return;
     };
-    let content = filtered
+    let preset = filtered
         .get(*selected)
         .and_then(|&idx| entries.get(idx))
-        .map(|(_, _, content)| content.clone());
+        .map(|(name, _, content)| (name.clone(), content.clone()));
 
     dialog.picker_mode = SectionPickerMode::None;
-    if let Some(content) = content {
-        dialog.add_section_with_content("instruction", content);
+    let Some((name, content)) = preset else {
+        return;
+    };
+
+    match crate::domain::prompts::render_preset(&name, &content, &HashMap::new()) {
+        Ok(rendered) => {
+            dialog.add_section_with_content("instruction", rendered);
+        }
+        Err(err) => {
+            crate::domain::notification::send_notification(
+                "Preset not inserted",
+                &err.to_string(),
+                crate::domain::notification::NotificationLevel::Warning,
+            );
+        }
     }
 }
 
@@ -559,8 +582,9 @@ fn handle_project_picker_key(dialog: &mut SimplePromptDialog, code: KeyCode) {
 }
 
 /// Move the highlighted row up/down within the filtered list, wrapping at
-/// both ends, then slides `scroll` (via `clamp_scroll`) so the new selection
-/// is always drawn — including right after a wraparound jump.
+/// both ends, then slides `scroll` (via the shared [`crate::tui::selection`]
+/// model) so the new selection is always drawn — including right after a
+/// wraparound jump.
 fn move_project_picker(dialog: &mut SimplePromptDialog, forward: bool) {
     let filtered_len = project_filtered_indices(dialog).len();
     if filtered_len == 0 {
@@ -572,13 +596,16 @@ fn move_project_picker(dialog: &mut SimplePromptDialog, forward: bool) {
     else {
         return;
     };
-    *selected = if forward {
-        (*selected + 1) % filtered_len
-    } else {
-        selected.checked_sub(1).unwrap_or(filtered_len - 1)
-    };
     let visible_rows = SimplePromptDialog::project_picker_visible_rows(filtered_len);
-    *scroll = SimplePromptDialog::clamp_scroll(*selected, *scroll, visible_rows);
+    let (new_selected, new_scroll) = crate::tui::selection::move_selection(
+        *selected,
+        *scroll,
+        filtered_len,
+        visible_rows,
+        forward,
+    );
+    *selected = new_selected;
+    *scroll = new_scroll;
 }
 
 fn push_project_picker_filter(dialog: &mut SimplePromptDialog, c: char) {
@@ -1205,7 +1232,10 @@ fn open_remove_section_picker_if_available(dialog: &mut SimplePromptDialog) {
         return;
     }
 
-    dialog.picker_mode = SectionPickerMode::RemoveSection { selected: 0 };
+    dialog.picker_mode = SectionPickerMode::RemoveSection {
+        selected: 0,
+        scroll: 0,
+    };
 }
 
 fn handle_section_char_input(
@@ -1246,12 +1276,11 @@ fn handle_section_backspace(
 }
 
 fn submit_prompt(app: &mut App, prompt: &str) {
-    // Capture whether system content was included before discarding
-    let had_system = app
+    // Capture whether the session-start protocol block was included before discarding
+    let had_protocol = app
         .simple_prompt_dialog
         .as_ref()
-        .and_then(|d| d.system_content.as_ref())
-        .is_some();
+        .is_some_and(|d| d.protocol_included);
     let is_solo = !app.sync_available();
     let workdir = app.current_workdir();
     let session_key = app.current_prompt_session_key();
@@ -1261,10 +1290,11 @@ fn submit_prompt(app: &mut App, prompt: &str) {
     app.prompt_builder_sessions.remove(&session_key);
     app.discard_simple_prompt_dialog();
 
-    // Record that system block was sent for this workdir
-    if had_system {
-        let state = app.workdir_system_state.entry(workdir).or_default();
-        state.sent = true;
+    // Record that the protocol block was sent for this session, so later
+    // turns of the same session omit it while still getting per-turn context.
+    if had_protocol {
+        let state = app.session_protocol_state.entry(session_key).or_default();
+        state.protocol_sent = true;
         state.sent_as_solo = is_solo;
     }
 }
@@ -1712,6 +1742,71 @@ mod preset_picker_tests {
         assert_eq!(dialog.picker_mode, SectionPickerMode::None);
         assert_eq!(dialog.enabled_sections, original_sections);
     }
+
+    #[test]
+    fn enter_refuses_a_preset_with_an_unfilled_placeholder_and_inserts_nothing() {
+        // Mirrors the observed C11 incident: picking a loop-engine role
+        // preset (carrying {{spec_content}}) from the TUI's ad hoc composer,
+        // which has no such binding to offer.
+        let mut dialog = dialog_with_presets(vec![(
+            "implementer",
+            "role a",
+            "Do this:\n\n{{spec_content}}",
+        )]);
+        let original_sections = dialog.enabled_sections.clone();
+
+        handle_preset_picker_key(&mut dialog, KeyCode::Enter);
+
+        assert_eq!(dialog.picker_mode, SectionPickerMode::None);
+        // Nothing was inserted — not a new section, and definitely not the
+        // literal unfilled placeholder.
+        assert_eq!(dialog.enabled_sections, original_sections);
+        for id in &dialog.enabled_sections {
+            assert!(!dialog.get_section_content(id).contains("{{"));
+        }
+    }
+
+    #[test]
+    fn two_presets_confirmed_in_one_session_stay_in_separate_isolated_sections() {
+        let mut dialog = dialog_with_presets(vec![
+            ("alpha", "role a", "alpha body, nothing else"),
+            ("beta", "role b", "beta body, nothing else"),
+        ]);
+
+        // Confirm "alpha" first.
+        handle_preset_picker_key(&mut dialog, KeyCode::Enter);
+        assert_eq!(
+            dialog.get_section_content("instruction_2"),
+            "alpha body, nothing else"
+        );
+
+        // Reopen the picker and confirm "beta" second.
+        dialog.picker_mode = SectionPickerMode::PresetPicker {
+            selected: 1,
+            entries: vec![
+                (
+                    "alpha".to_string(),
+                    "role a".to_string(),
+                    "alpha body, nothing else".to_string(),
+                ),
+                (
+                    "beta".to_string(),
+                    "role b".to_string(),
+                    "beta body, nothing else".to_string(),
+                ),
+            ],
+            filter: String::new(),
+        };
+        handle_preset_picker_key(&mut dialog, KeyCode::Enter);
+
+        // Each preset landed in its own section, containing only its own body.
+        let alpha_content = dialog.get_section_content("instruction_2");
+        let beta_content = dialog.get_section_content("instruction_3");
+        assert_eq!(alpha_content, "alpha body, nothing else");
+        assert_eq!(beta_content, "beta body, nothing else");
+        assert!(!alpha_content.contains("beta"));
+        assert!(!beta_content.contains("alpha"));
+    }
 }
 
 #[cfg(test)]
@@ -1896,6 +1991,235 @@ mod recall_last_prompt_tests {
         assert_eq!(
             dialog.get_section_content("instruction_1"),
             "recovered prompt"
+        );
+    }
+
+    /// Full round trip through the DB: compose a structured prompt (multiple
+    /// section types, not just one instruction), persist it the way
+    /// `submit_prompt`/`schedule_send_prompt` do (rendered text +
+    /// `PersistedBuilderState` JSON), then recall it into a fresh builder and
+    /// assert the structure — not a flattened blob — comes back.
+    #[test]
+    fn ctrl_l_restores_the_full_structured_view_not_just_flat_text() {
+        use crate::tui::app::dialog::PersistedBuilderState;
+
+        let (mut app, _dir) = test_app();
+        let workdir = app.current_workdir().to_string_lossy().to_string();
+
+        app.open_simple_prompt_dialog(None);
+        {
+            let dialog = app.simple_prompt_dialog.as_mut().unwrap();
+            dialog.set_section_content("instruction_1", "primary task".to_string());
+            dialog.add_section_with_content("goal", "ship the feature".to_string());
+            dialog.add_section_with_content("resources", "@src/main.rs".to_string());
+        }
+        let dialog = app.simple_prompt_dialog.as_ref().unwrap();
+        let snapshot = PersistedBuilderState::from_dialog(dialog);
+        let json = serde_json::to_string(&snapshot).unwrap();
+
+        app.db
+            .insert_last_prompt(
+                "lp-1",
+                &workdir,
+                "flattened rendered text",
+                Some(&json),
+                chrono::Utc::now(),
+            )
+            .expect("persist structured last prompt");
+
+        // Close and reopen fresh, as if the builder had been closed and the
+        // user came back later to edit it again.
+        app.discard_simple_prompt_dialog();
+        app.open_simple_prompt_dialog(None);
+        assert!(app.simple_prompt_dialog.as_ref().unwrap().is_empty());
+
+        ctrl_l(&mut app);
+
+        let dialog = app.simple_prompt_dialog.as_ref().unwrap();
+        assert!(dialog.pending_recall.is_none());
+        // The structure survived: three distinct sections, not one
+        // instruction section holding the flattened rendered text.
+        assert_eq!(dialog.get_section_content("instruction_1"), "primary task");
+        assert_eq!(dialog.get_section_content("goal_1"), "ship the feature");
+        assert_eq!(dialog.get_section_content("resources_1"), "@src/main.rs");
+        assert!(dialog.enabled_sections.contains(&"goal_1".to_string()));
+        assert!(dialog.enabled_sections.contains(&"resources_1".to_string()));
+        // None of the sections regressed to the flattened text.
+        for id in &dialog.enabled_sections {
+            assert_ne!(dialog.get_section_content(id), "flattened rendered text");
+        }
+    }
+
+    /// A row written before structured persistence existed (`builder_state`
+    /// is `NULL`) must still open — in raw, as a single instruction section
+    /// — never error or panic.
+    #[test]
+    fn ctrl_l_on_a_pre_migration_row_with_no_builder_state_opens_in_raw_without_error() {
+        let (mut app, _dir) = test_app();
+        let workdir = app.current_workdir().to_string_lossy().to_string();
+
+        app.db
+            .insert_last_prompt(
+                "lp-legacy",
+                &workdir,
+                "an old prompt saved before structure was tracked",
+                None,
+                chrono::Utc::now(),
+            )
+            .expect("seed legacy last prompt");
+
+        app.open_simple_prompt_dialog(None);
+        ctrl_l(&mut app);
+
+        let dialog = app.simple_prompt_dialog.as_ref().unwrap();
+        assert!(dialog.pending_recall.is_none());
+        assert_eq!(
+            dialog.get_section_content("instruction_1"),
+            "an old prompt saved before structure was tracked"
+        );
+        // Raw fallback is a single section — no structure to have restored.
+        assert_eq!(dialog.enabled_sections, vec!["instruction_1".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod session_protocol_tests {
+    use super::submit_prompt;
+    use crate::db::Database;
+    use crate::tui::app::types::App;
+    use std::sync::Arc;
+    use tempfile::{tempdir, NamedTempFile};
+
+    const FIRST_ACTION: &str = "FIRST action";
+
+    fn test_app() -> (App, tempfile::TempDir) {
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = Arc::new(Database::new(&path).expect("create test db"));
+        let data_dir = tempdir().expect("create data dir");
+        let app = App::new(db, data_dir.path()).expect("create app");
+        (app, data_dir)
+    }
+
+    fn system_content(app: &App) -> String {
+        app.simple_prompt_dialog
+            .as_ref()
+            .and_then(|d| d.system_content.clone())
+            .unwrap_or_default()
+    }
+
+    /// Opens the dialog, submits `prompt`, and returns the system content
+    /// that was assembled for that turn (i.e. what the agent actually saw).
+    fn send_turn(app: &mut App, prompt: &str) -> String {
+        app.open_simple_prompt_dialog(None);
+        let content = system_content(app);
+        submit_prompt(app, prompt);
+        content
+    }
+
+    #[test]
+    fn turn_one_of_a_session_contains_the_session_start_block() {
+        let (mut app, _dir) = test_app();
+
+        let turn_1 = send_turn(&mut app, "do the first thing");
+
+        assert!(turn_1.contains("[START HERE — required]"));
+        assert!(turn_1.contains(FIRST_ACTION));
+    }
+
+    #[test]
+    fn turn_two_of_the_same_session_omits_the_session_start_block() {
+        let (mut app, _dir) = test_app();
+
+        send_turn(&mut app, "do the first thing");
+        let turn_2 = send_turn(&mut app, "do the second thing");
+
+        assert!(!turn_2.contains("[START HERE — required]"));
+        assert!(!turn_2.contains(FIRST_ACTION));
+    }
+
+    #[test]
+    fn per_turn_workspace_context_is_present_on_every_turn() {
+        let (mut app, _dir) = test_app();
+
+        let turn_1 = send_turn(&mut app, "do the first thing");
+        let turn_2 = send_turn(&mut app, "do the second thing");
+        let turn_3 = send_turn(&mut app, "do the third thing");
+
+        assert!(turn_1.contains("workspace:"));
+        assert!(turn_2.contains("workspace:"));
+        assert!(turn_3.contains("workspace:"));
+    }
+
+    #[test]
+    fn a_new_session_after_the_previous_one_ended_gets_the_block_again() {
+        let (mut app, _dir) = test_app();
+        send_turn(&mut app, "do the first thing");
+
+        // The previous session's process ends; a brand new one starts with
+        // no shared in-memory state (a fresh `App`, per the documented
+        // decision that a session's protocol-delivery state does not
+        // outlive the process it was tracked in).
+        let (mut new_session_app, _dir2) = test_app();
+        let new_turn_1 = send_turn(&mut new_session_app, "do the first thing, again");
+
+        assert!(new_turn_1.contains("[START HERE — required]"));
+        assert!(new_turn_1.contains(FIRST_ACTION));
+    }
+
+    #[test]
+    fn first_action_phrase_appears_at_most_once_across_a_ten_turn_session() {
+        let (mut app, _dir) = test_app();
+
+        let turns: Vec<String> = (0..10)
+            .map(|i| send_turn(&mut app, &format!("turn {i}")))
+            .collect();
+
+        let occurrences = turns
+            .iter()
+            .filter(|content| content.contains(FIRST_ACTION))
+            .count();
+        assert_eq!(
+            occurrences, 1,
+            "expected exactly one turn to carry the session-start block"
+        );
+    }
+
+    /// FR5: measures the assembled system-block size for a ten-turn session
+    /// before this fix (protocol block repeated every turn) against after
+    /// (protocol block sent once, per-turn context sent every turn).
+    #[test]
+    fn ten_turn_session_sends_far_fewer_protocol_tokens_than_resending_every_turn() {
+        let (mut app, _dir) = test_app();
+
+        let turns: Vec<String> = (0..10)
+            .map(|i| send_turn(&mut app, &format!("turn {i}")))
+            .collect();
+
+        let turn_1_chars = turns[0].chars().count();
+        let turn_2_chars = turns[1].chars().count();
+        let after_chars: usize = turns.iter().map(|t| t.chars().count()).sum();
+        // Baseline this replaces: the full block (protocol + per-turn
+        // context) repeated on all ten turns, as observed in the bug report.
+        let before_chars = turn_1_chars * 10;
+
+        assert!(
+            turn_1_chars > turn_2_chars,
+            "turn 1 must carry more than later turns"
+        );
+        assert!(
+            after_chars < before_chars,
+            "after ({after_chars} chars) should be well below before ({before_chars} chars)"
+        );
+        // ~4 chars/token is a standard rough estimator; exact tokenization is
+        // beside the point here — the ratio is what the fix targets.
+        let before_tokens = before_chars / 4;
+        let after_tokens = after_chars / 4;
+        assert!(
+            after_tokens * 2 < before_tokens,
+            "expected at least a 2x reduction in estimated tokens over ten turns: \
+             before={before_tokens} after={after_tokens}"
         );
     }
 }
@@ -2322,38 +2646,40 @@ mod picker_navigation_tests {
     use tempfile::NamedTempFile;
 
     #[test]
-    fn skills_picker_up_at_zero_wraps() {
+    fn skills_picker_up_at_zero_wraps_to_last() {
         let mut dialog = SimplePromptDialog::new();
         dialog.picker_mode = SectionPickerMode::SkillsPicker {
             selected: 0,
+            scroll: 0,
             entries: vec![
                 ("s1".into(), "r1".into(), "skill".into()),
                 ("s2".into(), "r2".into(), "skill".into()),
             ],
             replace_id: None,
         };
-        handle_skills_picker_key(&mut dialog, 0, 2, KeyCode::Up);
+        handle_skills_picker_key(&mut dialog, KeyCode::Up);
         if let SectionPickerMode::SkillsPicker { selected, .. } = &dialog.picker_mode {
-            assert_eq!(*selected, 0, "stays at zero, no wrap");
+            assert_eq!(*selected, 1, "up from the first entry wraps to the last");
         } else {
             panic!("expected SkillsPicker");
         }
     }
 
     #[test]
-    fn skills_picker_down_at_end_wraps() {
+    fn skills_picker_down_at_end_wraps_to_first() {
         let mut dialog = SimplePromptDialog::new();
         dialog.picker_mode = SectionPickerMode::SkillsPicker {
             selected: 1,
+            scroll: 0,
             entries: vec![
                 ("s1".into(), "r1".into(), "skill".into()),
                 ("s2".into(), "r2".into(), "skill".into()),
             ],
             replace_id: None,
         };
-        handle_skills_picker_key(&mut dialog, 1, 2, KeyCode::Down);
+        handle_skills_picker_key(&mut dialog, KeyCode::Down);
         if let SectionPickerMode::SkillsPicker { selected, .. } = &dialog.picker_mode {
-            assert_eq!(*selected, 1, "stays at end, no wrap");
+            assert_eq!(*selected, 0, "down from the last entry wraps to the first");
         } else {
             panic!("expected SkillsPicker");
         }
@@ -2364,11 +2690,44 @@ mod picker_navigation_tests {
         let mut dialog = SimplePromptDialog::new();
         dialog.picker_mode = SectionPickerMode::SkillsPicker {
             selected: 0,
+            scroll: 0,
             entries: vec![("s1".into(), "r1".into(), "skill".into())],
             replace_id: None,
         };
-        handle_skills_picker_key(&mut dialog, 0, 1, KeyCode::Esc);
+        handle_skills_picker_key(&mut dialog, KeyCode::Esc);
         assert_eq!(dialog.picker_mode, SectionPickerMode::None);
+    }
+
+    /// Regression test for the reported bug: with more skills than fit the
+    /// picker's viewport, moving down past the last visible row must slide
+    /// the scroll offset so the selection stays on screen instead of
+    /// walking off the bottom.
+    #[test]
+    fn skills_picker_scrolls_past_visible_rows() {
+        let entries: Vec<_> = (0..20)
+            .map(|i| (format!("s{i}"), format!("r{i}"), "skill".to_string()))
+            .collect();
+        let visible_rows = SimplePromptDialog::skills_picker_visible_rows(20);
+        let mut dialog = SimplePromptDialog::new();
+        dialog.picker_mode = SectionPickerMode::SkillsPicker {
+            selected: visible_rows - 1,
+            scroll: 0,
+            entries,
+            replace_id: None,
+        };
+        handle_skills_picker_key(&mut dialog, KeyCode::Down);
+        if let SectionPickerMode::SkillsPicker {
+            selected, scroll, ..
+        } = &dialog.picker_mode
+        {
+            assert_eq!(*selected, visible_rows);
+            assert_eq!(
+                *scroll, 1,
+                "offset must advance to keep the selection visible"
+            );
+        } else {
+            panic!("expected SkillsPicker");
+        }
     }
 
     fn make_project_entries(names: &[&str]) -> Vec<ProjectPickerEntry> {
@@ -2589,10 +2948,33 @@ mod picker_navigation_tests {
     #[test]
     fn remove_section_picker_navigation() {
         let mut dialog = SimplePromptDialog::new();
-        dialog.picker_mode = SectionPickerMode::RemoveSection { selected: 1 };
+        dialog.add_section("context");
+        dialog.add_section("context");
+        dialog.picker_mode = SectionPickerMode::RemoveSection {
+            selected: 1,
+            scroll: 0,
+        };
         handle_remove_section_picker_key(&mut dialog, 1, KeyCode::Up);
-        if let SectionPickerMode::RemoveSection { selected } = &dialog.picker_mode {
+        if let SectionPickerMode::RemoveSection { selected, .. } = &dialog.picker_mode {
             assert_eq!(*selected, 0);
+        } else {
+            panic!("expected RemoveSection");
+        }
+    }
+
+    #[test]
+    fn remove_section_picker_up_at_zero_wraps_to_last() {
+        let mut dialog = SimplePromptDialog::new();
+        dialog.add_section("context");
+        dialog.add_section("context");
+        let last = dialog.get_removable_sections().len() - 1;
+        dialog.picker_mode = SectionPickerMode::RemoveSection {
+            selected: 0,
+            scroll: 0,
+        };
+        handle_remove_section_picker_key(&mut dialog, 0, KeyCode::Up);
+        if let SectionPickerMode::RemoveSection { selected, .. } = &dialog.picker_mode {
+            assert_eq!(*selected, last, "up from the first entry wraps to the last");
         } else {
             panic!("expected RemoveSection");
         }
@@ -2601,7 +2983,10 @@ mod picker_navigation_tests {
     #[test]
     fn remove_section_picker_esc_closes() {
         let mut dialog = SimplePromptDialog::new();
-        dialog.picker_mode = SectionPickerMode::RemoveSection { selected: 0 };
+        dialog.picker_mode = SectionPickerMode::RemoveSection {
+            selected: 0,
+            scroll: 0,
+        };
         handle_remove_section_picker_key(&mut dialog, 0, KeyCode::Esc);
         assert_eq!(dialog.picker_mode, SectionPickerMode::None);
     }
@@ -2614,14 +2999,30 @@ mod picker_navigation_tests {
     }
 
     #[test]
-    fn add_section_picker_up_at_zero_is_noop() {
+    fn add_section_picker_up_at_zero_wraps_to_last() {
         let mut dialog = SimplePromptDialog::new();
+        let last = dialog.get_addable_sections().len() - 1;
         dialog.picker_mode = SectionPickerMode::AddSection { selected: 0 };
         let db = test_db();
         let workdir = Path::new("/tmp");
         handle_add_section_picker_key(&mut dialog, 0, &db, workdir, KeyCode::Up).unwrap();
         if let SectionPickerMode::AddSection { selected } = &dialog.picker_mode {
-            assert_eq!(*selected, 0, "should stay at 0");
+            assert_eq!(*selected, last, "up from the first entry wraps to the last");
+        } else {
+            panic!("expected AddSection");
+        }
+    }
+
+    #[test]
+    fn add_section_picker_down_at_last_wraps_to_zero() {
+        let mut dialog = SimplePromptDialog::new();
+        let last = dialog.get_addable_sections().len() - 1;
+        dialog.picker_mode = SectionPickerMode::AddSection { selected: last };
+        let db = test_db();
+        let workdir = Path::new("/tmp");
+        handle_add_section_picker_key(&mut dialog, last, &db, workdir, KeyCode::Down).unwrap();
+        if let SectionPickerMode::AddSection { selected } = &dialog.picker_mode {
+            assert_eq!(*selected, 0, "down from the last entry wraps to the first");
         } else {
             panic!("expected AddSection");
         }

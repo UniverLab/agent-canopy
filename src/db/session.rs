@@ -155,6 +155,43 @@ impl Database {
         Ok(rows)
     }
 
+    /// Get sessions eligible for the canopy-native resume picker (C25):
+    /// finished (`completed` or `error`) interactive sessions, excluding
+    /// bridge sidecars. `active` rows are excluded because they're already
+    /// running and visible in the sidebar; `resumed` rows are excluded
+    /// because they were already superseded by a replacement session that
+    /// appears in its own right once it finishes. Most-recent-first, capped
+    /// at `limit` rows. Collapsing to one candidate per (cli, working_dir)
+    /// happens afterward in `session_resume::dedupe_resumable_sessions` —
+    /// this is a plain fetch, not the final candidate list.
+    pub fn get_resumable_sessions(&self, limit: usize) -> Result<Vec<InteractiveSession>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, cli, working_dir, args, started_at, status, session_type, pid, boot_id
+             FROM interactive_sessions
+             WHERE status IN ('completed', 'error') AND session_type != 'bridge'
+             ORDER BY started_at DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok(InteractiveSession {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    cli: row.get(2)?,
+                    working_dir: row.get(3)?,
+                    args: row.get(4)?,
+                    started_at: row.get(5)?,
+                    status: row.get(6)?,
+                    session_type: row.get(7)?,
+                    pid: row.get(8)?,
+                    boot_id: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Get active sessions of a specific `session_type` (e.g. "bridge").
     ///
     /// Used at startup to reconcile bridge sidecars whose owning process
@@ -497,6 +534,147 @@ mod tests {
         let db = test_db();
         let sessions = db.get_orphaned_sessions().unwrap();
         assert!(sessions.is_empty());
+    }
+
+    // ── get_resumable_sessions (C25 regression) ────────────────────
+
+    /// The reported bug: several finished sessions on record, and zero rows
+    /// in the retired `orphaned` status (nothing writes it any more), must
+    /// still yield resumable candidates.
+    #[test]
+    fn get_resumable_sessions_finds_completed_sessions_with_no_orphaned_rows() {
+        let db = test_db();
+        for i in 0..3 {
+            let id = format!("session-{i}");
+            db.insert_interactive_session(
+                &id,
+                &id,
+                "claude",
+                "/tmp/project",
+                None,
+                None,
+                "interactive",
+                None,
+            )
+            .unwrap();
+            db.finish_interactive_session(&id, 0).unwrap();
+        }
+
+        assert!(db.get_orphaned_sessions().unwrap().is_empty());
+
+        let resumable = db.get_resumable_sessions(20).unwrap();
+        assert!(
+            !resumable.is_empty(),
+            "finished sessions must be resumable even though nothing is 'orphaned'"
+        );
+        assert_eq!(resumable.len(), 3);
+    }
+
+    #[test]
+    fn get_resumable_sessions_includes_completed_and_error() {
+        let db = test_db();
+        db.insert_interactive_session(
+            "ok",
+            "ok",
+            "claude",
+            "/tmp",
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+        db.finish_interactive_session("ok", 0).unwrap();
+        db.insert_interactive_session(
+            "bad",
+            "bad",
+            "claude",
+            "/tmp",
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+        db.finish_interactive_session("bad", 1).unwrap();
+
+        let resumable = db.get_resumable_sessions(20).unwrap();
+        assert_eq!(resumable.len(), 2);
+    }
+
+    #[test]
+    fn get_resumable_sessions_excludes_active() {
+        let db = test_db();
+        db.insert_interactive_session(
+            "still-active",
+            "still-active",
+            "claude",
+            "/tmp",
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+
+        let resumable = db.get_resumable_sessions(20).unwrap();
+        assert!(resumable.is_empty());
+    }
+
+    #[test]
+    fn get_resumable_sessions_excludes_resumed() {
+        let db = test_db();
+        db.insert_interactive_session(
+            "superseded",
+            "superseded",
+            "claude",
+            "/tmp",
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+        db.mark_session_resumed("superseded").unwrap();
+
+        let resumable = db.get_resumable_sessions(20).unwrap();
+        assert!(resumable.is_empty());
+    }
+
+    #[test]
+    fn get_resumable_sessions_excludes_bridge_sidecars() {
+        let db = test_db();
+        db.insert_interactive_session(
+            "sidecar", "sidecar", "claude", "/tmp", None, None, "bridge", None,
+        )
+        .unwrap();
+        db.finish_interactive_session("sidecar", 0).unwrap();
+
+        let resumable = db.get_resumable_sessions(20).unwrap();
+        assert!(resumable.is_empty());
+    }
+
+    #[test]
+    fn get_resumable_sessions_respects_limit() {
+        let db = test_db();
+        for i in 0..5 {
+            let id = format!("session-{i}");
+            db.insert_interactive_session(
+                &id,
+                &id,
+                "claude",
+                "/tmp",
+                None,
+                None,
+                "interactive",
+                None,
+            )
+            .unwrap();
+            db.finish_interactive_session(&id, 0).unwrap();
+        }
+
+        let resumable = db.get_resumable_sessions(2).unwrap();
+        assert_eq!(resumable.len(), 2);
     }
 
     #[test]

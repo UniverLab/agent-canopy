@@ -55,7 +55,7 @@ pub fn draw_launchpad_dialog(frame: &mut Frame, app: &App, theme: &Theme) {
         .title(title)
         .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(theme.header_color))
-        .style(Style::default().bg(Color::Rgb(15, 25, 15)));
+        .style(Style::default().bg(theme.dialog_bg));
     frame.render_widget(block, area);
 
     let inner = Rect::new(

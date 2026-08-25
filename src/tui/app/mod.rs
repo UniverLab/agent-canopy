@@ -199,7 +199,7 @@ impl App {
             agents_rag_focused: false,
             sync_scroll_offset: 0,
             last_sync_area: None,
-            workdir_system_state: HashMap::new(),
+            session_protocol_state: HashMap::new(),
             project_relation_dialog: None,
             project_graph_edges: Vec::new(),
             project_graph_trees: Vec::new(),
@@ -3043,7 +3043,7 @@ impl App {
         let cli = crate::domain::models::Cli::from_str(&session.cli);
         let cli_config = canopy_config.get_cli(cli.as_str());
         let resume_args = build_resumed_session_args(
-            session,
+            session.args.as_deref(),
             cli_config.and_then(|config| config.interactive_args.as_deref()),
             cli_config.and_then(|config| config.resume_args.as_deref()),
             cli_config.and_then(|config| config.session_resume_cmd.as_deref()),
@@ -3568,7 +3568,11 @@ fn playground_vector_search(
         .enable_all()
         .build()?;
     rt.block_on(async {
-        let store = crate::rag::vector_store::VectorStore::new(dimensions).await?;
+        let store = crate::rag::vector_store::VectorStore::new(
+            dimensions,
+            Some(config.rag_vector_cache_entries),
+        )
+        .await?;
         let embedder = crate::rag::embedding_client::client_from_config(&config)?;
         let query_vec = embedder.embed(query)?;
         store.search_similar(&query_vec, top_k).await
@@ -3788,11 +3792,15 @@ mod tests {
             boot_id: None,
         };
 
-        assert!(
-            build_resumed_session_args(&session, None, None, None, Some("--yolo"))
-                .as_deref()
-                .is_some_and(|args| args.contains("--yolo"))
-        );
+        assert!(build_resumed_session_args(
+            session.args.as_deref(),
+            None,
+            None,
+            None,
+            Some("--yolo")
+        )
+        .as_deref()
+        .is_some_and(|args| args.contains("--yolo")));
     }
 
     #[test]
@@ -3810,7 +3818,9 @@ mod tests {
             boot_id: None,
         };
 
-        let args = build_resumed_session_args(&session, None, None, None, Some("--yolo")).unwrap();
+        let args =
+            build_resumed_session_args(session.args.as_deref(), None, None, None, Some("--yolo"))
+                .unwrap();
         assert_eq!(args.matches("--yolo").count(), 1);
     }
 
@@ -3830,7 +3840,7 @@ mod tests {
         };
 
         let args = build_resumed_session_args(
-            &session,
+            session.args.as_deref(),
             Some("--chat"),
             Some("-c"),
             Some("--session"),
@@ -3857,9 +3867,14 @@ mod tests {
             boot_id: None,
         };
 
-        let args =
-            build_resumed_session_args(&session, None, Some("--continue"), None, Some("--yolo"))
-                .unwrap();
+        let args = build_resumed_session_args(
+            session.args.as_deref(),
+            None,
+            Some("--continue"),
+            None,
+            Some("--yolo"),
+        )
+        .unwrap();
         assert!(args.contains("--continue"));
         assert!(!args.contains("--yolo"));
     }
@@ -3880,7 +3895,7 @@ mod tests {
         };
 
         let args = build_resumed_session_args(
-            &session,
+            session.args.as_deref(),
             Some("chat"),
             Some("--resume-picker"),
             None,
@@ -4028,6 +4043,7 @@ mod tests {
     ) -> crate::domain::loops::Loop {
         crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: id.to_string(),
             name: name.to_string(),
             description: None,
@@ -4061,6 +4077,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: workdir.map(str::to_string),
             completed_via: None,
             completed_via_reason: None,
@@ -5262,6 +5279,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -5795,6 +5813,7 @@ mod tests {
 
         db.insert_loop(&Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "plp1".to_string(),
             name: "plain loop".to_string(),
             description: None,
@@ -5822,6 +5841,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -5959,6 +5979,7 @@ mod tests {
 
         db.insert_loop(&Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "rlp1".to_string(),
             name: "router loop".to_string(),
             description: None,
@@ -5986,6 +6007,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -6247,6 +6269,7 @@ mod tests {
         let db = test_db();
         db.insert_loop(&Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "clp1".to_string(),
             name: "check loop".to_string(),
             description: None,
@@ -6274,6 +6297,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
