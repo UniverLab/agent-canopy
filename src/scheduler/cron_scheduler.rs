@@ -379,9 +379,11 @@ impl CronScheduler {
     }
 
     /// One-shot `autorun_at`: for each loop with a pending `autorun_at` in
-    /// the past that is still fireable (not `Running`/`Paused`), clear the
-    /// schedule and launch it once via the loop engine. Unlike cron loops,
-    /// this never repeats — see [`crate::domain::loops::Loop::is_autorun_due`].
+    /// the past that is still fireable (not `Running`/`Paused`) — or `Paused`
+    /// because `reconcile_orphaned_loops` put it there, see
+    /// [`crate::domain::loops::Loop::is_autorun_due`] — clear the schedule
+    /// and launch it once via the loop engine. Unlike cron loops, this never
+    /// repeats.
     ///
     /// A `failed` loop is not launched as-is — `loop_run` refuses `failed`
     /// loops, so firing here performs an explicit auto-reset-and-resume
@@ -399,6 +401,25 @@ impl CronScheduler {
         let pending = self.db.list_pending_autorun_loops()?;
         for lp in &pending {
             if !lp.is_autorun_due(now_utc) {
+                // C1: a due schedule on a loop the *operator* paused
+                // (`paused_by_reconciliation` is false) can never fire on its
+                // own — `is_fireable()` deliberately keeps excluding `Paused`
+                // for every caller but reconciliation's. That's correct, but
+                // it must not be a second silent expiry: surface it every
+                // tick it's still blocked, so an operator watching logs sees
+                // why the resume never happened instead of concluding canopy
+                // forgot.
+                if lp.status == LoopStatus::Paused
+                    && !lp.paused_by_reconciliation
+                    && lp.autorun_at.is_some_and(|at| now_utc >= at)
+                {
+                    tracing::warn!(
+                        "Loop '{}' autorun_at is due but the loop is paused (not by \
+                         reconciliation); it will not fire until resumed manually via \
+                         loop_continue or loop_run — the schedule remains pending.",
+                        lp.id
+                    );
+                }
                 continue;
             }
             self.db.clear_loop_autorun(&lp.id)?;
@@ -906,12 +927,34 @@ mod tests {
         (db, scheduler)
     }
 
+    /// Like [`test_scheduler_with_loops`], but also hands back the
+    /// [`LoopEngine`] itself, with the cross-run attempt budget floored to a
+    /// single attempt, so a test can drive a spec to a genuine C19 `Blocked`
+    /// loop through real execution and then check the scheduler's autorun
+    /// behavior against that exact state.
+    fn test_scheduler_and_engine() -> (Arc<Database>, CronScheduler, Arc<LoopEngine>) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
+        std::mem::forget(dir);
+        let executor = Arc::new(Executor::new(
+            db.clone(),
+            Arc::new(DefaultNotificationService),
+        ));
+        let loop_engine = Arc::new(
+            LoopEngine::new(db.clone(), Arc::new(DefaultNotificationService))
+                .with_spec_attempt_limit(1),
+        );
+        let scheduler = CronScheduler::with_loops(db.clone(), executor, Arc::clone(&loop_engine));
+        (db, scheduler, loop_engine)
+    }
+
     fn sample_loop(
         id: &str,
         status: crate::domain::loops::LoopStatus,
     ) -> crate::domain::loops::Loop {
         crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: id.to_string(),
             name: "Autorun test loop".to_string(),
             description: None,
@@ -1053,6 +1096,7 @@ mod tests {
         let loop_id = "failed-autorun".to_string();
         db.insert_loop(&Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: loop_id.clone(),
             name: "Autorun test loop".to_string(),
             description: None,
@@ -1082,6 +1126,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -1139,6 +1184,279 @@ mod tests {
         );
     }
 
+    /// C1's regression test — the real sequence: a loop is genuinely
+    /// `Running` when the daemon dies uncleanly; `reconcile_orphaned_loops`
+    /// (as it would run at the next boot) pauses it and marks its dangling
+    /// run interrupted; the resilience node's `loop_schedule_autorun` is
+    /// already due by the time the scheduler next evaluates it. Before this
+    /// fix, `is_autorun_due` excluded every `Paused` loop unconditionally, so
+    /// this schedule would sit forever and never fire. It must fire now,
+    /// through the same `resume_background` path a manual `loop_continue`
+    /// takes, and actually finish the interrupted spec.
+    #[tokio::test]
+    async fn fire_due_autorun_loops_fires_reconciliation_paused_loop() {
+        use crate::domain::loops::{LoopNodeRun, LoopRunStatus, LoopSpecStatus};
+
+        let (db, scheduler) = test_scheduler_with_loops();
+        let workdir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let loop_id = "reconciled-autorun".to_string();
+
+        let mut lp = sample_loop(&loop_id, LoopStatus::Running);
+        lp.workdir = workdir.path().to_string_lossy().to_string();
+        db.insert_loop(&lp).unwrap();
+
+        let spec = crate::domain::loops::LoopSpec {
+            id: "spec-reconciled".to_string(),
+            loop_id: Some(loop_id.clone()),
+            name: "Spec 1".to_string(),
+            description: Some(
+                "Functional Requirements:\n- A\n\nNon-Functional Requirements:\n- B\n\nObjective:\n- C\n\nConstraints:\n- D\n\nGuidelines:\n- E\n\nIn Scope:\n- F\n\nOut of Scope:\n- G".to_string(),
+            ),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Running,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        db.insert_loop_spec(&spec).unwrap();
+        db.update_loop_spec_status(&spec.id, LoopSpecStatus::Running, Some(Utc::now()), None)
+            .unwrap();
+
+        let node = crate::domain::loops::LoopNode {
+            id: "node-reconciled".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "check".to_string(),
+            kind: crate::domain::loops::LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: Utc::now(),
+        };
+        db.insert_loop_node(&node).unwrap();
+
+        // The run left dangling by the daemon that died uncleanly.
+        db.insert_loop_run(&LoopNodeRun {
+            id: "run-reconciled".to_string(),
+            loop_id: loop_id.clone(),
+            spec_id: spec.id.clone(),
+            node_id: node.id.clone(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        })
+        .unwrap();
+
+        // The next boot's reconciliation pass — this is what must leave the
+        // loop resumable, not the test hand-setting `paused_by_reconciliation`.
+        assert_eq!(db.reconcile_orphaned_loops(data_dir.path()).unwrap(), 1);
+        let lp_after_reconcile = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp_after_reconcile.status, LoopStatus::Paused);
+        assert!(
+            lp_after_reconcile.paused_by_reconciliation,
+            "reconciliation must flag its own pause"
+        );
+
+        // The resilience node's scheduled resume, already due.
+        db.schedule_loop_autorun(&loop_id, Utc::now() - chrono::Duration::minutes(1))
+            .unwrap();
+
+        scheduler.fire_due_autorun_loops(Utc::now()).unwrap();
+
+        let lp_fired = db.get_loop(&loop_id).unwrap().unwrap();
+        assert!(
+            lp_fired.autorun_at.is_none(),
+            "firing must clear autorun_at"
+        );
+
+        // Unlike the `failed` case, there's no synchronous reset step here —
+        // `resume_background`'s spawned task is what actually claims the
+        // loop off `Paused` (via `claim_loop_for_run`). Prove it left
+        // `Paused` by waiting for the resumed run to actually complete.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let lp = db.get_loop(&loop_id).unwrap().unwrap();
+            if lp.status == LoopStatus::Completed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "resumed run did not complete in time; loop status is {:?}",
+                lp.status
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let spec_after = db.get_loop_spec(&spec.id).unwrap().unwrap();
+        assert_eq!(
+            spec_after.status,
+            LoopSpecStatus::Completed,
+            "the auto-resumed run must have actually executed the interrupted spec"
+        );
+    }
+
+    /// C1: firing on a reconciliation-paused loop must clear `autorun_at`
+    /// exactly like every other autorun fire — a second scheduler tick must
+    /// not resume it again.
+    #[tokio::test]
+    async fn fire_due_autorun_loops_on_reconciliation_paused_loop_is_one_shot() {
+        let (db, scheduler) = test_scheduler_with_loops();
+        let loop_id = "reconciled-once".to_string();
+        let mut lp = sample_loop(&loop_id, LoopStatus::Paused);
+        lp.paused_by_reconciliation = true;
+        db.insert_loop(&lp).unwrap();
+        db.schedule_loop_autorun(&loop_id, Utc::now() - chrono::Duration::minutes(1))
+            .unwrap();
+
+        scheduler.fire_due_autorun_loops(Utc::now()).unwrap();
+        let pending = db.list_pending_autorun_loops().unwrap();
+        assert!(
+            pending.iter().all(|l| l.id != loop_id),
+            "firing must clear autorun_at so a second tick can't resume it again"
+        );
+    }
+
+    /// C1: a due `autorun_at` on a loop the operator paused (not
+    /// reconciliation) must never fire — `loop_pause`/`loop_report_blocker`
+    /// both route through `update_loop_status`, which clears
+    /// `paused_by_reconciliation`, so this is the default state of any
+    /// `Paused` loop that didn't come through reconciliation.
+    #[tokio::test]
+    async fn fire_due_autorun_loops_never_fires_on_an_operator_paused_loop() {
+        let (db, scheduler) = test_scheduler_with_loops();
+        let loop_id = "operator-paused-autorun".to_string();
+        let lp = sample_loop(&loop_id, LoopStatus::Paused);
+        assert!(!lp.paused_by_reconciliation);
+        db.insert_loop(&lp).unwrap();
+        db.schedule_loop_autorun(&loop_id, Utc::now() - chrono::Duration::minutes(1))
+            .unwrap();
+
+        scheduler.fire_due_autorun_loops(Utc::now()).unwrap();
+
+        let lp_after = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp_after.status, LoopStatus::Paused, "must stay paused");
+        assert!(
+            lp_after.autorun_at.is_some(),
+            "operator pause must not be silently discarded either — the schedule stays pending"
+        );
+    }
+
+    /// C19: a loop the engine itself paused because a spec exceeded its
+    /// persisted cross-run attempt budget must not be silently relaunched by
+    /// a pending autorun schedule either — it needs a human, exactly like
+    /// any other blocker. `LoopEngine::block_loop` reaches this state
+    /// through the exact same `update_loop_status(..., Paused, ...)` path
+    /// as an operator pause (clearing `paused_by_reconciliation` on every
+    /// call), so `is_autorun_due` already refuses it — this exercises that
+    /// through real execution rather than a hand-built `Loop` row.
+    #[tokio::test]
+    async fn fire_due_autorun_loops_never_fires_a_c19_blocked_loop() {
+        use crate::domain::loops::{Loop, LoopNode, LoopNodeKind, LoopSpec, LoopSpecStatus};
+
+        let (db, scheduler, loop_engine) = test_scheduler_and_engine();
+        let workdir = tempfile::tempdir().unwrap();
+        let loop_id = "c19-blocked-autorun".to_string();
+        db.insert_loop(&Loop {
+            archived: false,
+            paused_by_reconciliation: false,
+            id: loop_id.clone(),
+            name: "C19 blocked autorun test".to_string(),
+            description: None,
+            workdir: workdir.path().to_string_lossy().to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        })
+        .unwrap();
+
+        let spec_id = "c19-blocked-spec".to_string();
+        db.insert_loop_spec(&LoopSpec {
+            id: spec_id.clone(),
+            loop_id: Some(loop_id.clone()),
+            name: "Spec".to_string(),
+            description: Some(
+                "Functional Requirements:\n- A\n\nNon-Functional Requirements:\n- B\n\n\
+                 Objective:\n- C\n\nConstraints:\n- D\n\nGuidelines:\n- E\n\nIn Scope:\n- F\n\n\
+                 Out of Scope:\n- G"
+                    .to_string(),
+            ),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "dead-end".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "dead-end".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "exit 1",
+                "success_condition": "exit_code_0",
+            }),
+            position: 1,
+            created_at: Utc::now(),
+        })
+        .unwrap();
+        // No outgoing edge from "dead-end": one genuine Fail is enough to
+        // exceed the attempt limit of 1 this fixture set up.
+
+        loop_engine
+            .run_loop(loop_id.clone(), None, None)
+            .await
+            .unwrap();
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Paused, "must be blocked, not failed");
+        assert!(!lp.paused_by_reconciliation);
+
+        db.schedule_loop_autorun(&loop_id, Utc::now() - chrono::Duration::minutes(1))
+            .unwrap();
+
+        scheduler.fire_due_autorun_loops(Utc::now()).unwrap();
+
+        let lp_after = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(
+            lp_after.status,
+            LoopStatus::Paused,
+            "a C19-blocked loop must not autorun"
+        );
+        assert!(
+            lp_after.autorun_at.is_some(),
+            "the pending schedule stays pending until the blocker is cleared"
+        );
+    }
+
     /// The exact incident this spec fixes: a loop was launched with
     /// `loop_run { queue_id }`, failed mid-queue (e.g. a quota error), and its
     /// `loop_schedule_autorun` fired to revive it. Before this fix, autorun
@@ -1158,6 +1476,7 @@ mod tests {
         let loop_id = "failed-queue-autorun".to_string();
         db.insert_loop(&Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: loop_id.clone(),
             name: "Autorun queue test loop".to_string(),
             description: None,
@@ -1186,6 +1505,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -1417,6 +1737,7 @@ mod tests {
         let loop_id = "paused-auto-continue".to_string();
         db.insert_loop(&Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: loop_id.clone(),
             name: "Auto-continue test loop".to_string(),
             description: None,
@@ -1448,6 +1769,7 @@ mod tests {
             started_at: Some(Utc::now()),
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -1527,6 +1849,7 @@ mod tests {
         let loop_id = "paused-auto-continue-skip".to_string();
         db.insert_loop(&Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: loop_id.clone(),
             name: "Auto-continue skip test loop".to_string(),
             description: None,
@@ -1554,6 +1877,7 @@ mod tests {
             started_at: Some(Utc::now()),
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,

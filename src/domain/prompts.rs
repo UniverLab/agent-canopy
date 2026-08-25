@@ -10,6 +10,7 @@
 //! content written to disk *and* the fallback used when a preset file goes
 //! missing or unreadable, so the two can never drift apart.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// The tag vocabulary every builtin preset below is built from, mirroring
@@ -234,6 +235,78 @@ pub fn resolve_prompt_preset(prompts_dir: &Path, name: &str) -> String {
             fallback
         }
     }
+}
+
+/// A `{{name}}` placeholder in a preset's raw content with no bound value
+/// supplied by the caller. [`render_preset`] refuses to emit rather than let
+/// a literal, unfilled placeholder reach whatever the preset is composed
+/// into — an unfilled placeholder is a refusal, not a warning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingPresetBinding {
+    pub preset: String,
+    pub binding: String,
+}
+
+impl std::fmt::Display for MissingPresetBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "preset '{}' requires '{{{{{}}}}}', which was not supplied",
+            self.preset, self.binding
+        )
+    }
+}
+
+impl std::error::Error for MissingPresetBinding {}
+
+/// Every `{{name}}` placeholder in `content`, first-seen order, deduplicated.
+fn placeholder_names(content: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = content;
+    while let Some(start) = rest.find("{{") {
+        let after_open = &rest[start + 2..];
+        let Some(end) = after_open.find("}}") else {
+            break;
+        };
+        let name = after_open[..end].trim().to_string();
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+        rest = &after_open[end + 2..];
+    }
+    names
+}
+
+/// Render a preset's raw content (as returned by [`resolve_prompt_preset`]
+/// or read straight from a picker entry) by substituting every `{{name}}`
+/// placeholder with `bindings[name]`. A preset is scoped to its own
+/// invocation: this only ever touches `content`, never anything composed
+/// around it, and returns exactly that preset's body.
+///
+/// Refuses — returns `Err` naming the preset and the missing binding —
+/// rather than emit a literal `{{...}}` sequence when a required binding
+/// isn't supplied, so a caller with no bindings to offer (e.g. the TUI
+/// composing an ad hoc prompt) never leaks an unfilled template into its
+/// output.
+pub fn render_preset(
+    preset: &str,
+    content: &str,
+    bindings: &HashMap<String, String>,
+) -> Result<String, MissingPresetBinding> {
+    for name in placeholder_names(content) {
+        if !bindings.contains_key(&name) {
+            return Err(MissingPresetBinding {
+                preset: preset.to_string(),
+                binding: name,
+            });
+        }
+    }
+
+    let mut rendered = content.to_string();
+    for (name, value) in bindings {
+        rendered = rendered.replace(&format!("{{{{{name}}}}}"), value);
+    }
+    Ok(rendered)
 }
 
 #[cfg(test)]
@@ -468,5 +541,84 @@ mod tests {
             implementer_preset()
         );
         assert!(resolve_prompt_preset(&prompts, "implementer").contains("<role>"));
+    }
+
+    // ── render_preset ─────────────────────────────────────────────
+
+    #[test]
+    fn render_preset_substitutes_every_bound_placeholder() {
+        let mut bindings = HashMap::new();
+        bindings.insert("spec_content".to_string(), "do the thing".to_string());
+        bindings.insert("previous_feedback".to_string(), "(none)".to_string());
+
+        let rendered = render_preset("implementer", &implementer_preset(), &bindings).unwrap();
+
+        assert!(!rendered.contains("{{"));
+        assert!(rendered.contains("do the thing"));
+        assert!(rendered.contains("(none)"));
+    }
+
+    #[test]
+    fn render_preset_refuses_and_names_preset_and_missing_binding() {
+        let content = "Body with {{spec_content}} inside.";
+        let err = render_preset("implementer", content, &HashMap::new()).unwrap_err();
+
+        assert_eq!(err.preset, "implementer");
+        assert_eq!(err.binding, "spec_content");
+    }
+
+    #[test]
+    fn render_preset_with_no_placeholders_and_no_bindings_returns_content_unchanged() {
+        let content = "Just plain preset text, no placeholders at all.";
+        let rendered = render_preset("custom", content, &HashMap::new()).unwrap();
+        assert_eq!(rendered, content);
+    }
+
+    #[test]
+    fn render_preset_emits_nothing_when_refused() {
+        // A refusal returns Err, never a partially-substituted or
+        // placeholder-carrying Ok — the caller cannot accidentally use a
+        // half-rendered body.
+        let content = "{{a}} and {{b}}";
+        let mut bindings = HashMap::new();
+        bindings.insert("a".to_string(), "filled".to_string());
+        // 'b' deliberately left unbound.
+        assert!(render_preset("p", content, &bindings).is_err());
+    }
+
+    #[test]
+    fn render_preset_property_every_builtin_preset_renders_with_no_placeholder_leftover() {
+        let mut bindings = HashMap::new();
+        bindings.insert("spec_content".to_string(), "SPEC-BODY".to_string());
+        bindings.insert("previous_feedback".to_string(), "FEEDBACK-BODY".to_string());
+
+        for (name, content) in builtin_prompt_preset_specs() {
+            let rendered = render_preset(name, &content, &bindings)
+                .unwrap_or_else(|e| panic!("preset '{name}' failed to render: {e}"));
+            assert!(
+                !rendered.contains("{{"),
+                "preset '{name}' left an unfilled placeholder: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_preset_two_presets_in_one_session_stay_isolated() {
+        let mut bindings_a = HashMap::new();
+        bindings_a.insert("spec_content".to_string(), "ONLY-IN-A".to_string());
+        bindings_a.insert("previous_feedback".to_string(), "(none)".to_string());
+
+        let mut bindings_b = HashMap::new();
+        bindings_b.insert("spec_content".to_string(), "ONLY-IN-B".to_string());
+
+        let rendered_a = render_preset("implementer", &implementer_preset(), &bindings_a).unwrap();
+        let rendered_b = render_preset("reviewer", &reviewer_preset(), &bindings_b).unwrap();
+
+        assert!(rendered_a.contains("ONLY-IN-A"));
+        assert!(!rendered_a.contains("ONLY-IN-B"));
+        assert!(rendered_b.contains("ONLY-IN-B"));
+        assert!(!rendered_b.contains("ONLY-IN-A"));
+        assert!(!rendered_a.contains(&rendered_b));
+        assert!(!rendered_b.contains(&rendered_a));
     }
 }

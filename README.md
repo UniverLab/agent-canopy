@@ -27,6 +27,76 @@ harness-canopy is a modern, self-contained MCP (Model Context Protocol) server a
 
 ---
 
+## Requirements
+
+canopy orchestrates AI agent tools — it doesn't ship one. Before installing,
+you need at least one supported **platform installed and authenticated**
+on this machine. "Installed" is not enough: the most common first failure
+is a platform that's present but not logged in, and canopy has no way to
+tell you apart from "canopy is broken."
+
+canopy calls each supported AI tool a **platform**. Most ship as a
+standalone terminal command (`claude`, `codex`, `gemini`, ...); a few —
+Cursor, Antigravity, Qoder — ship as a code editor with one built in.
+canopy drives either kind the same way, through the CLI binary each one
+exposes, so editors show up in the same list as terminal tools.
+
+### Supported platforms
+
+| Platform | Binary | Ships as |
+|---|---|---|
+| claude | `claude` | terminal (Claude Code) |
+| codex | `codex` | terminal (Codex CLI) |
+| gemini | `gemini` | terminal (Gemini CLI) |
+| copilot | `copilot` | terminal (GitHub Copilot CLI) |
+| qwen | `qwen` | terminal (Qwen Code) |
+| mistral | `vibe` | terminal (Mistral's Vibe CLI) |
+| opencode | `opencode` | terminal (OpenCode) |
+| kiro | `kiro-cli` | terminal (Kiro) |
+| kilo | `kilo` | terminal (Kilo Code) |
+| cline | `cline` | editor (Cline, VS Code) |
+| continue | `cn` | editor (Continue, VS Code/JetBrains) |
+| blackbox | `blackbox` | terminal (Blackbox AI CLI) |
+| mimocode | `mimo` | terminal (Mimo Code) |
+| cursor | `agent` | editor (Cursor) |
+| antigravity | `agy` | editor (Antigravity) |
+| qoder | `qoder` | editor (Qoder) |
+
+This list is drawn from the live [platform registry](https://github.com/UniverLab/canopy-registry)
+(`index.toml`); `canopy setup` re-fetches it, so newly added platforms show
+up there before they show up here.
+
+### Check that a platform is usable
+
+```bash
+canopy doctor
+```
+
+Its "Harnesses" line confirms each configured platform's binary is present
+and executable on `PATH` — **it does not check that you're logged in.**
+There's no single command across all 16 platforms for that; check the
+platform's own way, e.g. `claude auth status` or `codex login status`. Most
+tools will otherwise tell you the moment you actually run them for real.
+
+### If no platform is installed
+
+`canopy setup` is meant to detect nothing, say so, list every platform it
+supports, and finish with zero platforms configured so you can install one
+and re-run. In practice it doesn't reach that message: the registry fetch
+(`src/setup_module/registry_fetch.rs`, `try_fetch_v6` / `try_fetch_v5` /
+`try_fetch_local`) filters the platform list down to already-installed
+binaries *before* returning it, and bails out if that filtered list is
+empty — discarding the full list that the "no platforms detected" branch
+(`src/setup_module/wizard.rs:50-61`) needs. Verified by running
+`canopy setup` with no supported binary on `PATH`: the real registry path
+fails with `Error: Registry returned HTTP 404 Not Found` (it falls through
+to a dead legacy endpoint), and `canopy setup --local-registry <dir>` fails
+with `Error: Local registry not found or invalid at: <dir>`. Either way,
+setup exits instead of guiding you — this is a bug in `canopy setup`,
+tracked separately, not fixed here.
+
+---
+
 ## Installation
 
 **Linux / macOS:**

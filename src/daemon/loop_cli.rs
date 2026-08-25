@@ -555,6 +555,12 @@ fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
                     Some(head) => println!(" spec_start_head: {head}"),
                     None => println!(" spec_start_head: (not a git workdir)"),
                 }
+                // C15: the HEAD this attempt's own committer last left
+                // behind, if any — `{{spec_committed_head}}` in a check node.
+                match spec.spec_committed_head {
+                    Some(head) => println!(" spec_committed_head: {head}"),
+                    None => println!(" spec_committed_head: (nothing committed by this run yet)"),
+                }
             }
         }
     }
@@ -1113,6 +1119,7 @@ mod tests {
     fn make_loop(id: &str, name: &str, status: LoopStatus) -> Loop {
         Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: id.to_string(),
             name: name.to_string(),
             description: None,
@@ -1142,6 +1149,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,

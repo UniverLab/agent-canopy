@@ -1158,6 +1158,7 @@ mod tests {
             .unwrap();
         db.insert_loop(&crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "loop-1".to_string(),
             name: "loop-1".to_string(),
             description: None,
@@ -1185,6 +1186,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: Some(workdir.to_string()),
             completed_via: None,
             completed_via_reason: None,
@@ -1364,6 +1366,7 @@ mod tests {
             .unwrap();
         db.insert_loop(&crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "loop-b".to_string(),
             name: "loop-b".to_string(),
             description: None,

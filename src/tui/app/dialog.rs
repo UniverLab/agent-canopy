@@ -2,6 +2,7 @@
 
 mod app_methods;
 pub mod at_picker;
+pub mod datetime_picker;
 pub mod knowledge;
 pub mod launchpad;
 pub mod loop_control;

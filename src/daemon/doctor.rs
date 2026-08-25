@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -233,6 +234,14 @@ pub(crate) async fn run_doctor() -> Result<()> {
     // port — from here that's indistinguishable from "never started" unless
     // doctor reads the unit itself and says so.
     report_service_unit(&home, &mut issues);
+
+    // ── Duplicate Binaries (C17) ────────────────────────────────────
+    // A tool installed by both the install script (~/.local/bin) and
+    // `cargo install` (~/.cargo/bin) leaves two binaries on PATH — updating
+    // one and running the other produces old behaviour with nothing to
+    // explain it. Walk PATH the way the shell does and say which copy
+    // actually runs.
+    report_canopy_path_copies(&mut issues).await;
 
     // declaration: same marker as the "Config: config.toml" check above —
     // kept as a separate line for readability, not a separate fact. Same
@@ -562,7 +571,12 @@ pub(crate) async fn run_doctor() -> Result<()> {
                 );
             }
         }
-        Some(dimensions) => match crate::rag::vector_store::VectorStore::new(dimensions).await {
+        Some(dimensions) => match crate::rag::vector_store::VectorStore::new(
+            dimensions,
+            Some(config.rag_vector_cache_entries),
+        )
+        .await
+        {
             Err(e) => {
                 println!(" \x1b[31m✗\x1b[0m Could not open LanceDB: {e}");
                 issues.push(
@@ -900,6 +914,190 @@ fn report_service_unit(home: &Path, issues: &mut Vec<String>) {
             success_nested(format!("Binary: {}", unit_binary.display()));
         }
     }
+}
+
+/// Every `canopy` executable found on `path_var`, in the order the shell
+/// would resolve them — first match wins. Backed by `which::which_in_all`,
+/// which already applies the rule this check needs: a PATH entry that
+/// doesn't exist or can't be read is skipped rather than failing the whole
+/// search, and a file named `canopy` without the execute bit (or, on
+/// Windows, without a recognized `PATHEXT` extension) is not a match.
+///
+/// `which_in_all` yields one candidate per matching `PATH` entry, not one
+/// per distinct file — a directory repeated in `PATH` (ordinary when a
+/// shell profile is sourced more than once), or a symlink alongside its
+/// own target, would otherwise be counted as separate binaries. Dedupe by
+/// canonical path, keeping the first `PATH` entry that reaches each file so
+/// resolution order — and which one is "the one that runs" — is preserved.
+/// A candidate whose canonical path can't be determined (broken symlink,
+/// permission error) is kept as its own distinct entry rather than dropped:
+/// a check that can silently lose a candidate on failure is worse than one
+/// that occasionally over-reports.
+fn find_canopy_copies(path_var: &str, cwd: &Path) -> Vec<PathBuf> {
+    let candidates: Vec<PathBuf> = which::which_in_all("canopy", Some(path_var), cwd)
+        .map(Iterator::collect)
+        .unwrap_or_default();
+
+    let mut seen = HashSet::new();
+    let mut copies = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let key = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+        if seen.insert(key) {
+            copies.push(candidate);
+        }
+    }
+    copies
+}
+
+/// How long to wait on one copy's `--version` before giving up on it. This
+/// check walks every `canopy` found on PATH, so a hung or wrapper binary
+/// must not stall doctor for the rest of them.
+const PATH_COPY_VERSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Best-effort `<path> --version`, trimmed, bounded by
+/// `PATH_COPY_VERSION_TIMEOUT`. `None` on any failure, including a timeout —
+/// `kill_on_drop` ensures a timed-out child is reaped rather than left
+/// running, since dropping the in-flight `wait_with_output` future drops the
+/// `Child` that owns it.
+async fn probe_path_copy_version(path: &Path) -> Option<String> {
+    let mut command = tokio::process::Command::new(path);
+    command
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let child = command.spawn().ok()?;
+    let output = tokio::time::timeout(PATH_COPY_VERSION_TIMEOUT, child.wait_with_output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+/// What doctor should report about the `canopy` copies found on `$PATH`,
+/// given each copy's path (in PATH resolution order — index 0 is the one
+/// that runs) and its version if one could be determined. Pure — no I/O —
+/// so every branch is reachable from synthetic inputs without spawning real
+/// processes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PathCopiesReport {
+    /// No `canopy` found on PATH at all (e.g. only ever run by absolute path).
+    None,
+    /// Exactly one copy — the normal case, nothing to warn about.
+    Single {
+        path: PathBuf,
+        version: Option<String>,
+    },
+    /// Two or more copies whose known versions all agree (or too few
+    /// versions could be determined to tell them apart) — harmless, and
+    /// reported plainly rather than as a warning.
+    Consistent {
+        copies: Vec<(PathBuf, Option<String>)>,
+    },
+    /// Two or more copies with at least two differing known versions — the
+    /// hazard this check exists to catch: the copy that runs may not be the
+    /// one that was last updated.
+    Diverging {
+        copies: Vec<(PathBuf, Option<String>)>,
+    },
+}
+
+/// Decide which [`PathCopiesReport`] variant `copies` (in PATH order)
+/// describes. A version that couldn't be determined is excluded from the
+/// agreement check rather than treated as "different" — an unknown version
+/// is not evidence of a mismatch, and a false warning here is exactly the
+/// noise the "silent when there's nothing to say" rule exists to prevent.
+fn diagnose_path_copies(copies: Vec<(PathBuf, Option<String>)>) -> PathCopiesReport {
+    match copies.len() {
+        0 => PathCopiesReport::None,
+        1 => {
+            let (path, version) = copies.into_iter().next().expect("len == 1");
+            PathCopiesReport::Single { path, version }
+        }
+        _ => {
+            let distinct_versions: HashSet<&str> =
+                copies.iter().filter_map(|(_, v)| v.as_deref()).collect();
+            if distinct_versions.len() > 1 {
+                PathCopiesReport::Diverging { copies }
+            } else {
+                PathCopiesReport::Consistent { copies }
+            }
+        }
+    }
+}
+
+/// One line describing a single copy: its path, version (or "version
+/// unknown" if the probe failed/timed out), and — for the copy at index 0,
+/// the one PATH resolution would actually run — a marker saying so.
+fn describe_path_copy(path: &Path, version: &Option<String>, is_winner: bool) -> String {
+    let label = version.as_deref().unwrap_or("version unknown");
+    let winner = if is_winner { " — this one runs" } else { "" };
+    format!("{} ({label}){winner}", path.display())
+}
+
+/// Render a [`PathCopiesReport`], pushing an issue only for the `Diverging`
+/// case — a single copy, or several at the same version, must produce no
+/// warning at all (the normal case must not read as something to worry
+/// about).
+fn print_path_copies_report(report: PathCopiesReport, issues: &mut Vec<String>) {
+    match report {
+        PathCopiesReport::None => {}
+        PathCopiesReport::Single { path, version } => {
+            success(format!(
+                "canopy on PATH: {}",
+                describe_path_copy(&path, &version, false)
+            ));
+        }
+        PathCopiesReport::Consistent { copies } => {
+            success(format!(
+                "{} copies of canopy on PATH, all at the same version:",
+                copies.len()
+            ));
+            for (i, (path, version)) in copies.iter().enumerate() {
+                println!("     {}", describe_path_copy(path, version, i == 0));
+            }
+        }
+        PathCopiesReport::Diverging { copies } => {
+            println!(
+                " \x1b[33m⚠\x1b[0m {} copies of canopy on PATH report different versions:",
+                copies.len()
+            );
+            for (i, (path, version)) in copies.iter().enumerate() {
+                println!("     {}", describe_path_copy(path, version, i == 0));
+            }
+            issues.push(
+                "Multiple `canopy` binaries are on your PATH at different versions — updating \
+                 one (self-update, cargo install, or the install script) doesn't update the \
+                 others. The copy marked \"this one runs\" above is the one actually in effect."
+                    .to_string(),
+            );
+        }
+    }
+}
+
+/// Resolve every `canopy` copy on `path_var` and probe each one's version,
+/// in PATH order. Split out from [`report_canopy_path_copies`] so tests can
+/// drive it over a synthetic PATH instead of the real one.
+async fn gather_path_copies_report(path_var: &str, cwd: &Path) -> PathCopiesReport {
+    let paths = find_canopy_copies(path_var, cwd);
+    let mut copies = Vec::with_capacity(paths.len());
+    for path in paths {
+        let version = probe_path_copy_version(&path).await;
+        copies.push((path, version));
+    }
+    diagnose_path_copies(copies)
+}
+
+/// Real-`$PATH` entry point for the duplicate-binary check (C17).
+async fn report_canopy_path_copies(issues: &mut Vec<String>) {
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    print_path_copies_report(gather_path_copies_report(&path_var, &cwd).await, issues);
 }
 
 #[cfg(test)]
@@ -1329,7 +1527,9 @@ mod tests {
         // the vector store already "exists" when doctor checks for it.
         // 1536 dims matches text-embedding-3-small.
         let lancedb_path = canopy_dir.join("rag").join("vectors.lancedb");
-        let store = VectorStore::open_at(&lancedb_path, 1536).await.unwrap();
+        let store = VectorStore::open_at(&lancedb_path, 1536, None)
+            .await
+            .unwrap();
         store
             .insert_chunk(&VectorChunk {
                 id: "chunk-1".to_string(),
@@ -1691,6 +1891,203 @@ mod tests {
         assert!(
             output.contains("Could not open LanceDB"),
             "expected the open failure to be surfaced:\n{output}"
+        );
+    }
+
+    /// Writes an executable fake `canopy` into `dir` that prints
+    /// `version_output` to stdout and exits 0 on `--version` — a synthetic
+    /// stand-in for a real install, so the C17 tests below never touch the
+    /// developer's real PATH or real `canopy` binaries.
+    fn write_fake_canopy(dir: &Path, version_output: &str) -> PathBuf {
+        let path = dir.join("canopy");
+        std::fs::write(&path, format!("#!/bin/sh\necho '{version_output}'\n")).unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        path
+    }
+
+    fn synthetic_path_var(dirs: &[&Path]) -> String {
+        std::env::join_paths(dirs).unwrap().into_string().unwrap()
+    }
+
+    #[tokio::test]
+    async fn gather_path_copies_report_two_dirs_different_versions_diverges_in_path_order() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let path_a = write_fake_canopy(dir_a.path(), "canopy 2.0.0");
+        let path_b = write_fake_canopy(dir_b.path(), "canopy 1.0.0");
+        let path_var = synthetic_path_var(&[dir_a.path(), dir_b.path()]);
+
+        let report = gather_path_copies_report(&path_var, dir_a.path()).await;
+        match &report {
+            PathCopiesReport::Diverging { copies } => {
+                assert_eq!(copies.len(), 2);
+                assert_eq!(copies[0].0, path_a, "PATH order must be preserved");
+                assert_eq!(copies[0].1.as_deref(), Some("canopy 2.0.0"));
+                assert_eq!(copies[1].0, path_b);
+                assert_eq!(copies[1].1.as_deref(), Some("canopy 1.0.0"));
+            }
+            other => panic!("expected Diverging, got {other:?}"),
+        }
+
+        let mut issues = Vec::new();
+        print_path_copies_report(report, &mut issues);
+        assert_eq!(issues.len(), 1, "differing versions must raise a warning");
+        assert!(issues[0].contains("different versions"));
+    }
+
+    #[tokio::test]
+    async fn gather_path_copies_report_two_dirs_same_version_is_consistent_and_silent() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        write_fake_canopy(dir_a.path(), "canopy 1.0.0");
+        write_fake_canopy(dir_b.path(), "canopy 1.0.0");
+        let path_var = synthetic_path_var(&[dir_a.path(), dir_b.path()]);
+
+        let report = gather_path_copies_report(&path_var, dir_a.path()).await;
+        match &report {
+            PathCopiesReport::Consistent { copies } => assert_eq!(copies.len(), 2),
+            other => panic!("expected Consistent, got {other:?}"),
+        }
+
+        let mut issues = Vec::new();
+        print_path_copies_report(report, &mut issues);
+        assert!(
+            issues.is_empty(),
+            "identical versions must not raise a warning"
+        );
+    }
+
+    #[tokio::test]
+    async fn gather_path_copies_report_one_copy_is_single_and_silent() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let path_a = write_fake_canopy(dir_a.path(), "canopy 1.0.0");
+        let path_var = synthetic_path_var(&[dir_a.path()]);
+
+        let report = gather_path_copies_report(&path_var, dir_a.path()).await;
+        match &report {
+            PathCopiesReport::Single { path, version } => {
+                assert_eq!(path, &path_a);
+                assert_eq!(version.as_deref(), Some("canopy 1.0.0"));
+            }
+            other => panic!("expected Single, got {other:?}"),
+        }
+
+        let mut issues = Vec::new();
+        print_path_copies_report(report, &mut issues);
+        assert!(issues.is_empty(), "one copy must not raise a warning");
+    }
+
+    #[test]
+    fn find_canopy_copies_skips_nonexistent_path_entry_without_failing() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let path_a = write_fake_canopy(dir_a.path(), "canopy 1.0.0");
+        let missing = dir_a.path().join("does-not-exist-xyz");
+        let path_var = synthetic_path_var(&[&missing, dir_a.path()]);
+
+        let copies = find_canopy_copies(&path_var, dir_a.path());
+        assert_eq!(copies, vec![path_a]);
+    }
+
+    #[test]
+    fn find_canopy_copies_ignores_non_executable_file_with_right_name() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let path = dir_a.path().join("canopy");
+        std::fs::write(&path, "not executable").unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+            .unwrap();
+        let path_var = synthetic_path_var(&[dir_a.path()]);
+
+        let copies = find_canopy_copies(&path_var, dir_a.path());
+        assert!(
+            copies.is_empty(),
+            "a non-executable file must not be reported as a copy that would run"
+        );
+    }
+
+    /// C21 regression test: the bug this spec fixes. A shell profile
+    /// sourced more than once leaves the same directory repeated in `PATH`
+    /// — one file, several `PATH` entries — and the check must still report
+    /// it as one copy, not one per repetition.
+    #[test]
+    fn find_canopy_copies_dedupes_directory_repeated_on_path() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let path_a = write_fake_canopy(dir_a.path(), "canopy 1.0.0");
+        let path_var = synthetic_path_var(&[dir_a.path(), dir_a.path(), dir_a.path()]);
+
+        let copies = find_canopy_copies(&path_var, dir_a.path());
+        assert_eq!(
+            copies,
+            vec![path_a],
+            "one file reachable through three PATH entries must be reported once"
+        );
+    }
+
+    #[tokio::test]
+    async fn gather_path_copies_report_directory_repeated_on_path_is_single_and_silent() {
+        let dir_a = tempfile::tempdir().unwrap();
+        write_fake_canopy(dir_a.path(), "canopy 1.0.0");
+        let path_var = synthetic_path_var(&[dir_a.path(), dir_a.path(), dir_a.path()]);
+
+        let report = gather_path_copies_report(&path_var, dir_a.path()).await;
+        match &report {
+            PathCopiesReport::Single { .. } => {}
+            other => panic!("expected Single from a directory repeated on PATH, got {other:?}"),
+        }
+
+        let mut issues = Vec::new();
+        print_path_copies_report(report, &mut issues);
+        assert!(
+            issues.is_empty(),
+            "a duplicated PATH entry pointing at one file must not raise a warning"
+        );
+    }
+
+    /// A symlink and its target are one binary, not two — someone who
+    /// symlinks `~/bin/canopy` to `~/.local/bin/canopy` has one install.
+    #[cfg(unix)]
+    #[test]
+    fn find_canopy_copies_dedupes_symlink_to_binary_in_another_dir() {
+        let real_dir = tempfile::tempdir().unwrap();
+        let link_dir = tempfile::tempdir().unwrap();
+        let real_path = write_fake_canopy(real_dir.path(), "canopy 1.0.0");
+        let link_path = link_dir.path().join("canopy");
+        std::os::unix::fs::symlink(&real_path, &link_path).unwrap();
+        let path_var = synthetic_path_var(&[link_dir.path(), real_dir.path()]);
+
+        let copies = find_canopy_copies(&path_var, link_dir.path());
+        assert_eq!(
+            copies.len(),
+            1,
+            "a symlink and its target must be counted as one binary, got {copies:?}"
+        );
+        assert_eq!(
+            copies[0], link_path,
+            "PATH order must be preserved: the symlink resolves first"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gather_path_copies_report_symlink_to_binary_in_another_dir_is_single_and_silent() {
+        let real_dir = tempfile::tempdir().unwrap();
+        let link_dir = tempfile::tempdir().unwrap();
+        let real_path = write_fake_canopy(real_dir.path(), "canopy 1.0.0");
+        let link_path = link_dir.path().join("canopy");
+        std::os::unix::fs::symlink(&real_path, &link_path).unwrap();
+        let path_var = synthetic_path_var(&[link_dir.path(), real_dir.path()]);
+
+        let report = gather_path_copies_report(&path_var, link_dir.path()).await;
+        match &report {
+            PathCopiesReport::Single { .. } => {}
+            other => panic!("expected Single from a symlink and its target, got {other:?}"),
+        }
+
+        let mut issues = Vec::new();
+        print_path_copies_report(report, &mut issues);
+        assert!(
+            issues.is_empty(),
+            "a symlink alongside its target must not raise a warning"
         );
     }
 

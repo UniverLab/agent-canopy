@@ -20,6 +20,11 @@ pub enum SectionPickerMode {
     },
     RemoveSection {
         selected: usize,
+        /// Scroll offset into `enabled_sections`' removable subset — unlike
+        /// `AddSection`'s fixed, short menu this list grows with however
+        /// many sections the user has enabled, so it can exceed the
+        /// viewport in practice.
+        scroll: usize,
     },
     AddCustom {
         input: String,
@@ -27,6 +32,7 @@ pub enum SectionPickerMode {
     /// Skills picker for the Tools section — entries are `(label, raw_name, prefix)`
     SkillsPicker {
         selected: usize,
+        scroll: usize,
         /// `(display_label, raw_name, prefix)` — `prefix` is "skill" or "global"
         entries: Vec<(String, String, String)>,
         /// `None` → create a new tools section on confirm; `Some(id)` → replace content of that section
@@ -91,93 +97,18 @@ pub const TAB_NORMAL_LABEL: &str = " Normal ";
 pub const TAB_RAW_LABEL: &str = " Raw ";
 
 /// Inline date-time picker state for the send control (U11). Opened with
-/// Enter on `send: date`, preseeded with the current local time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SendAtEdit {
-    pub value: chrono::NaiveDateTime,
-    /// Focused field: 0=year, 1=month, 2=day, 3=hour, 4=minute.
-    pub field: usize,
-    /// In-progress numeric accumulator for the focused field while the user is
-    /// typing digits (U11): the running value and how many digits have been
-    /// entered since the field was (re)started. Reset on field change and on
-    /// arrow adjust so a fresh digit always starts a new number.
-    pub typed: u32,
-    pub typed_len: u8,
-}
+/// Enter on `send: date`, preseeded with the current local time. An alias
+/// for the shared picker ([`crate::tui::app::dialog::datetime_picker::DateTimeEdit`])
+/// also used by the loop autorun dialog (C18), so the two never diverge into
+/// separate widgets.
+pub type SendAtEdit = crate::tui::app::dialog::datetime_picker::DateTimeEdit;
 
-/// Digits a field accepts before it is "full" and auto-advances: the year is
-/// 4 digits wide, every other field is 2.
-fn field_digit_width(field: usize) -> u8 {
-    if field == 0 {
-        4
-    } else {
-        2
-    }
-}
-
-/// Month arithmetic for the send picker: ±N months with day clamping
-/// (chrono's checked add/sub semantics — Jan 31 + 1 month = Feb 28/29).
-fn add_months(value: chrono::NaiveDateTime, delta: i64) -> Option<chrono::NaiveDateTime> {
-    if delta >= 0 {
-        value.checked_add_months(chrono::Months::new(delta as u32))
-    } else {
-        value.checked_sub_months(chrono::Months::new(delta.unsigned_abs() as u32))
-    }
-}
-
-/// Number of days in a given month (handles leap years).
-fn days_in_month(year: i32, month: u32) -> u32 {
-    let (next_year, next_month) = if month == 12 {
-        (year + 1, 1)
-    } else {
-        (year, month + 1)
-    };
-    match (
-        chrono::NaiveDate::from_ymd_opt(year, month, 1),
-        chrono::NaiveDate::from_ymd_opt(next_year, next_month, 1),
-    ) {
-        (Some(first), Some(next)) => (next - first).num_days() as u32,
-        _ => 28,
-    }
-}
-
-/// Set one component (year/month/day/hour/minute) of `value` to `num`, clamping
-/// it into that component's valid range and clamping the day to the resulting
-/// month length. Returns `None` only if chrono still rejects the date, in which
-/// case the caller keeps the previous value.
-fn with_field(
-    value: chrono::NaiveDateTime,
-    field: usize,
-    num: u32,
-) -> Option<chrono::NaiveDateTime> {
-    use chrono::{Datelike, NaiveDate, Timelike};
-    let date = value.date();
-    let time = value.time();
-    match field {
-        0 => {
-            let year = num.clamp(1, 9999) as i32;
-            let day = date.day().min(days_in_month(year, date.month()));
-            NaiveDate::from_ymd_opt(year, date.month(), day).map(|d| d.and_time(time))
-        }
-        1 => {
-            let month = num.clamp(1, 12);
-            let day = date.day().min(days_in_month(date.year(), month));
-            NaiveDate::from_ymd_opt(date.year(), month, day).map(|d| d.and_time(time))
-        }
-        2 => {
-            let day = num.clamp(1, days_in_month(date.year(), date.month()));
-            NaiveDate::from_ymd_opt(date.year(), date.month(), day).map(|d| d.and_time(time))
-        }
-        3 => {
-            let hour = num.min(23);
-            date.and_hms_opt(hour, time.minute(), time.second())
-        }
-        _ => {
-            let minute = num.min(59);
-            date.and_hms_opt(time.hour(), minute, time.second())
-        }
-    }
-}
+use crate::tui::app::dialog::datetime_picker::{add_months, field_digit_width, with_field};
+// `days_in_month` isn't called directly outside `datetime_picker` (only
+// through `with_field`) — this crate's own tests below are the sole direct
+// caller, so the import is test-only.
+#[cfg(test)]
+use crate::tui::app::dialog::datetime_picker::days_in_month;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RagScope<'a> {
@@ -212,9 +143,14 @@ pub struct SimplePromptDialog {
     /// Section IDs that are read-only (auto-filled, cannot be edited).
     pub locked_sections: HashSet<String>,
     /// Invisible system block rendered at the top of the final prompt so its
-    /// protocol is read before the task. None = omit. Set once per workdir
-    /// session (idempotent).
+    /// protocol is read before the task. None = omit.
     pub system_content: Option<String>,
+    /// Whether `system_content` (if any) carries the one-time session-start
+    /// protocol block, as opposed to only the per-turn workspace/intents/
+    /// chatter context. Read by `submit_prompt` to decide whether to mark
+    /// the session's protocol as delivered; never persisted across
+    /// openings.
+    pub protocol_included: bool,
     /// Send-timing selector (U11): `now` sends immediately, `date`
     /// schedules the delivery at `send_at`.
     pub send_choice: SendChoice,
@@ -281,6 +217,7 @@ impl SimplePromptDialog {
             collapsed_pastes: HashMap::new(),
             locked_sections: HashSet::new(),
             system_content: None,
+            protocol_included: false,
             send_choice: SendChoice::Now,
             send_at: None,
             send_edit: None,
@@ -577,22 +514,28 @@ impl SimplePromptDialog {
         Self::project_picker_box_height(count).saturating_sub(4) as usize
     }
 
-    /// Recompute the scroll offset so `selected` (an index into the current
-    /// filtered list) stays inside the `visible_rows`-tall window, sliding by
-    /// exactly enough to bring it back into view. Pure and Frame-free so
-    /// scrolling logic is unit-testable on its own; also what makes the view
-    /// follow selection wraparound at either end of the list for free.
-    pub fn clamp_scroll(selected: usize, scroll: usize, visible_rows: usize) -> usize {
-        if visible_rows == 0 {
-            return 0;
-        }
-        if selected < scroll {
-            selected
-        } else if selected >= scroll + visible_rows {
-            selected + 1 - visible_rows
-        } else {
-            scroll
-        }
+    /// Box height for the Skills picker (Tools section), mirroring
+    /// `project_picker_box_height`: grows to fit small lists, caps so long
+    /// lists scroll instead of overflowing the screen.
+    pub fn skills_picker_box_height(count: usize) -> u16 {
+        (count as u16 + 5).min(16)
+    }
+
+    /// Entry rows visible inside the Skills picker box — the box height
+    /// minus its 2 border rows and 1 hint row.
+    pub fn skills_picker_visible_rows(count: usize) -> usize {
+        Self::skills_picker_box_height(count).saturating_sub(3) as usize
+    }
+
+    /// Box height for the Remove Section picker.
+    pub fn remove_section_box_height(count: usize) -> u16 {
+        (count as u16 + 4).min(15)
+    }
+
+    /// Entry rows visible inside the Remove Section picker box — the box
+    /// height minus its 2 border rows and 1 hint row.
+    pub fn remove_section_visible_rows(count: usize) -> usize {
+        Self::remove_section_box_height(count).saturating_sub(3) as usize
     }
 
     /// Set the content of a specific tools section to a single skill label.
@@ -831,7 +774,12 @@ impl SimplePromptDialog {
         };
 
         rt.block_on(async {
-            let Ok(store) = crate::rag::vector_store::VectorStore::new(dimensions).await else {
+            let Ok(store) = crate::rag::vector_store::VectorStore::new(
+                dimensions,
+                Some(config.rag_vector_cache_entries),
+            )
+            .await
+            else {
                 return Vec::new();
             };
             let Ok(embedder) = crate::rag::embedding_client::client_from_config(&config) else {
@@ -2049,31 +1997,17 @@ mod tests {
     }
 
     #[test]
-    fn clamp_scroll_stays_put_when_selection_already_visible() {
-        assert_eq!(SimplePromptDialog::clamp_scroll(2, 0, 5), 0);
+    fn skills_picker_visible_rows_caps_at_thirteen() {
+        assert_eq!(SimplePromptDialog::skills_picker_visible_rows(1), 3);
+        assert_eq!(SimplePromptDialog::skills_picker_visible_rows(11), 13);
+        assert_eq!(SimplePromptDialog::skills_picker_visible_rows(100), 13);
     }
 
     #[test]
-    fn clamp_scroll_follows_selection_past_bottom_edge() {
-        // visible_rows=5 shows rows [0,5); selecting row 5 must slide by one.
-        assert_eq!(SimplePromptDialog::clamp_scroll(5, 0, 5), 1);
-    }
-
-    #[test]
-    fn clamp_scroll_follows_selection_past_top_edge() {
-        assert_eq!(SimplePromptDialog::clamp_scroll(2, 3, 5), 2);
-    }
-
-    #[test]
-    fn clamp_scroll_shows_last_page_when_selection_wraps_to_end() {
-        // 20 entries, 13 visible rows: wrapping to the last entry (idx 19)
-        // must scroll so the final page (rows 7..20) is shown.
-        assert_eq!(SimplePromptDialog::clamp_scroll(19, 0, 13), 7);
-    }
-
-    #[test]
-    fn clamp_scroll_resets_to_top_when_selection_wraps_to_start() {
-        assert_eq!(SimplePromptDialog::clamp_scroll(0, 7, 13), 0);
+    fn remove_section_visible_rows_caps_at_twelve() {
+        assert_eq!(SimplePromptDialog::remove_section_visible_rows(1), 2);
+        assert_eq!(SimplePromptDialog::remove_section_visible_rows(11), 12);
+        assert_eq!(SimplePromptDialog::remove_section_visible_rows(100), 12);
     }
 
     #[test]
@@ -4467,6 +4401,7 @@ impl PromptBuilderSession {
         dialog.picker_mode = SectionPickerMode::None;
         dialog.at_picker = None;
         dialog.system_content = None; // re-evaluated on each open
+        dialog.protocol_included = false; // re-evaluated on each open
         dialog.send_edit = None;
         dialog.send_error = None;
         dialog.raw_preview = None; // recomputed when the Raw tab is shown
@@ -4481,8 +4416,9 @@ impl PromptBuilderSession {
 ///
 /// Deliberately excludes `send_at`: recalling a prompt should not silently
 /// re-arm a delivery schedule from a previous session. `picker_mode`,
-/// `at_picker`, and `system_content` are transient UI/idempotency state that
-/// `PromptBuilderSession::restore_into` also never persists.
+/// `at_picker`, `system_content`, and `protocol_included` are transient
+/// UI/idempotency state that `PromptBuilderSession::restore_into` also
+/// never persists.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PersistedBuilderState {
     pub sections: HashMap<String, String>,

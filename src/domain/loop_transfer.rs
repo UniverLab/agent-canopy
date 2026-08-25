@@ -668,6 +668,7 @@ mod tests {
     fn make_loop(name: &str) -> Loop {
         Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "loop-1".to_string(),
             name: name.to_string(),
             description: Some("A test loop".to_string()),

@@ -45,6 +45,7 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
     let loop_engine = Arc::new(
         LoopEngine::new(Arc::clone(&db), Arc::clone(&notification_service))
             .with_ensemble_concurrency_cap(canopy_config.ensemble_concurrency_cap)
+            .with_spec_attempt_limit(canopy_config.spec_attempt_limit)
             .with_dynamic_skills(Arc::clone(&dynamic_skills)),
     );
     let watcher_engine = Arc::new(WatcherEngine::new(
@@ -335,6 +336,7 @@ async fn stdio_server_startup(db: Arc<Database>, data_dir: &std::path::Path) -> 
     let loop_engine = Arc::new(
         LoopEngine::new(Arc::clone(&db), Arc::clone(&notification_service))
             .with_ensemble_concurrency_cap(canopy_config.ensemble_concurrency_cap)
+            .with_spec_attempt_limit(canopy_config.spec_attempt_limit)
             .with_dynamic_skills(Arc::clone(&dynamic_skills)),
     );
     let watcher_engine = Arc::new(WatcherEngine::new(
@@ -837,6 +839,7 @@ mod hang_repro {
         let spec_id = "spec-hang-repro".to_string();
         db.insert_loop(&Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: loop_id.clone(),
             name: "Repro Loop".to_string(),
             description: None,
@@ -864,6 +867,7 @@ mod hang_repro {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,
@@ -1354,6 +1358,7 @@ mod stdio_startup_reconciliation_tests {
 
         let lp = Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: format!("wf-stdio-startup-{suffix}"),
             name: format!("Stdio startup test loop {suffix}"),
             description: None,
@@ -1384,6 +1389,7 @@ mod stdio_startup_reconciliation_tests {
             completed_via: None,
             completed_via_reason: None,
             completed_via_at: None,
+            spec_committed_head: None,
         };
         let node = LoopNode {
             id: format!("node-stdio-startup-{suffix}"),

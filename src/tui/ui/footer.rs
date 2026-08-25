@@ -8,6 +8,7 @@ use ratatui::Frame;
 
 use super::theme::Theme;
 use crate::tui::app::types::{AgentEntry, App, AutomationKind, Focus, ProjectTab, SidebarLayer};
+use crate::tui::event::focused_child_claimed_keyboard;
 
 pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let activity_available = app.activity_panel_available();
@@ -127,19 +128,31 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Them
             );
             let in_split = app.active_split_id.is_some();
             if is_pty {
-                let mut h = vec![
-                    ("F10", "preview"),
-                    ("Esc", "home"),
-                    ("Shift+↑↓", "agents/rag"),
-                    ("Ctrl+T", "context"),
-                ];
-                if in_split {
-                    h.push(("F4", "dissolve"));
-                    h.push(("Shift+F4", "end"));
-                    h.push(("Shift+←→", "split focus"));
+                // While the focused child has claimed the keyboard (alternate
+                // screen or Kitty keyboard protocol), every canopy shortcut
+                // below yields to it except F10 — see
+                // `agent_focus::RESERVED_FOCUS_KEYS`. Reflect that here so a
+                // shortcut that "did nothing" is explainable instead of
+                // looking broken.
+                let child_claimed = focused_child_claimed_keyboard(app);
+                let mut h = vec![("F10", "preview"), ("Esc", "home")];
+                if child_claimed {
+                    // Frame navigation stays with canopy even then, so it is
+                    // still worth showing: only the content shortcuts yield.
+                    h.push(("Shift+↑↓", "agents/rag"));
+                    h.push(("Shift+←→", if in_split { "split focus" } else { "tab" }));
+                    h.push(("*", "other keys → child"));
                 } else {
-                    h.push(("F4", "end"));
-                    h.push(("Shift+←→", "tab"));
+                    h.push(("Shift+↑↓", "agents/rag"));
+                    h.push(("Ctrl+T", "context"));
+                    if in_split {
+                        h.push(("F4", "dissolve"));
+                        h.push(("Shift+F4", "end"));
+                        h.push(("Shift+←→", "split focus"));
+                    } else {
+                        h.push(("F4", "end"));
+                        h.push(("Shift+←→", "tab"));
+                    }
                 }
                 if matches!(app.selected_agent(), Some(AgentEntry::Terminal(_))) {
                     h.push(("Tab", "catalog"));
@@ -152,7 +165,9 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Them
                     h.push(("F3", "activity"));
                 }
                 h.push(("Ctrl+N", "new"));
-                h.push(("F1", "legend"));
+                if !child_claimed {
+                    h.push(("F1", "legend"));
+                }
                 h
             } else {
                 let mut h = vec![("F10", "preview"), ("Esc", "home")];
@@ -755,6 +770,7 @@ mod tests {
     fn loop_with_status(status: crate::domain::loops::LoopStatus) -> crate::domain::loops::Loop {
         crate::domain::loops::Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: "lp1".to_string(),
             name: "Nightly review".to_string(),
             description: None,

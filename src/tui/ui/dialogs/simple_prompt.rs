@@ -65,6 +65,7 @@ fn wrap_styled_content(
     cursor_idx: Option<usize>,
     field_width: usize,
     section_bg: Color,
+    text_color: Color,
 ) -> Vec<Line<'static>> {
     fn flush_run(spans: &mut Vec<Span<'static>>, run: &mut String, style: Style) {
         if !run.is_empty() {
@@ -73,18 +74,18 @@ fn wrap_styled_content(
     }
 
     let field_width = field_width.max(1);
-    let cursor_style = Style::default().fg(section_bg).bg(Color::White);
+    let cursor_style = Style::default().fg(section_bg).bg(text_color);
 
     let mut lines: Vec<Line> = Vec::new();
     let mut spans: Vec<Span> = Vec::new();
     let mut run = String::new();
-    let mut run_style = Style::default().fg(Color::White).bg(section_bg);
+    let mut run_style = Style::default().fg(text_color).bg(section_bg);
     let mut col = 0usize;
     let mut char_pos = 0usize;
 
     for (text, color) in styled_content {
         let base_style = Style::default()
-            .fg(color.unwrap_or(Color::White))
+            .fg(color.unwrap_or(text_color))
             .bg(section_bg);
         for ch in text.chars() {
             let style = if cursor_idx == Some(char_pos) {
@@ -444,7 +445,7 @@ pub fn draw_simple_prompt_dialog(
         .title(title)
         .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(accent))
-        .style(Style::default().bg(Color::Rgb(15, 25, 15)));
+        .style(Style::default().bg(theme.dialog_bg));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -495,7 +496,7 @@ pub fn draw_simple_prompt_dialog(
     .flat_map(|hint| {
         [
             Span::styled(hint.key, Style::default().fg(theme.dim_text)),
-            Span::styled(hint.desc, Style::default().fg(Color::White)),
+            Span::styled(hint.desc, Style::default().fg(theme.text_primary)),
         ]
     })
     .collect();
@@ -527,11 +528,11 @@ pub fn draw_simple_prompt_dialog(
         let field_style = |idx: usize| {
             if edit.field == idx {
                 Style::default()
-                    .fg(Color::Black)
+                    .fg(theme.accent_fg)
                     .bg(accent)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(theme.text_primary)
             }
         };
         let v = edit.value;
@@ -573,7 +574,7 @@ pub fn draw_simple_prompt_dialog(
     if let Some(error) = dialog.send_error.as_ref() {
         send_spans.push(Span::styled(
             format!("  ⚠ {error}"),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme.warning),
         ));
     }
     // Pending scheduled sends now render as a dedicated LIST panel above the
@@ -726,9 +727,9 @@ pub fn draw_simple_prompt_dialog(
             y_pos += 1;
 
             let section_bg = if is_focused {
-                Color::Rgb(40, 40, 40)
+                theme.field_bg_focused
             } else {
-                Color::Rgb(30, 30, 30)
+                theme.field_bg
             };
 
             let content_raw = dialog
@@ -791,8 +792,13 @@ pub fn draw_simple_prompt_dialog(
                 // Use default file reference styling
                 dialog.get_file_reference_with_styling(&render_text, accent)
             };
-            let wrapped_lines =
-                wrap_styled_content(styled_content, cursor_idx_opt, field_width, section_bg);
+            let wrapped_lines = wrap_styled_content(
+                styled_content,
+                cursor_idx_opt,
+                field_width,
+                section_bg,
+                theme.text_primary,
+            );
             let content_paragraph =
                 Paragraph::new(ratatui::text::Text::from(wrapped_lines)).scroll((scroll_offset, 0));
 
@@ -866,6 +872,7 @@ pub fn draw_simple_prompt_dialog(
             accent,
             inner,
             panel_top,
+            theme,
         );
     }
 
@@ -931,7 +938,7 @@ fn draw_raw_tab_content(
         width: inner.width.saturating_sub(2),
         height: avail_h as u16,
     };
-    let section_bg = Color::Rgb(30, 30, 30);
+    let section_bg = theme.field_bg;
 
     if raw_empty {
         // Read-only preview, dimmed. ↑↓/PgUp/PgDn scroll it; edge markers show
@@ -986,7 +993,13 @@ fn draw_raw_tab_content(
         let scroll = dialog.raw_edit_scroll.unwrap_or(base_scroll) as u16;
 
         let styled = dialog.get_file_reference_with_styling(text, accent);
-        let wrapped = wrap_styled_content(styled, Some(cursor_idx), field_width, section_bg);
+        let wrapped = wrap_styled_content(
+            styled,
+            Some(cursor_idx),
+            field_width,
+            section_bg,
+            theme.text_primary,
+        );
         frame.render_widget(
             Paragraph::new(ratatui::text::Text::from(wrapped)).scroll((scroll, 0)),
             content_area,
@@ -1016,6 +1029,7 @@ fn draw_scheduled_list(
     accent: Color,
     inner: ratatui::layout::Rect,
     panel_top: u16,
+    theme: &Theme,
 ) {
     let editing = editing_id.is_some_and(|id| pending.iter().any(|send| send.id == id));
     let label = if editing {
@@ -1048,7 +1062,7 @@ fn draw_scheduled_list(
                 .fg(accent)
                 .add_modifier(Modifier::BOLD | Modifier::REVERSED)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(theme.text_primary)
         };
         let marker = if is_selected { "› " } else { "  " };
         let line = Line::from(vec![
@@ -1088,7 +1102,7 @@ mod tests {
     #[test]
     fn wrap_preserves_spaces_and_breaks_on_newline() {
         let styled = vec![("hola mundo\nsegunda línea".to_string(), None)];
-        let lines = wrap_styled_content(styled, None, 40, Color::Black);
+        let lines = wrap_styled_content(styled, None, 40, Color::Black, Color::White);
         let texts: Vec<String> = lines.iter().map(line_text).collect();
         assert_eq!(texts, vec!["hola mundo", "segunda línea"]);
     }
@@ -1098,8 +1112,13 @@ mod tests {
         use crate::tui::app::dialog::SimplePromptDialog;
         let content = "una frase que se pasa del ancho del campo";
         let width = 10;
-        let lines =
-            wrap_styled_content(vec![(content.to_string(), None)], None, width, Color::Black);
+        let lines = wrap_styled_content(
+            vec![(content.to_string(), None)],
+            None,
+            width,
+            Color::Black,
+            Color::White,
+        );
         assert_eq!(
             lines.len(),
             SimplePromptDialog::visual_line_count(content, width)
@@ -1112,7 +1131,7 @@ mod tests {
     #[test]
     fn wrap_renders_cursor_at_end_as_blank_cell() {
         let styled = vec![("ab".to_string(), None)];
-        let lines = wrap_styled_content(styled, Some(2), 40, Color::Black);
+        let lines = wrap_styled_content(styled, Some(2), 40, Color::Black, Color::White);
         assert_eq!(line_text(&lines[0]), "ab ");
     }
 
@@ -1292,13 +1311,19 @@ mod tests {
     #[test]
     fn wrap_empty_content() {
         // The function always pushes at least one line
-        let lines = wrap_styled_content(vec![], None, 40, Color::Black);
+        let lines = wrap_styled_content(vec![], None, 40, Color::Black, Color::White);
         assert_eq!(lines.len(), 1);
     }
 
     #[test]
     fn wrap_single_short_line() {
-        let lines = wrap_styled_content(vec![("hello".to_string(), None)], None, 40, Color::Black);
+        let lines = wrap_styled_content(
+            vec![("hello".to_string(), None)],
+            None,
+            40,
+            Color::Black,
+            Color::White,
+        );
         assert_eq!(lines.len(), 1);
         assert_eq!(line_text(&lines[0]), "hello");
     }
@@ -1324,7 +1349,7 @@ mod tests {
     #[test]
     fn wrap_with_style() {
         let styled = vec![("hello".to_string(), Some(Color::Red))];
-        let lines = wrap_styled_content(styled, None, 40, Color::Black);
+        let lines = wrap_styled_content(styled, None, 40, Color::Black, Color::White);
         assert_eq!(lines.len(), 1);
     }
 
@@ -1338,7 +1363,7 @@ mod tests {
     #[test]
     fn wrap_preserves_newline_at_end() {
         let styled = vec![("hello\n".to_string(), None)];
-        let lines = wrap_styled_content(styled, None, 40, Color::Black);
+        let lines = wrap_styled_content(styled, None, 40, Color::Black, Color::White);
         // "hello" on first line, empty second line
         assert_eq!(lines.len(), 2);
         assert_eq!(line_text(&lines[0]), "hello");
@@ -1347,7 +1372,7 @@ mod tests {
     #[test]
     fn wrap_multiple_newlines() {
         let styled = vec![("a\nb\nc".to_string(), None)];
-        let lines = wrap_styled_content(styled, None, 40, Color::Black);
+        let lines = wrap_styled_content(styled, None, 40, Color::Black, Color::White);
         assert_eq!(lines.len(), 3);
         assert_eq!(line_text(&lines[0]), "a");
         assert_eq!(line_text(&lines[1]), "b");
@@ -1357,7 +1382,7 @@ mod tests {
     #[test]
     fn wrap_tab_expands_to_spaces() {
         let styled = vec![("a\tb".to_string(), None)];
-        let lines = wrap_styled_content(styled, None, 40, Color::Black);
+        let lines = wrap_styled_content(styled, None, 40, Color::Black, Color::White);
         let text = line_text(&lines[0]);
         assert!(text.contains("b"));
         // Tab should be expanded to spaces
@@ -1367,7 +1392,7 @@ mod tests {
     #[test]
     fn wrap_tab_at_width_boundary() {
         let styled = vec![("abcd\tef".to_string(), None)];
-        let lines = wrap_styled_content(styled, None, 5, Color::Black);
+        let lines = wrap_styled_content(styled, None, 5, Color::Black, Color::White);
         // Tab after "abcd" (col 4) wraps to next line
         assert!(lines.len() >= 2);
     }
@@ -1375,7 +1400,7 @@ mod tests {
     #[test]
     fn wrap_cursor_in_middle() {
         let styled = vec![("hello".to_string(), None)];
-        let lines = wrap_styled_content(styled, Some(2), 40, Color::Black);
+        let lines = wrap_styled_content(styled, Some(2), 40, Color::Black, Color::White);
         // Cursor at position 2 should be visible
         assert_eq!(lines.len(), 1);
     }
@@ -1383,7 +1408,7 @@ mod tests {
     #[test]
     fn wrap_cursor_at_start() {
         let styled = vec![("hello".to_string(), None)];
-        let lines = wrap_styled_content(styled, Some(0), 40, Color::Black);
+        let lines = wrap_styled_content(styled, Some(0), 40, Color::Black, Color::White);
         assert_eq!(lines.len(), 1);
     }
 
@@ -1393,7 +1418,7 @@ mod tests {
             ("hello ".to_string(), Some(Color::Red)),
             ("world".to_string(), Some(Color::Blue)),
         ];
-        let lines = wrap_styled_content(styled, None, 40, Color::Black);
+        let lines = wrap_styled_content(styled, None, 40, Color::Black, Color::White);
         assert_eq!(lines.len(), 1);
         assert_eq!(line_text(&lines[0]), "hello world");
     }
@@ -1511,7 +1536,7 @@ mod tests {
     #[test]
     fn wrap_content_exactly_field_width() {
         let styled = vec![("abcde".to_string(), None)];
-        let lines = wrap_styled_content(styled, None, 5, Color::Black);
+        let lines = wrap_styled_content(styled, None, 5, Color::Black, Color::White);
         assert_eq!(lines.len(), 1);
         assert_eq!(line_text(&lines[0]), "abcde");
     }
@@ -1519,7 +1544,7 @@ mod tests {
     #[test]
     fn wrap_content_one_over_field_width() {
         let styled = vec![("abcdef".to_string(), None)];
-        let lines = wrap_styled_content(styled, None, 5, Color::Black);
+        let lines = wrap_styled_content(styled, None, 5, Color::Black, Color::White);
         assert_eq!(lines.len(), 2);
         assert_eq!(line_text(&lines[0]), "abcde");
         assert_eq!(line_text(&lines[1]), "f");
@@ -1528,7 +1553,7 @@ mod tests {
     #[test]
     fn wrap_content_empty_segments() {
         let styled = vec![(String::new(), None), ("hello".to_string(), None)];
-        let lines = wrap_styled_content(styled, None, 40, Color::Black);
+        let lines = wrap_styled_content(styled, None, 40, Color::Black, Color::White);
         assert_eq!(line_text(&lines[0]), "hello");
     }
 

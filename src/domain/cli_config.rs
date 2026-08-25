@@ -92,6 +92,17 @@ pub struct CliConfig {
     /// Flag to pass to disable approval prompts (yolo/autonomous mode).
     #[serde(default)]
     pub yolo_flag: Option<String>,
+    /// Flag that non-interactively trusts the run's working directory for
+    /// this invocation, e.g. mistral's `--trust`. Some harnesses refuse to
+    /// load project configuration (including MCP server declarations) from
+    /// a directory they haven't been told to trust, and — critically — exit
+    /// 0 with empty output instead of failing loudly when that happens
+    /// (2026-08-13 `gitkit-composition` incident). `None` for harnesses with
+    /// no such concept. Passing this flag is always opt-in per node
+    /// (`node.config["trust_workdir"]`), never a default, since trusting a
+    /// directory changes what the harness will execute there.
+    #[serde(default)]
+    pub trust_flag: Option<String>,
     /// Path to the custom instructions file (e.g. `.github/copilot-instructions.md`).
     #[serde(default)]
     pub instruction_file: Option<String>,
@@ -315,6 +326,7 @@ mod tests {
             models_list_cmd: None,
             accent_color: None,
             yolo_flag: None,
+            trust_flag: None,
             instruction_file: None,
             prompt_via_stdin: false,
             paste_submit_delay_ms: None,
@@ -535,6 +547,7 @@ mod tests {
         assert!(config.models_list_cmd.is_none());
         assert!(config.accent_color.is_none());
         assert!(config.yolo_flag.is_none());
+        assert!(config.trust_flag.is_none());
         assert!(config.instruction_file.is_none());
         assert!(!config.prompt_via_stdin);
         assert!(config.paste_submit_delay_ms.is_none());

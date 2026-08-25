@@ -165,6 +165,19 @@ pub struct InteractiveAgent {
     /// True once the current shell line has been materialized in the PTY
     /// and warp input should stay synchronized from PTY edits.
     pub warp_passthrough: bool,
+    /// Flags from the most recent Kitty keyboard protocol "push" the child
+    /// sent (`CSI > flags u`), if any — `None` until one is observed.
+    /// Populated by a raw scan of PTY output in the reader thread (vt100
+    /// 0.16 has no Kitty-protocol support of its own — see
+    /// `input::parse_kitty_keyboard_push`), independent of the vt100
+    /// parser's own state. Exposed via
+    /// [`crate::tui::agent::InteractiveAgent::kitty_keyboard_negotiated`],
+    /// consulted by `event::agent_focus::focused_child_claimed_keyboard` to
+    /// decide whether a focus shortcut should yield to the child; not
+    /// consulted by any scroll encoder (see the `MPM::None` arm of
+    /// `encode_scroll_sequence` in `input.rs` for why Page Up/Page Down
+    /// specifically have no distinct Kitty encoding to switch to).
+    pub(crate) kitty_keyboard_flags: Arc<Mutex<Option<u8>>>,
 }
 
 impl InteractiveAgent {
@@ -270,6 +283,8 @@ impl InteractiveAgent {
         let last_output_at_clone = Arc::clone(&last_output_at);
         let activity_suppressed_until = Arc::new(Mutex::new(Utc::now()));
         let suppressed_until_clone = Arc::clone(&activity_suppressed_until);
+        let kitty_keyboard_flags = Arc::new(Mutex::new(None));
+        let kitty_keyboard_flags_clone = Arc::clone(&kitty_keyboard_flags);
 
         // Background thread: read PTY output → feed into vt100 parser
         std::thread::spawn(move || {
@@ -280,6 +295,11 @@ impl InteractiveAgent {
                     Ok(n) => {
                         if let Ok(mut parser) = vt_clone.lock() {
                             parser.process(&tmp[..n]);
+                        }
+                        if let Some(flags) = input::parse_kitty_keyboard_push(&tmp[..n]) {
+                            if let Ok(mut f) = kitty_keyboard_flags_clone.lock() {
+                                *f = Some(flags);
+                            }
                         }
                         // Stamp last output time so is_waiting_for_input()
                         // can detect idle — unless this output falls inside a
@@ -328,6 +348,7 @@ impl InteractiveAgent {
             warp_cursor: 0,
             history_index: None,
             warp_passthrough: false,
+            kitty_keyboard_flags,
         })
     }
 
@@ -387,6 +408,8 @@ impl InteractiveAgent {
         let last_output_at_clone = Arc::clone(&last_output_at);
         let activity_suppressed_until = Arc::new(Mutex::new(Utc::now()));
         let suppressed_until_clone = Arc::clone(&activity_suppressed_until);
+        let kitty_keyboard_flags = Arc::new(Mutex::new(None));
+        let kitty_keyboard_flags_clone = Arc::clone(&kitty_keyboard_flags);
 
         std::thread::spawn(move || {
             let mut tmp = [0u8; 4096];
@@ -396,6 +419,11 @@ impl InteractiveAgent {
                     Ok(n) => {
                         if let Ok(mut parser) = vt_clone.lock() {
                             parser.process(&tmp[..n]);
+                        }
+                        if let Some(flags) = input::parse_kitty_keyboard_push(&tmp[..n]) {
+                            if let Ok(mut f) = kitty_keyboard_flags_clone.lock() {
+                                *f = Some(flags);
+                            }
                         }
                         // See the sibling reader thread above: repaint bursts
                         // inside a post-resize window are not activity (B21).
@@ -444,6 +472,7 @@ impl InteractiveAgent {
             warp_cursor: 0,
             history_index: None,
             warp_passthrough: false,
+            kitty_keyboard_flags,
         })
     }
 

@@ -29,7 +29,7 @@ pub fn draw_rag_transfer_modal(frame: &mut Frame, app: &App, theme: &Theme) {
         .title(" Transfer RAG Result ")
         .borders(crate::tui::ui::borders_for(theme))
         .border_style(Style::default().fg(theme.header_color))
-        .style(Style::default().bg(Color::Rgb(15, 25, 15)));
+        .style(Style::default().bg(theme.dialog_bg));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     draw_dialog_left_wave(frame, area, app.animation_tick.into());
@@ -85,7 +85,7 @@ pub fn draw_rag_transfer_modal(frame: &mut Frame, app: &App, theme: &Theme) {
             let bg = if is_sel {
                 theme.selected_bg
             } else {
-                Color::Rgb(15, 25, 15)
+                theme.dialog_bg
             };
             let fg = if is_sel { accent } else { Color::White };
             let cursor = if is_sel { "›" } else { " " };

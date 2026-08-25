@@ -12,6 +12,7 @@
 
 use crate::application::ports::StateRepository;
 use crate::domain::loops::LoopStatus;
+use crate::tui::app::dialog::datetime_picker::{local_naive_to_utc, DateTimeEdit};
 use crate::tui::app::types::App;
 use crate::tui::mcp_client;
 
@@ -87,25 +88,80 @@ pub(crate) fn available_loop_actions(status: LoopStatus) -> Vec<LoopControlActio
     }
 }
 
-/// Free-text autorun scheduling input for the loop currently focused in the
-/// live view. A single field, mirroring the CLI's `--at`/`--quota-reset-message`
-/// split collapsed into one: an empty submission cancels any pending autorun,
-/// a value that parses as an RFC 3339 instant is sent as `at`, anything else
-/// is sent as the raw `quota_reset_message` for the daemon to parse (the
-/// engine, never the TUI, computes the resulting instant).
+/// Which of the autorun dialog's two input modes is active. Toggled with
+/// Tab, mirroring the prompt builder's `send_toggle`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoopAutorunMode {
+    /// Pick a local date/time with the shared picker — becomes `at`.
+    Picker,
+    /// Type a raw quota-reset message for the daemon to parse — sent
+    /// verbatim as `quota_reset_message`. Submitting this mode empty
+    /// cancels any pending autorun instead.
+    QuotaMessage,
+}
+
+/// Autorun scheduling input for the loop currently focused in the live view,
+/// mirroring the CLI's `--at`/`--quota-reset-message` split: picking a time
+/// with [`Self::picker`] (the same [`DateTimeEdit`] widget the prompt
+/// builder's scheduled-send control uses) is sent as `at`; typing into
+/// [`Self::quota_input`] is sent as the raw `quota_reset_message` for the
+/// daemon to parse (the engine, never the TUI, computes the resulting
+/// instant from that text); submitting the quota-message mode empty cancels
+/// any pending autorun.
 pub(crate) struct LoopAutorunDialog {
     pub loop_id: String,
     pub loop_name: String,
-    pub input: String,
+    pub mode: LoopAutorunMode,
+    pub picker: DateTimeEdit,
+    pub quota_input: String,
+    /// Inline validation hint (e.g. a picked time already in the past).
+    pub error: Option<String>,
 }
 
 impl LoopAutorunDialog {
-    pub fn new(loop_id: String, loop_name: String) -> Self {
+    /// Seed the picker from an existing pending `autorun_at` (converted to
+    /// local time) so reopening the dialog on a loop that already has one
+    /// scheduled shows it, rather than an empty/now-seeded field. With none
+    /// pending, seed with the current local time (seconds zeroed), mirroring
+    /// the prompt builder's `send_begin_edit`.
+    pub fn new(
+        loop_id: String,
+        loop_name: String,
+        existing_autorun_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Self {
+        use chrono::Timelike;
+        let seed = existing_autorun_at
+            .map(|at| at.with_timezone(&chrono::Local).naive_local())
+            .unwrap_or_else(|| {
+                let now = chrono::Local::now().naive_local();
+                now.with_second(0)
+                    .and_then(|t| t.with_nanosecond(0))
+                    .unwrap_or(now)
+            });
         Self {
             loop_id,
             loop_name,
-            input: String::new(),
+            mode: LoopAutorunMode::Picker,
+            picker: DateTimeEdit::new(seed),
+            quota_input: String::new(),
+            error: None,
         }
+    }
+
+    /// Toggle between the picker and the free-text quota-message input.
+    pub fn toggle_mode(&mut self) {
+        self.error = None;
+        self.mode = match self.mode {
+            LoopAutorunMode::Picker => LoopAutorunMode::QuotaMessage,
+            LoopAutorunMode::QuotaMessage => LoopAutorunMode::Picker,
+        };
+    }
+
+    /// The picker's currently displayed value, resolved to its UTC instant —
+    /// shown to the user before submission so the local-to-UTC conversion is
+    /// visible rather than trusted (requirement 3).
+    pub fn picker_resulting_utc(&self) -> chrono::DateTime<chrono::Utc> {
+        local_naive_to_utc(self.picker.value)
     }
 }
 
@@ -280,7 +336,11 @@ impl App {
         let Some(lp) = self.actionable_selected_loop() else {
             return;
         };
-        self.loop_autorun_dialog = Some(LoopAutorunDialog::new(lp.id.clone(), lp.name.clone()));
+        self.loop_autorun_dialog = Some(LoopAutorunDialog::new(
+            lp.id.clone(),
+            lp.name.clone(),
+            lp.autorun_at,
+        ));
     }
 
     /// Close the autorun dialog without submitting.
@@ -288,23 +348,57 @@ impl App {
         self.loop_autorun_dialog = None;
     }
 
-    /// Submit the autorun dialog's typed input: empty cancels any pending
-    /// autorun, an RFC 3339 instant is sent as `at`, anything else is sent
-    /// as the raw `quota_reset_message` for the daemon to parse. The TUI
-    /// never computes the resulting instant itself.
+    /// Submit the autorun dialog: in [`LoopAutorunMode::Picker`], the
+    /// picker's currently displayed local time is converted to UTC and sent
+    /// as `at` — a past instant is refused and the dialog stays open with an
+    /// inline error instead of submitting (requirement 7). In
+    /// [`LoopAutorunMode::QuotaMessage`], non-empty text is sent as the raw
+    /// `quota_reset_message` for the daemon to parse; empty text cancels any
+    /// pending autorun. The TUI never computes an instant from that text
+    /// itself — only from what the user explicitly picked.
     pub fn submit_loop_autorun_dialog(&mut self) {
-        let Some(dialog) = self.loop_autorun_dialog.take() else {
+        let Some(mut dialog) = self.loop_autorun_dialog.take() else {
             return;
         };
-        let input = dialog.input.trim();
-        let arguments = if input.is_empty() {
-            serde_json::json!({ "loop_id": dialog.loop_id })
-        } else if chrono::DateTime::parse_from_rfc3339(input).is_ok() {
-            serde_json::json!({ "loop_id": dialog.loop_id, "at": input })
-        } else {
-            serde_json::json!({ "loop_id": dialog.loop_id, "quota_reset_message": input })
-        };
-        self.dispatch_loop_action("loop_schedule_autorun", arguments);
+        match autorun_dialog_arguments(&dialog, chrono::Utc::now()) {
+            Ok(arguments) => self.dispatch_loop_action("loop_schedule_autorun", arguments),
+            Err(error) => {
+                dialog.error = Some(error);
+                self.loop_autorun_dialog = Some(dialog);
+            }
+        }
+    }
+}
+
+/// Compute the `loop_schedule_autorun` arguments for the dialog's current
+/// state, or the inline error to show instead of submitting. `now` is
+/// injected so the past/future boundary (requirement 7) is testable without
+/// depending on wall-clock time. Pure and `App`-free so the three submit
+/// paths (pick a time, cancel, quota message) can be tested directly against
+/// the produced JSON — the regression guard for decision 3.
+fn autorun_dialog_arguments(
+    dialog: &LoopAutorunDialog,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<serde_json::Value, String> {
+    match dialog.mode {
+        LoopAutorunMode::Picker => {
+            let at = dialog.picker_resulting_utc();
+            if at <= now {
+                return Err("picked time is in the past".to_string());
+            }
+            Ok(serde_json::json!({
+                "loop_id": dialog.loop_id,
+                "at": at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            }))
+        }
+        LoopAutorunMode::QuotaMessage => {
+            let text = dialog.quota_input.trim();
+            if text.is_empty() {
+                Ok(serde_json::json!({ "loop_id": dialog.loop_id }))
+            } else {
+                Ok(serde_json::json!({ "loop_id": dialog.loop_id, "quota_reset_message": text }))
+            }
+        }
     }
 }
 
@@ -360,5 +454,109 @@ mod tests {
         ];
         let keys: std::collections::HashSet<&str> = actions.iter().map(|a| a.key()).collect();
         assert_eq!(keys.len(), actions.len());
+    }
+
+    // ── autorun dialog: submit paths (C18) ─────────────────────────
+
+    fn future_dialog() -> LoopAutorunDialog {
+        let mut dialog =
+            LoopAutorunDialog::new("lp1".to_string(), "Nightly review".to_string(), None);
+        dialog.picker.value = chrono::Local::now().naive_local() + chrono::Duration::hours(2);
+        dialog
+    }
+
+    #[test]
+    fn picker_mode_future_time_produces_at_argument() {
+        let dialog = future_dialog();
+        let arguments = autorun_dialog_arguments(&dialog, chrono::Utc::now()).unwrap();
+        assert!(arguments.get("at").is_some(), "{arguments}");
+        assert!(
+            arguments.get("quota_reset_message").is_none(),
+            "{arguments}"
+        );
+        assert_eq!(arguments["loop_id"], "lp1");
+    }
+
+    #[test]
+    fn picker_mode_past_time_is_rejected() {
+        let mut dialog = future_dialog();
+        dialog.picker.value = chrono::Local::now().naive_local() - chrono::Duration::hours(1);
+        let err = autorun_dialog_arguments(&dialog, chrono::Utc::now()).unwrap_err();
+        assert!(err.contains("past"), "{err}");
+    }
+
+    #[test]
+    fn picker_mode_future_time_is_accepted() {
+        let dialog = future_dialog();
+        assert!(autorun_dialog_arguments(&dialog, chrono::Utc::now()).is_ok());
+    }
+
+    #[test]
+    fn quota_message_mode_empty_produces_cancel_argument() {
+        let mut dialog = future_dialog();
+        dialog.mode = LoopAutorunMode::QuotaMessage;
+        dialog.quota_input = "   ".to_string();
+        let arguments = autorun_dialog_arguments(&dialog, chrono::Utc::now()).unwrap();
+        assert_eq!(arguments, serde_json::json!({ "loop_id": "lp1" }));
+    }
+
+    #[test]
+    fn quota_message_mode_nonparsing_text_is_sent_unparsed() {
+        let mut dialog = future_dialog();
+        dialog.mode = LoopAutorunMode::QuotaMessage;
+        dialog.quota_input = "resets 2:10am (America/Bogota)".to_string();
+        let arguments = autorun_dialog_arguments(&dialog, chrono::Utc::now()).unwrap();
+        assert_eq!(
+            arguments["quota_reset_message"],
+            "resets 2:10am (America/Bogota)"
+        );
+        assert!(arguments.get("at").is_none(), "{arguments}");
+    }
+
+    #[test]
+    fn three_submit_paths_produce_distinguishable_arguments() {
+        let now = chrono::Utc::now();
+
+        let mut cancel = future_dialog();
+        cancel.mode = LoopAutorunMode::QuotaMessage;
+        cancel.quota_input = String::new();
+        let cancel_args = autorun_dialog_arguments(&cancel, now).unwrap();
+
+        let mut quota = future_dialog();
+        quota.mode = LoopAutorunMode::QuotaMessage;
+        quota.quota_input = "resets 1pm".to_string();
+        let quota_args = autorun_dialog_arguments(&quota, now).unwrap();
+
+        let picked = future_dialog();
+        let picked_args = autorun_dialog_arguments(&picked, now).unwrap();
+
+        assert!(
+            cancel_args.get("at").is_none() && cancel_args.get("quota_reset_message").is_none()
+        );
+        assert!(quota_args.get("quota_reset_message").is_some() && quota_args.get("at").is_none());
+        assert!(
+            picked_args.get("at").is_some() && picked_args.get("quota_reset_message").is_none()
+        );
+    }
+
+    #[test]
+    fn opening_dialog_seeds_picker_from_existing_pending_autorun() {
+        let existing = chrono::Utc::now() + chrono::Duration::hours(3);
+        let dialog = LoopAutorunDialog::new(
+            "lp1".to_string(),
+            "Nightly review".to_string(),
+            Some(existing),
+        );
+        assert_eq!(
+            dialog.picker.value,
+            existing.with_timezone(&chrono::Local).naive_local()
+        );
+    }
+
+    #[test]
+    fn opening_dialog_without_pending_autorun_seeds_current_time() {
+        let dialog = LoopAutorunDialog::new("lp1".to_string(), "Nightly review".to_string(), None);
+        let now = chrono::Local::now().naive_local();
+        assert!((dialog.picker.value - now).num_minutes().abs() < 2);
     }
 }

@@ -132,7 +132,7 @@ impl App {
     }
 
     pub(super) fn tick_missions(&mut self) -> Result<()> {
-        let events: Vec<_> = self.mission_pending_events.drain(..).collect();
+        let events = std::mem::take(&mut self.mission_pending_events);
         let snapshot = self.build_mission_snapshot()?;
         let unlocked =
             self.mission_manager

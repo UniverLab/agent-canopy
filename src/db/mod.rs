@@ -98,6 +98,7 @@ impl Database {
     /// TABLE IF NOT EXISTS` batch below, which would otherwise create empty
     /// `queues`/`queue_members` tables first and make the rename fail with
     /// "table already exists".
+    // RETIRED-SCHEMA-NAME-BEGIN (see `no_retired_schema_name_identifiers_remain_outside_its_migration`)
     fn migrate_legacy_queue_schema(conn: &Connection) -> Result<()> {
         let legacy_schema_present: bool = conn
             .query_row(
@@ -162,6 +163,7 @@ impl Database {
 
         Ok(())
     }
+    // RETIRED-SCHEMA-NAME-END
 
     fn init(&self) -> Result<()> {
         let conn = self
@@ -370,7 +372,9 @@ impl Database {
                 workdir TEXT,
                 completed_via TEXT,
                 completed_via_reason TEXT,
-                completed_via_at INTEGER
+                completed_via_at INTEGER,
+                spec_committed_head TEXT,
+                cross_run_attempts INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_loop_specs_position
@@ -1085,6 +1089,79 @@ impl Database {
         if !has_archived {
             conn.execute(
                 "ALTER TABLE loops ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // C1: distinguishes a loop `reconcile_orphaned_loops` paused after an
+        // unclean daemon exit from one an operator paused on purpose, so a
+        // pending `autorun_at` schedule can survive the former but still be
+        // blocked by the latter — see
+        // [`crate::domain::loops::Loop::is_autorun_due`]. `DEFAULT 0` means
+        // every pre-existing `Paused` loop reads as operator-paused, which is
+        // the safe assumption for a row this migration has no way to
+        // distinguish retroactively.
+        let has_paused_by_reconciliation: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loops') WHERE name = 'paused_by_reconciliation'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_paused_by_reconciliation {
+            conn.execute(
+                "ALTER TABLE loops ADD COLUMN paused_by_reconciliation INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // `spec_committed_head` (C15): the workdir's git HEAD immediately
+        // after a `commit_rights: true` node's own execution actually moved
+        // it — as opposed to `spec_start_head`, which only proves *some*
+        // commit landed since the spec began and is satisfied just as well
+        // by a concurrent commit from outside this run sharing the same
+        // worktree. `NULL` on every pre-existing row (no historical spec's
+        // committing node was ever tracked this way) and on any row where
+        // the graph never named a committer. Additive.
+        let has_spec_committed_head: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loop_specs') WHERE name = 'spec_committed_head'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_spec_committed_head {
+            conn.execute(
+                "ALTER TABLE loop_specs ADD COLUMN spec_committed_head TEXT",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // `cross_run_attempts` (C19): how many separate loop executions this
+        // spec has failed with a genuine (non-infrastructure) verdict.
+        // Unlike the per-node iteration budget `run_spec` tracks in memory
+        // for the duration of one execution, this is persisted so it
+        // survives `loop_reset`, a relaunch, and a daemon restart — the
+        // whole point being that an unsatisfiable spec doesn't get a fresh
+        // budget every time an operator resets and relaunches after a quota
+        // failure. `DEFAULT 0` means every pre-existing spec reads as never
+        // having failed under this counter, which is correct: it didn't
+        // exist to count anything before now. See
+        // `Database::increment_loop_spec_cross_run_attempts` and
+        // `LoopEngine::record_spec_attempt`.
+        let has_cross_run_attempts: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loop_specs') WHERE name = 'cross_run_attempts'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_cross_run_attempts {
+            conn.execute(
+                "ALTER TABLE loop_specs ADD COLUMN cross_run_attempts INTEGER NOT NULL DEFAULT 0",
                 [],
             )
             .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;

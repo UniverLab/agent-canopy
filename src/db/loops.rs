@@ -31,8 +31,8 @@ impl Database {
         let (trigger_type, trigger_config) = encode_loop_trigger(lp.trigger.as_ref())?;
         let on_completed = encode_loop_completion_hook(lp.on_completed.as_ref())?;
         conn.execute(
-            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 &lp.id,
                 &lp.name,
@@ -50,6 +50,7 @@ impl Database {
                 lp.auto_continue_at.map(|value| value.timestamp()),
                 &lp.auto_continue_action,
                 lp.archived,
+                lp.paused_by_reconciliation,
             ],
         )?;
         Ok(())
@@ -90,7 +91,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation
              FROM loops WHERE autorun_at IS NOT NULL",
         )?;
         let rows = stmt.query_map([], map_loop_row)?;
@@ -145,7 +146,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation
              FROM loops WHERE auto_continue_at IS NOT NULL",
         )?;
         let rows = stmt.query_map([], map_loop_row)?;
@@ -204,7 +205,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation
              FROM loops WHERE trigger_type = ?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![trigger_type], map_loop_row)?;
@@ -249,7 +250,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation
              FROM loops WHERE id = ?1",
         )?;
 
@@ -278,12 +279,12 @@ impl Database {
         };
         let sql = if workdir.is_some() {
             format!(
-                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived
+                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation
                  FROM loops WHERE workdir = ?1{archived_clause} ORDER BY created_at DESC"
             )
         } else {
             format!(
-                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived
+                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation
                  FROM loops WHERE 1=1{archived_clause} ORDER BY created_at DESC"
             )
         };
@@ -374,11 +375,18 @@ impl Database {
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        // C1: every status transition through this generic path is explicit
+        // (an operator's pause, a run finishing, a launch claiming the loop)
+        // — never `reconcile_orphaned_loops`'s own automatic pause, which
+        // writes `paused_by_reconciliation` through its own dedicated
+        // statement. Clearing it here unconditionally keeps that flag scoped
+        // to exactly the loops reconciliation itself paused.
         let rows = conn.execute(
             "UPDATE loops
              SET status = ?1,
                  started_at = COALESCE(?2, started_at),
-                 completed_at = COALESCE(?3, completed_at)
+                 completed_at = COALESCE(?3, completed_at),
+                 paused_by_reconciliation = 0
              WHERE id = ?4",
             params![
                 status.as_str(),
@@ -457,16 +465,75 @@ impl Database {
     /// Reset a loop spec back to `Pending`, clearing `started_at` and
     /// `completed_at` unconditionally (unlike [`Self::update_loop_spec_status`],
     /// which only overwrites when a new value is given). Used by `loop_reset`.
-    pub fn reset_loop_spec_status(&self, spec_id: &str) -> Result<bool> {
+    ///
+    /// `clear_cross_run_attempts` (C19) additionally zeroes the spec's
+    /// persisted cross-run attempt counter — but only when the caller passed
+    /// this exact spec explicitly. [`Self::reset_loop`] wires that in: an
+    /// operator naming a spec by id is the deliberate "I fixed this" signal
+    /// decision 6 asks for; a blanket reset of every non-completed spec is
+    /// not, so the counter must survive it — otherwise the very relaunch
+    /// this budget exists to guard against would silently get a fresh one
+    /// every time.
+    pub fn reset_loop_spec_status(
+        &self,
+        spec_id: &str,
+        clear_cross_run_attempts: bool,
+    ) -> Result<bool> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let rows = conn.execute(
-            "UPDATE loop_specs SET status = ?1, started_at = NULL, completed_at = NULL, spec_start_head = NULL WHERE id = ?2",
-            params![LoopSpecStatus::Pending.as_str(), spec_id],
+            "UPDATE loop_specs SET status = ?1, started_at = NULL, completed_at = NULL, spec_start_head = NULL, spec_committed_head = NULL,
+                 cross_run_attempts = CASE WHEN ?3 THEN 0 ELSE cross_run_attempts END
+             WHERE id = ?2",
+            params![
+                LoopSpecStatus::Pending.as_str(),
+                spec_id,
+                clear_cross_run_attempts,
+            ],
         )?;
         Ok(rows > 0)
+    }
+
+    /// C19: the spec's persisted cross-run attempt count — how many separate
+    /// loop executions it has failed with a genuine (non-infrastructure)
+    /// verdict. `0` for a spec that has never failed this way (including
+    /// every pre-migration row). See [`Self::increment_loop_spec_cross_run_attempts`].
+    pub fn get_loop_spec_cross_run_attempts(&self, spec_id: &str) -> Result<i64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        conn.query_row(
+            "SELECT cross_run_attempts FROM loop_specs WHERE id = ?1",
+            params![spec_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    }
+
+    /// Increment `spec_id`'s persisted cross-run attempt count and return the
+    /// new value, atomically under the single connection lock so a
+    /// concurrent read never observes a torn increment. Called by
+    /// `LoopEngine::record_spec_attempt` exactly once per spec-execution
+    /// that ends in a genuine (non-infrastructure) `Failed` — never for an
+    /// infra failure, and never more than once per attempt.
+    pub fn increment_loop_spec_cross_run_attempts(&self, spec_id: &str) -> Result<i64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        conn.execute(
+            "UPDATE loop_specs SET cross_run_attempts = cross_run_attempts + 1 WHERE id = ?1",
+            params![spec_id],
+        )?;
+        conn.query_row(
+            "SELECT cross_run_attempts FROM loop_specs WHERE id = ?1",
+            params![spec_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
     }
 
     /// Administratively transition a standalone spec's status. The transition
@@ -602,8 +669,15 @@ impl Database {
         // recorded under this same `loop_id` (bound or drawn live from a
         // queue — see `list_loop_runs_for_loop`), so there is nothing left
         // to terminate here.
+        //
+        // C19: only an explicitly-named `specs` list clears the target
+        // spec(s)' cross-run attempt count — see `reset_loop_spec_status`'s
+        // doc. A blanket reset (`specs: None`) resets every non-completed
+        // spec's status the same as always, but leaves each one's count
+        // exactly where it was.
+        let clear_cross_run_attempts = specs.is_some();
         for spec_id in &target_ids {
-            self.reset_loop_spec_status(spec_id)?;
+            self.reset_loop_spec_status(spec_id, clear_cross_run_attempts)?;
         }
         self.reset_loop_status(loop_id)?;
 
@@ -618,8 +692,8 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         conn.execute(
-            "INSERT INTO loop_specs (id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO loop_specs (id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir, spec_committed_head)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 &spec.id,
                 &spec.loop_id,
@@ -632,6 +706,7 @@ impl Database {
                 spec.completed_at.map(|value| value.timestamp()),
                 &spec.spec_start_head,
                 &spec.workdir,
+                &spec.spec_committed_head,
             ],
         )?;
         Ok(())
@@ -643,7 +718,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir, completed_via, completed_via_reason, completed_via_at
+            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir, completed_via, completed_via_reason, completed_via_at, spec_committed_head
              FROM loop_specs WHERE loop_id = ?1 ORDER BY position ASC",
         )?;
         let rows = stmt.query_map(params![loop_id], map_loop_spec_row)?;
@@ -658,7 +733,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir, completed_via, completed_via_reason, completed_via_at
+            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir, completed_via, completed_via_reason, completed_via_at, spec_committed_head
              FROM loop_specs WHERE id = ?1",
         )?;
 
@@ -695,7 +770,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir, completed_via, completed_via_reason, completed_via_at
+            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir, completed_via, completed_via_reason, completed_via_at, spec_committed_head
              FROM loop_specs
              WHERE (?1 IS NULL OR workdir = ?1)
                AND (?2 IS NULL OR status = ?2)
@@ -766,6 +841,29 @@ impl Database {
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let rows = conn.execute(
             "UPDATE loop_specs SET spec_start_head = ?1 WHERE id = ?2",
+            params![head, spec_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Record the workdir's git HEAD immediately after a `commit_rights:
+    /// true` node's own execution actually moved it (C15) — see
+    /// [`crate::loop_engine`]'s `{{spec_committed_head}}` placeholder.
+    /// Unlike `spec_start_head`, which is captured once and answers "has
+    /// anything been committed since this spec began", this answers "did
+    /// *this run's own committer* land a commit" — the distinction a
+    /// concurrent commit from outside this run (another agent, a human
+    /// sharing the worktree) would otherwise slip past. Overwritten every
+    /// time the committer node visits and moves HEAD again (e.g. a
+    /// review/retry cycle that re-commits), so it always reflects the
+    /// latest commit this run itself produced.
+    pub fn set_loop_spec_committed_head(&self, spec_id: &str, head: Option<&str>) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE loop_specs SET spec_committed_head = ?1 WHERE id = ?2",
             params![head, spec_id],
         )?;
         Ok(rows > 0)
@@ -1542,7 +1640,7 @@ impl Database {
 
         let orphaned: Vec<Loop> = {
             let mut stmt = tx.prepare(
-                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived
+                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation
                  FROM loops WHERE status = ?1",
             )?;
             let rows = stmt.query_map(params![LoopStatus::Running.as_str()], map_loop_row)?;
@@ -1617,20 +1715,28 @@ impl Database {
                 // reset to `Pending`) is what used to be the stash's job —
                 // it's what tells the next pickup's rendered prompt to say
                 // "a previous attempt exists, continue it" instead of
-                // silently starting fresh. `spec_start_head` is still
-                // cleared: the next attempt captures its own fresh baseline
-                // (`run_spec` only reuses a persisted baseline for a
-                // same-attempt resume of a `Running` spec, which an
-                // `Interrupted` pickup is not).
+                // silently starting fresh. `spec_start_head` and
+                // `spec_committed_head` (C15) are still cleared: the next
+                // attempt captures its own fresh baseline and starts with no
+                // committed-head evidence of its own (`run_spec` only reuses
+                // a persisted baseline for a same-attempt resume of a
+                // `Running` spec, which an `Interrupted` pickup is not) — a
+                // restart must never let a *stale* `spec_committed_head` from
+                // the interrupted attempt pass a check for an attempt that
+                // hasn't committed anything itself yet.
                 tx.execute(
                     "UPDATE loop_specs
-                     SET status = ?1, started_at = NULL, completed_at = NULL, spec_start_head = NULL
+                     SET status = ?1, started_at = NULL, completed_at = NULL, spec_start_head = NULL, spec_committed_head = NULL
                      WHERE id = ?2",
                     params![LoopSpecStatus::Interrupted.as_str(), run.spec_id],
                 )?;
             }
+            // C1: flag this pause as reconciliation's own, distinct from an
+            // operator's `loop_pause`/`loop_report_blocker` (both go through
+            // `update_loop_status`, which always clears this flag) — see
+            // [`crate::domain::loops::Loop::paused_by_reconciliation`].
             tx.execute(
-                "UPDATE loops SET status = ?1 WHERE id = ?2",
+                "UPDATE loops SET status = ?1, paused_by_reconciliation = 1 WHERE id = ?2",
                 params![LoopStatus::Paused.as_str(), lp.id],
             )?;
         }
@@ -1764,7 +1870,7 @@ impl Database {
                 tx.execute(
                     "UPDATE loop_specs
                      SET status = ?1, started_at = NULL, completed_at = NULL,
-                         spec_start_head = NULL
+                         spec_start_head = NULL, spec_committed_head = NULL
                      WHERE id = ?2",
                     params![new_status.as_str(), spec_id],
                 )?;
@@ -1858,6 +1964,7 @@ fn map_loop_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Loop> {
             .transpose()?,
         auto_continue_action: row.get(13)?,
         archived: row.get(14)?,
+        paused_by_reconciliation: row.get(15)?,
     })
 }
 
@@ -1922,6 +2029,7 @@ fn map_loop_spec_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoopSpec> {
             .get::<_, Option<i64>>(13)?
             .map(from_timestamp)
             .transpose()?,
+        spec_committed_head: row.get(14)?,
     })
 }
 
@@ -2077,6 +2185,7 @@ mod tests {
     fn sample_loop(id: &str) -> Loop {
         Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: id.to_string(),
             name: format!("Loop {id}"),
             description: None,
@@ -2439,6 +2548,7 @@ mod tests {
             started_at: None,
             completed_at: None,
             spec_start_head: None,
+            spec_committed_head: None,
             workdir: None,
             completed_via: None,
             completed_via_reason: None,

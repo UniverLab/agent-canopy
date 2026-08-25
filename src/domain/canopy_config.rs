@@ -62,6 +62,17 @@ pub struct CanopyConfig {
     #[serde(default = "default_ensemble_concurrency_cap")]
     pub ensemble_concurrency_cap: usize,
 
+    /// Cross-run attempt budget (C19): how many separate loop executions a
+    /// single spec may fail with a genuine verdict before the loop is marked
+    /// blocked instead of being left to burn another quota window on a
+    /// relaunch. Persisted per spec (`loop_specs.cross_run_attempts`) so it
+    /// survives `loop_reset`, a relaunch, and a daemon restart — unlike the
+    /// per-node in-run iteration budget, which resets with every execution.
+    /// Lower than that per-node budget by design: these are whole attempts,
+    /// not node cycles.
+    #[serde(default = "default_spec_attempt_limit")]
+    pub spec_attempt_limit: usize,
+
     /// `[clean]` settings for the `canopy clean` CLI command.
     #[serde(default)]
     pub clean: CleanConfig,
@@ -97,6 +108,16 @@ pub struct CanopyConfig {
     /// choosing to index bigger files, not a regression in chunking itself.
     #[serde(default = "default_rag_max_file_mb")]
     pub rag_max_file_mb: u32,
+
+    /// Ceiling on LanceDB's index cache, in entries (see
+    /// `lancedb::OpenTableBuilder::index_cache_size` — roughly 20 MiB per
+    /// entry). With this unset, LanceDB's own default lets the index cache
+    /// grow to 6 GiB, which is the second identified contributor to daemon
+    /// RSS on a workspace with a large on-disk index. Configurable per
+    /// workspace since a small index and a tens-of-gigabytes one want
+    /// different ceilings.
+    #[serde(default = "default_rag_vector_cache_entries")]
+    pub rag_vector_cache_entries: u32,
 }
 
 /// Highest per-file indexing cap a user may configure, in MB. Text/PDF
@@ -107,6 +128,15 @@ pub const RAG_MAX_FILE_MB_CEILING: u32 = 100;
 
 fn default_rag_max_file_mb() -> u32 {
     10
+}
+
+/// Kept equal to `rag::vector_store::DEFAULT_INDEX_CACHE_ENTRIES` (see that
+/// constant for the measurement behind the value). Not referenced directly
+/// across the module boundary because `examples/rag_search.rs` mounts
+/// `vector_store` at its own crate root via `#[path]`, without a `rag`
+/// module wrapping it — `crate::rag::vector_store` doesn't resolve there.
+fn default_rag_vector_cache_entries() -> u32 {
+    64
 }
 
 /// Validates a configured (or user-entered) per-file indexing size cap.
@@ -277,6 +307,10 @@ fn default_ensemble_concurrency_cap() -> usize {
     4
 }
 
+fn default_spec_attempt_limit() -> usize {
+    3
+}
+
 fn default_theme() -> String {
     "classic".to_string()
 }
@@ -369,11 +403,13 @@ impl Default for CanopyConfig {
             projects_root: default_projects_root(),
             embeddings_idle_unload_secs: default_embeddings_idle_unload_secs(),
             ensemble_concurrency_cap: default_ensemble_concurrency_cap(),
+            spec_attempt_limit: default_spec_attempt_limit(),
             clean: CleanConfig::default(),
             skills: SkillsConfig::default(),
             models: ModelsConfig::default(),
             theme: default_theme(),
             rag_max_file_mb: default_rag_max_file_mb(),
+            rag_vector_cache_entries: default_rag_vector_cache_entries(),
         }
     }
 }
@@ -393,6 +429,10 @@ mod tests {
         assert_eq!(config.similarity_threshold, 0.25);
         assert_eq!(config.theme, "classic");
         assert_eq!(config.rag_max_file_mb, 10);
+        assert_eq!(
+            config.rag_vector_cache_entries,
+            crate::rag::vector_store::DEFAULT_INDEX_CACHE_ENTRIES
+        );
     }
 
     #[test]
@@ -709,6 +749,26 @@ mod tests {
 
         let loaded = CanopyConfig::load(&canopy_dir);
         assert_eq!(loaded.ensemble_concurrency_cap, 8);
+    }
+
+    #[test]
+    fn test_spec_attempt_limit_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let canopy_dir = dir.path().join(".canopy");
+
+        let config = CanopyConfig {
+            spec_attempt_limit: 5,
+            ..CanopyConfig::default()
+        };
+        config.save(&canopy_dir).unwrap();
+
+        let loaded = CanopyConfig::load(&canopy_dir);
+        assert_eq!(loaded.spec_attempt_limit, 5);
+    }
+
+    #[test]
+    fn test_spec_attempt_limit_defaults_to_three() {
+        assert_eq!(CanopyConfig::default().spec_attempt_limit, 3);
     }
 
     #[test]

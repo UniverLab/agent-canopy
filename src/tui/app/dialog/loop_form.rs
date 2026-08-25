@@ -323,6 +323,7 @@ mod tests {
     fn sample_loop(id: &str, trigger: Option<Trigger>) -> Loop {
         Loop {
             archived: false,
+            paused_by_reconciliation: false,
             id: id.to_string(),
             name: "Nightly review".to_string(),
             description: Some("Review the queue".to_string()),

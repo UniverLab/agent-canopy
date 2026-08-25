@@ -20,13 +20,17 @@ fn first_n_chars(s: &str, n: usize) -> &str {
 
 const SPINNER: [&str; 8] = ["⣷", "⣯", "⣟", "⡿", "⢿", "⣻", "⣽", "⣾"];
 
+// THEME-EXEMPT: the banner gradient is its own authored animation palette
+// (`BANNER_GRADIENT`), independent of classic/modern — not a theme role.
 fn gradient_wave_color(char_idx: usize, shift: usize) -> Color {
     let len = BANNER_GRADIENT.len();
     if len == 0 {
+        // THEME-EXEMPT: see function doc above.
         return Color::White;
     }
     if len == 1 {
         let (r, g, b) = BANNER_GRADIENT[0];
+        // THEME-EXEMPT: see function doc above.
         return Color::Rgb(r, g, b);
     }
 
@@ -36,6 +40,7 @@ fn gradient_wave_color(char_idx: usize, shift: usize) -> Color {
     let pos = (char_idx + shift) % cycle_len;
     let gradient_idx = if pos < len { pos } else { cycle_len - pos };
     let (r, g, b) = BANNER_GRADIENT[gradient_idx];
+    // THEME-EXEMPT: see function doc above.
     Color::Rgb(r, g, b)
 }
 
@@ -62,11 +67,12 @@ pub(super) fn draw_header(frame: &mut Frame, area: Rect, app: &mut App, theme: &
         let frame_idx = ((millis / 125) % 8) as usize;
         (SPINNER[frame_idx], theme.header_color)
     } else {
-        // Blinking █ in red when stopped
+        // Blinking █ in red when stopped.
         let blink_on = (millis / 500).is_multiple_of(2);
         let color = if blink_on {
             ERROR_COLOR
         } else {
+            // THEME-EXEMPT: single-use dim variant of the error red — not a recurring role.
             Color::Rgb(120, 60, 60)
         };
         ("█", color)
@@ -95,6 +101,7 @@ pub(super) fn draw_header(frame: &mut Frame, area: Rect, app: &mut App, theme: &
         spans.push(Span::styled(
             format!("{} ", visible_text),
             Style::default()
+                // THEME-EXEMPT: single-use whimsy-message gray — not a recurring role.
                 .fg(Color::Rgb(140, 140, 140))
                 .add_modifier(Modifier::ITALIC),
         ));

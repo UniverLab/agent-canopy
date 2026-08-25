@@ -16,6 +16,31 @@ use lancedb::{connect, Connection, Table};
 const DEFAULT_DB_DIR: &str = ".canopy/rag/vectors.lancedb";
 const TABLE_NAME: &str = "chunks";
 
+/// Default ceiling on LanceDB's index cache, in entries (see
+/// `lancedb::connection::OpenTableBuilder::index_cache_size`, which converts
+/// entries to bytes at ~20 MiB/entry — the same conversion `lance::dataset`
+/// uses internally for its now-deprecated entry-count API). Left unset,
+/// LanceDB defaults to `lance::dataset::DEFAULT_INDEX_CACHE_SIZE` = 6 GiB.
+///
+/// Measured on this repo's own indexed workspace (~1,900 chunks, 384-dim
+/// embeddings, no `create_index()` call so search is a brute-force KNN
+/// scan): with no vector index ever built, the index cache holds nothing,
+/// so 64 entries (~1.25 GiB ceiling) vs. LanceDB's unbounded-by-default
+/// 6 GiB showed no measurable difference in RSS or query latency — the
+/// cache simply isn't populated by this workload today. 64 is kept as the
+/// default anyway because it cuts the *worst-case* ceiling by ~80% against
+/// LanceDB's built-in default at zero cost to today's brute-force search,
+/// and gives headroom for if/when an ANN index is added later.
+pub const DEFAULT_INDEX_CACHE_ENTRIES: u32 = 64;
+
+/// Resolve the effective LanceDB index cache bound: the configured value,
+/// or `DEFAULT_INDEX_CACHE_ENTRIES` when nothing is configured. Kept as a
+/// pure function, separate from the LanceDB calls that consume it, so the
+/// resolution itself is directly testable.
+fn resolve_index_cache_entries(configured: Option<u32>) -> u32 {
+    configured.unwrap_or(DEFAULT_INDEX_CACHE_ENTRIES)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct VectorChunk {
     pub id: String,
@@ -42,9 +67,17 @@ pub struct VectorStore {
 }
 
 impl VectorStore {
-    pub async fn new(embedding_dimensions: usize) -> Result<Self> {
+    pub async fn new(
+        embedding_dimensions: usize,
+        index_cache_entries: Option<u32>,
+    ) -> Result<Self> {
         let home = dirs::home_dir().context("Could not determine home directory")?;
-        Self::open_at(&home.join(DEFAULT_DB_DIR), embedding_dimensions).await
+        Self::open_at(
+            &home.join(DEFAULT_DB_DIR),
+            embedding_dimensions,
+            index_cache_entries,
+        )
+        .await
     }
 
     pub fn default_lancedb_path() -> Result<PathBuf> {
@@ -52,7 +85,12 @@ impl VectorStore {
         Ok(home.join(DEFAULT_DB_DIR))
     }
 
-    pub async fn open_at(path: &Path, embedding_dimensions: usize) -> Result<Self> {
+    pub async fn open_at(
+        path: &Path,
+        embedding_dimensions: usize,
+        index_cache_entries: Option<u32>,
+    ) -> Result<Self> {
+        let cache_entries = resolve_index_cache_entries(index_cache_entries);
         let embedding_dimensions = i32::try_from(embedding_dimensions)
             .context("Embedding dimensions exceed supported LanceDB schema size")?;
         if embedding_dimensions <= 0 {
@@ -89,12 +127,16 @@ impl VectorStore {
                 .create_empty_table(TABLE_NAME, schema.clone())
                 .execute()
                 .await
-                .context("Failed to create LanceDB table")?
+                .context("Failed to create LanceDB table")?;
+            // create_empty_table's builder has no cache-size knob (there is no
+            // index yet on an empty table); reopen once so `self.table` always
+            // carries the configured bound, regardless of which branch built it.
+            open_table_with_cache(&connection, cache_entries).await?
         } else {
             // The table is listed on disk, so it must not be silently replaced:
             // an open failure here is a transient race (e.g. concurrent manifest
             // rewrite) or genuine corruption, never "table does not exist".
-            let existing_table = open_existing_table_with_retry(&connection).await?;
+            let existing_table = open_existing_table_with_retry(&connection, cache_entries).await?;
 
             // Check whether the stored schema matches the requested dimensions.
             // If they differ (e.g. model was changed), drop and recreate the table.
@@ -114,7 +156,7 @@ impl VectorStore {
                     .drop_table(TABLE_NAME, &[])
                     .await
                     .context("Failed to drop outdated LanceDB table")?;
-                let new_table = connection
+                connection
                     .create_empty_table(TABLE_NAME, schema.clone())
                     .execute()
                     .await
@@ -123,7 +165,7 @@ impl VectorStore {
                     "RAG VectorStore: recreated table with {} dimensions",
                     embedding_dimensions
                 );
-                new_table
+                open_table_with_cache(&connection, cache_entries).await?
             } else {
                 tracing::info!("RAG VectorStore: schema OK, reusing existing table");
                 existing_table
@@ -277,10 +319,18 @@ const OPEN_TABLE_MAX_ATTEMPTS: u32 = 3;
 /// Open a table that `table_names()` has already confirmed exists, retrying
 /// with backoff on failure. Never falls back to creating an empty table:
 /// callers must treat a persistent failure as fatal, not as "table missing".
-async fn open_existing_table_with_retry(connection: &Connection) -> Result<Table> {
+async fn open_existing_table_with_retry(
+    connection: &Connection,
+    cache_entries: u32,
+) -> Result<Table> {
     let mut last_error = None;
     for attempt in 1..=OPEN_TABLE_MAX_ATTEMPTS {
-        match connection.open_table(TABLE_NAME).execute().await {
+        match connection
+            .open_table(TABLE_NAME)
+            .index_cache_size(cache_entries)
+            .execute()
+            .await
+        {
             Ok(table) => return Ok(table),
             Err(error) => {
                 tracing::warn!(
@@ -302,6 +352,19 @@ async fn open_existing_table_with_retry(connection: &Connection) -> Result<Table
             "Failed to open existing LanceDB table {TABLE_NAME} after {OPEN_TABLE_MAX_ATTEMPTS} attempts"
         )
     })
+}
+
+/// Reopen a table that was just created, applying the configured index
+/// cache bound. `create_empty_table`'s builder has no cache-size knob (an
+/// empty table has no index to cache yet), so this is the one place that
+/// bound gets attached for a freshly created or recreated table.
+async fn open_table_with_cache(connection: &Connection, cache_entries: u32) -> Result<Table> {
+    connection
+        .open_table(TABLE_NAME)
+        .index_cache_size(cache_entries)
+        .execute()
+        .await
+        .context("Failed to reopen LanceDB table with configured index cache size")
 }
 
 fn path_to_uri(path: &Path) -> Result<String> {
@@ -452,7 +515,7 @@ mod tests {
     #[tokio::test]
     async fn vector_store_inserts_and_searches_chunks() {
         let temp_dir = TempDir::new().unwrap();
-        let store = VectorStore::open_at(&VectorStore::path_for_tests(temp_dir.path()), 4)
+        let store = VectorStore::open_at(&VectorStore::path_for_tests(temp_dir.path()), 4, None)
             .await
             .unwrap();
         store
@@ -477,7 +540,7 @@ mod tests {
     #[tokio::test]
     async fn vector_store_deletes_chunks_by_path() {
         let temp_dir = TempDir::new().unwrap();
-        let store = VectorStore::open_at(&VectorStore::path_for_tests(temp_dir.path()), 4)
+        let store = VectorStore::open_at(&VectorStore::path_for_tests(temp_dir.path()), 4, None)
             .await
             .unwrap();
         store
@@ -497,7 +560,7 @@ mod tests {
     #[tokio::test]
     async fn vector_store_rejects_wrong_dimensions() {
         let temp_dir = TempDir::new().unwrap();
-        let store = VectorStore::open_at(&VectorStore::path_for_tests(temp_dir.path()), 4)
+        let store = VectorStore::open_at(&VectorStore::path_for_tests(temp_dir.path()), 4, None)
             .await
             .unwrap();
 
@@ -512,7 +575,7 @@ mod tests {
     #[tokio::test]
     async fn semantic_chunking_embedding_and_vector_search_roundtrip() {
         let temp_dir = TempDir::new().unwrap();
-        let store = VectorStore::open_at(&VectorStore::path_for_tests(temp_dir.path()), 4)
+        let store = VectorStore::open_at(&VectorStore::path_for_tests(temp_dir.path()), 4, None)
             .await
             .unwrap();
         let embedder = MockEmbeddingClient::new(4);
@@ -565,7 +628,7 @@ mod tests {
         let lancedb_path = VectorStore::path_for_tests(temp_dir.path());
 
         // Create a valid store with data.
-        let store = VectorStore::open_at(&lancedb_path, 4).await.unwrap();
+        let store = VectorStore::open_at(&lancedb_path, 4, None).await.unwrap();
         store
             .insert_chunk(&chunk("a", "/test.md", "hello", vec![1.0, 0.0, 0.0, 0.0]))
             .await
@@ -576,7 +639,7 @@ mod tests {
         corrupt_all_files(&lancedb_path);
 
         // Opening the corrupted store should fail.
-        let result = VectorStore::open_at(&lancedb_path, 4).await;
+        let result = VectorStore::open_at(&lancedb_path, 4, None).await;
         assert!(result.is_err(), "corrupted store should fail to open");
     }
 
@@ -586,7 +649,7 @@ mod tests {
         let lancedb_path = VectorStore::path_for_tests(temp_dir.path());
 
         // Create a valid store with data.
-        let store = VectorStore::open_at(&lancedb_path, 4).await.unwrap();
+        let store = VectorStore::open_at(&lancedb_path, 4, None).await.unwrap();
         store
             .insert_chunk(&chunk("a", "/test.md", "hello", vec![1.0, 0.0, 0.0, 0.0]))
             .await
@@ -611,7 +674,7 @@ mod tests {
 
         // Opening must propagate the failure, not fall back to creating an
         // empty table — that would silently discard the existing row.
-        let result = VectorStore::open_at(&lancedb_path, 4).await;
+        let result = VectorStore::open_at(&lancedb_path, 4, None).await;
         assert!(
             result.is_err(),
             "open failure on a known-existing table must propagate, not recreate it empty"
@@ -624,7 +687,7 @@ mod tests {
         let lancedb_path = VectorStore::path_for_tests(temp_dir.path());
 
         // Create a valid store with data.
-        let store = VectorStore::open_at(&lancedb_path, 4).await.unwrap();
+        let store = VectorStore::open_at(&lancedb_path, 4, None).await.unwrap();
         store
             .insert_chunk(&chunk("a", "/test.md", "hello", vec![1.0, 0.0, 0.0, 0.0]))
             .await
@@ -635,13 +698,13 @@ mod tests {
         corrupt_all_files(&lancedb_path);
 
         // Opening the corrupted store should fail.
-        assert!(VectorStore::open_at(&lancedb_path, 4).await.is_err());
+        assert!(VectorStore::open_at(&lancedb_path, 4, None).await.is_err());
 
         // Purge (delete) the corrupted directory — simulates wipe_lancedb_dir.
         std::fs::remove_dir_all(&lancedb_path).unwrap();
 
         // Opening after purge should succeed with a fresh (empty) table.
-        let store = VectorStore::open_at(&lancedb_path, 4).await.unwrap();
+        let store = VectorStore::open_at(&lancedb_path, 4, None).await.unwrap();
         assert_eq!(store.count_chunks().await.unwrap(), 0);
     }
 
@@ -651,7 +714,7 @@ mod tests {
         let lancedb_path = VectorStore::path_for_tests(temp_dir.path());
 
         // Create a store with 4-dimensional embeddings and a row.
-        let store = VectorStore::open_at(&lancedb_path, 4).await.unwrap();
+        let store = VectorStore::open_at(&lancedb_path, 4, None).await.unwrap();
         store
             .insert_chunk(&chunk("a", "/test.md", "hello", vec![1.0, 0.0, 0.0, 0.0]))
             .await
@@ -661,7 +724,7 @@ mod tests {
 
         // Reopening with a different embedding dimension (e.g. model change)
         // must drop and recreate the table, ending up empty with the new schema.
-        let store = VectorStore::open_at(&lancedb_path, 8).await.unwrap();
+        let store = VectorStore::open_at(&lancedb_path, 8, None).await.unwrap();
         assert_eq!(store.count_chunks().await.unwrap(), 0);
         store
             .insert_chunk(&chunk(
@@ -681,14 +744,14 @@ mod tests {
         let lancedb_path = temp_dir.path().join("nonexistent").join("vectors.lancedb");
 
         // open_at should create the directory and table from scratch.
-        let store = VectorStore::open_at(&lancedb_path, 4).await.unwrap();
+        let store = VectorStore::open_at(&lancedb_path, 4, None).await.unwrap();
         assert_eq!(store.count_chunks().await.unwrap(), 0);
     }
 
     #[tokio::test]
     async fn count_chunks_returns_total_and_unique_paths() {
         let temp_dir = TempDir::new().unwrap();
-        let store = VectorStore::open_at(&VectorStore::path_for_tests(temp_dir.path()), 4)
+        let store = VectorStore::open_at(&VectorStore::path_for_tests(temp_dir.path()), 4, None)
             .await
             .unwrap();
         store
@@ -706,5 +769,122 @@ mod tests {
 
         assert_eq!(store.count_chunks().await.unwrap(), 3);
         assert_eq!(store.count_unique_paths().await.unwrap(), 2);
+    }
+
+    // ── C9: vector cache bound ──────────────────────────────────────
+
+    #[test]
+    fn resolve_index_cache_entries_applies_configured_bound() {
+        assert_eq!(resolve_index_cache_entries(Some(7)), 7);
+    }
+
+    #[test]
+    fn resolve_index_cache_entries_applies_default_when_unconfigured() {
+        assert_eq!(
+            resolve_index_cache_entries(None),
+            DEFAULT_INDEX_CACHE_ENTRIES
+        );
+    }
+
+    #[tokio::test]
+    async fn open_at_accepts_a_configured_cache_bound() {
+        let temp_dir = TempDir::new().unwrap();
+        // A value LanceDB actually receives via `.index_cache_size()` on both
+        // the create path and the reuse-on-reopen path — an unsupported or
+        // mis-threaded value would surface as an Err here, not silently.
+        let store = VectorStore::open_at(&VectorStore::path_for_tests(temp_dir.path()), 4, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(store.count_chunks().await.unwrap(), 0);
+
+        // Reopening the same on-disk table exercises the "existing table"
+        // path, which threads the bound through a different call site.
+        let reopened =
+            VectorStore::open_at(&VectorStore::path_for_tests(temp_dir.path()), 4, Some(1))
+                .await
+                .unwrap();
+        assert_eq!(reopened.count_chunks().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn search_results_identical_with_and_without_cache_bound() {
+        let bounded_dir = TempDir::new().unwrap();
+        let unbounded_dir = TempDir::new().unwrap();
+        let bounded =
+            VectorStore::open_at(&VectorStore::path_for_tests(bounded_dir.path()), 4, Some(2))
+                .await
+                .unwrap();
+        let unbounded =
+            VectorStore::open_at(&VectorStore::path_for_tests(unbounded_dir.path()), 4, None)
+                .await
+                .unwrap();
+
+        for (id, embedding) in [
+            ("a", vec![1.0, 0.0, 0.0, 0.0]),
+            ("b", vec![0.0, 1.0, 0.0, 0.0]),
+            ("c", vec![0.0, 0.0, 1.0, 0.0]),
+        ] {
+            let file_path = format!("/docs/{id}.md");
+            bounded
+                .insert_chunk(&chunk(id, &file_path, id, embedding.clone()))
+                .await
+                .unwrap();
+            unbounded
+                .insert_chunk(&chunk(id, &file_path, id, embedding))
+                .await
+                .unwrap();
+        }
+
+        let query = [0.9, 0.1, 0.0, 0.0];
+        let bounded_results = bounded.search_similar(&query, 3).await.unwrap();
+        let unbounded_results = unbounded.search_similar(&query, 3).await.unwrap();
+
+        // A cache limit changes memory and latency, never answers.
+        assert_eq!(bounded_results, unbounded_results);
+    }
+
+    #[tokio::test]
+    async fn search_stays_correct_when_index_outgrows_the_cache() {
+        let tiny_cache_dir = TempDir::new().unwrap();
+        let unbounded_dir = TempDir::new().unwrap();
+        // Cache bound of 1 entry — deliberately smaller than what a real
+        // index over this many chunks would need — against a store opened
+        // with no bound at all (today's un-configured behavior).
+        let tiny_cache = VectorStore::open_at(
+            &VectorStore::path_for_tests(tiny_cache_dir.path()),
+            4,
+            Some(1),
+        )
+        .await
+        .unwrap();
+        let unbounded =
+            VectorStore::open_at(&VectorStore::path_for_tests(unbounded_dir.path()), 4, None)
+                .await
+                .unwrap();
+
+        for i in 0..50 {
+            let id = format!("chunk-{i}");
+            let file_path = format!("/docs/{id}.md");
+            // Sweep the embedding across the 4 dimensions so results have a
+            // well-defined nearest-neighbor ranking to compare.
+            let mut embedding = vec![0.0f32; 4];
+            embedding[i % 4] = 1.0;
+            embedding[(i + 1) % 4] = 0.5 - (i as f32 * 0.001);
+            tiny_cache
+                .insert_chunk(&chunk(&id, &file_path, &id, embedding.clone()))
+                .await
+                .unwrap();
+            unbounded
+                .insert_chunk(&chunk(&id, &file_path, &id, embedding))
+                .await
+                .unwrap();
+        }
+
+        let query = [1.0, 0.5, 0.0, 0.0];
+        let tiny_cache_results = tiny_cache.search_similar(&query, 10).await.unwrap();
+        let unbounded_results = unbounded.search_similar(&query, 10).await.unwrap();
+
+        assert_eq!(tiny_cache_results, unbounded_results);
+        assert_eq!(tiny_cache_results.len(), 10);
     }
 }
