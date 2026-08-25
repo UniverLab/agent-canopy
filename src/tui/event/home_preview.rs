@@ -356,6 +356,14 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         KeyCode::Char('R') if on_loop && app.loop_view_archived => {
             let _ = app.restore_selected_archived_loop();
         }
+        KeyCode::Char('t') if modifiers.contains(KeyModifiers::CONTROL) => {
+            if matches!(
+                app.selected_agent(),
+                Some(AgentEntry::Interactive(_)) | Some(AgentEntry::Terminal(_))
+            ) {
+                app.open_context_transfer_modal();
+            }
+        }
         KeyCode::F(4) => {
             if app.sidebar_layer == SidebarLayer::Knowledge {
                 app.delete_project_confirm = true;
@@ -1527,5 +1535,62 @@ mod preview_key_tests {
         let before_focus = app.loop_live_focus;
         handle_preview_key(&mut app, KeyCode::Tab, KeyModifiers::NONE).unwrap();
         assert_ne!(before_focus, app.loop_live_focus);
+    }
+
+    fn spawn_cat_agent(name: &str) -> crate::tui::agent::InteractiveAgent {
+        crate::tui::agent::InteractiveAgent::spawn(
+            Cli::new("cat"),
+            ".",
+            80,
+            24,
+            None,
+            None,
+            ratatui::style::Color::Reset,
+            Some(name),
+            &[],
+            None,
+            None,
+            None,
+        )
+        .expect("spawn cat as a stand-in interactive child")
+    }
+
+    #[test]
+    fn preview_ctrl_t_opens_context_transfer_for_interactive_selection() {
+        let mut app = app_with_agents();
+        app.interactive_agents = vec![spawn_cat_agent("interactive-1")];
+        app.agents = vec![AgentEntry::Interactive(0)];
+        app.selected = 0;
+        app.focus = Focus::Preview;
+
+        handle_preview_key(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL).unwrap();
+
+        assert!(matches!(app.focus, Focus::ContextTransfer));
+        app.interactive_agents[0].kill();
+    }
+
+    #[test]
+    fn preview_ctrl_t_does_nothing_for_non_session_selection() {
+        let mut app = app_with_agents();
+        app.focus = Focus::Preview;
+
+        handle_preview_key(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL).unwrap();
+
+        assert!(matches!(app.focus, Focus::Preview));
+    }
+
+    #[test]
+    fn preview_ctrl_t_opens_rag_transfer_not_context_transfer_while_playground_active() {
+        let mut app = app_with_agents();
+        app.interactive_agents = vec![spawn_cat_agent("interactive-2")];
+        app.agents = vec![AgentEntry::Interactive(0)];
+        app.selected = 0;
+        app.focus = Focus::Preview;
+        app.playground_active = true;
+
+        handle_preview_key(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL).unwrap();
+
+        assert!(!matches!(app.focus, Focus::ContextTransfer));
+        app.interactive_agents[0].kill();
     }
 }
