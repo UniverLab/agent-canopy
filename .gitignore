@@ -57,8 +57,10 @@ Cargo.lock
 
 # End of https://www.toptal.com/developers/gitignore/api/rust
 
-# Demo artifacts: the recorded cast and the rendered gif are generated from
-# demo.toml and weigh tens of megabytes. The published demo lives in the
-# landing repo under public/demos/.
+# Demo artifacts. The recording is tracked: it is the source of truth for
+# re-exporting the demo, and cargo already keeps the whole directory out of the
+# published crate via `exclude = ["demo/"]` in Cargo.toml — so crates.io is not
+# a reason to hide it from git. The rendered output is not tracked: this demo's
+# gif is ~36 MB (a TUI that redraws every frame compresses badly), and the
+# landing serves the mp4 at public/demos/canopy.mp4.
 demo/dist/
-demo/*.rec
