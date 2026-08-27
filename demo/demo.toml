@@ -1,6 +1,8 @@
 [demo]
 name = "demo"
 output_dir = "./dist"
+speed = "3x"
+targets = ["gif", "mp4"]
 prompt = '\[\e[1;32m\]canopy@univerlab\[\e[0m\]:\[\e[1;34m\]~\[\e[0m\]$ '
 
 [typing]
