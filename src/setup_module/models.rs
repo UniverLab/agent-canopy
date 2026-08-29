@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 #[derive(Clone)]
@@ -14,7 +14,7 @@ pub struct CanonicalServers {
     pub servers: std::collections::HashMap<String, serde_json::Value>,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Platform {
     pub name: String,
     pub config_path: String,

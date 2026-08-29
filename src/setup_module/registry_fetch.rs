@@ -458,6 +458,76 @@ fn apply_registry_refresh(home: &Path, registry: &RegistryRaw) -> Result<()> {
         );
     }
 
+    // Platform-level reconciliation: add / update / delete / unchanged.
+    // Structural comparison (field-by-field) rather than textual ensures
+    // reformatted content with identical semantics is not treated as a change.
+    let baseline_platforms: std::collections::HashMap<String, &Platform> = baseline
+        .as_ref()
+        .map(|b| b.platforms.iter().map(|p| (p.name.clone(), p)).collect())
+        .unwrap_or_default();
+
+    let mut added_platforms: Vec<String> = Vec::new();
+    let mut updated_platforms: Vec<String> = Vec::new();
+    let mut unchanged_platforms: Vec<String> = Vec::new();
+    let mut reconciled_platforms: Vec<Platform> = Vec::new();
+
+    for platform in &registry.platforms {
+        if !resolve_config_path(home, &platform.config_path).exists() {
+            continue;
+        }
+        match baseline_platforms.get(&platform.name) {
+            Some(baseline_platform) => {
+                if platforms_differ(baseline_platform, platform) {
+                    updated_platforms.push(platform.name.clone());
+                } else {
+                    unchanged_platforms.push(platform.name.clone());
+                }
+            }
+            None => {
+                added_platforms.push(platform.name.clone());
+            }
+        }
+        reconciled_platforms.push((*platform).clone());
+    }
+
+    let new_platform_names: std::collections::HashSet<String> = reconciled_platforms
+        .iter()
+        .map(|p| p.name.clone())
+        .collect();
+    let mut deleted_platforms: Vec<String> = Vec::new();
+    if let Some(b) = baseline.as_ref() {
+        for baseline_platform in &b.platforms {
+            if !new_platform_names.contains(&baseline_platform.name) {
+                // Only count as deleted if the platform's config was part of
+                // the baseline's detected set; platforms never detected are
+                // not reconciled and should not appear here, but since we
+                // only ever store detected platforms, any missing name is a
+                // genuine deletion.
+                deleted_platforms.push(baseline_platform.name.clone());
+            }
+        }
+    }
+
+    if !added_platforms.is_empty() || !updated_platforms.is_empty() || !deleted_platforms.is_empty()
+    {
+        tracing::warn!(
+            "registry refresh: {} added, {} updated, {} deleted, {} unchanged platform(s)",
+            added_platforms.len(),
+            updated_platforms.len(),
+            deleted_platforms.len(),
+            unchanged_platforms.len()
+        );
+        if !updated_platforms.is_empty() {
+            tracing::warn!("  updated: {}", updated_platforms.join(", "));
+        }
+        if !added_platforms.is_empty() {
+            tracing::warn!("  added: {}", added_platforms.join(", "));
+        }
+        if !deleted_platforms.is_empty() {
+            tracing::warn!("  deleted: {}", deleted_platforms.join(", "));
+        }
+    }
+
     // Always persist: an empty `clis` here only happens when the registry
     // confirmed every remaining entry's binary is gone (the retain rule
     // above never touches a manually-added, registry-unknown entry), so
@@ -467,6 +537,7 @@ fn apply_registry_refresh(home: &Path, registry: &RegistryRaw) -> Result<()> {
 
     RegistryBaseline {
         clis: cli_registry.available_clis,
+        platforms: reconciled_platforms,
     }
     .save(&canopy_dir)?;
 
@@ -477,6 +548,24 @@ fn apply_registry_refresh(home: &Path, registry: &RegistryRaw) -> Result<()> {
     )?;
 
     Ok(())
+}
+
+/// Structural comparison of two Platform objects. Returns true when any
+/// registry-controlled field differs. The `cli` field is excluded — it is
+/// handled by the existing CLI three-way merge.
+fn platforms_differ(old: &Platform, new: &Platform) -> bool {
+    old.config_path != new.config_path
+        || old.config_format != new.config_format
+        || old.toml_array_format != new.toml_array_format
+        || old.command_format != new.command_format
+        || old.mcp_servers_key != new.mcp_servers_key
+        || old.deprecated_keys != new.deprecated_keys
+        || old.unsupported_keys != new.unsupported_keys
+        || old.fields_mapping != new.fields_mapping
+        || old.required_fields != new.required_fields
+        || old.server_extras != new.server_extras
+        || old.skills_dir != new.skills_dir
+        || old.instruction_file != new.instruction_file
 }
 
 /// Merges one CLI's registry-owned fields into `local`, field by field: a
@@ -568,7 +657,12 @@ mod tests {
     }
 
     fn write_baseline(canopy_dir: &Path, clis: Vec<CliConfig>) {
-        RegistryBaseline { clis }.save(canopy_dir).unwrap();
+        RegistryBaseline {
+            clis,
+            ..Default::default()
+        }
+        .save(canopy_dir)
+        .unwrap();
     }
 
     #[test]
@@ -817,5 +911,267 @@ mod tests {
 
         // The stale state-table timestamp is what still governs eligibility.
         assert!(needs_refresh(dir.path()));
+    }
+
+    #[test]
+    fn platform_fields_are_updated_on_refresh() {
+        let home = TempDir::new().unwrap();
+        let canopy_dir = home.path().join(".canopy");
+
+        let old_platform = Platform {
+            name: "testcli".to_string(),
+            config_path: "testcli.marker".to_string(),
+            config_format: None,
+            toml_array_format: false,
+            command_format: "separate".to_string(),
+            mcp_servers_key: vec!["old_key".to_string()],
+            deprecated_keys: vec![],
+            unsupported_keys: vec![],
+            fields_mapping: std::collections::HashMap::new(),
+            required_fields: std::collections::HashMap::new(),
+            server_extras: std::collections::HashMap::new(),
+            skills_dir: None,
+            instruction_file: None,
+            cli: Some(serde_json::json!({"binary": "ls", "headless_mode": "--headless"})),
+        };
+
+        std::fs::write(home.path().join(&old_platform.config_path), "").unwrap();
+
+        write_config(&canopy_dir, vec![]);
+        let baseline = RegistryBaseline {
+            clis: vec![],
+            platforms: vec![old_platform],
+        };
+        baseline.save(&canopy_dir).unwrap();
+
+        let new_platform = Platform {
+            name: "testcli".to_string(),
+            config_path: "testcli.marker".to_string(),
+            config_format: None,
+            toml_array_format: false,
+            command_format: "merged".to_string(),
+            mcp_servers_key: vec!["new_key".to_string()],
+            deprecated_keys: vec![],
+            unsupported_keys: vec![],
+            fields_mapping: std::collections::HashMap::new(),
+            required_fields: std::collections::HashMap::new(),
+            server_extras: std::collections::HashMap::new(),
+            skills_dir: None,
+            instruction_file: None,
+            cli: Some(serde_json::json!({"binary": "ls", "headless_mode": "--headless"})),
+        };
+        let registry = registry_of(vec![new_platform]);
+
+        apply_registry_refresh(home.path(), &registry).unwrap();
+
+        let updated_baseline = RegistryBaseline::load(&canopy_dir).unwrap();
+        let updated_platform = updated_baseline
+            .platforms
+            .iter()
+            .find(|p| p.name == "testcli")
+            .unwrap();
+        assert_eq!(updated_platform.command_format, "merged");
+        assert_eq!(
+            updated_platform.mcp_servers_key,
+            vec!["new_key".to_string()]
+        );
+    }
+
+    #[test]
+    fn platform_unchanged_when_registry_matches_baseline() {
+        let home = TempDir::new().unwrap();
+        let canopy_dir = home.path().join(".canopy");
+
+        let platform = Platform {
+            name: "testcli".to_string(),
+            config_path: "testcli.marker".to_string(),
+            config_format: None,
+            toml_array_format: false,
+            command_format: "separate".to_string(),
+            mcp_servers_key: vec!["key".to_string()],
+            deprecated_keys: vec![],
+            unsupported_keys: vec![],
+            fields_mapping: std::collections::HashMap::new(),
+            required_fields: std::collections::HashMap::new(),
+            server_extras: std::collections::HashMap::new(),
+            skills_dir: None,
+            instruction_file: None,
+            cli: Some(serde_json::json!({"binary": "ls", "headless_mode": "--headless"})),
+        };
+        std::fs::write(home.path().join(&platform.config_path), "").unwrap();
+
+        write_config(&canopy_dir, vec![]);
+        RegistryBaseline {
+            clis: vec![],
+            platforms: vec![platform.clone()],
+        }
+        .save(&canopy_dir)
+        .unwrap();
+
+        let registry = registry_of(vec![platform]);
+        apply_registry_refresh(home.path(), &registry).unwrap();
+
+        let updated = RegistryBaseline::load(&canopy_dir).unwrap();
+        assert_eq!(updated.platforms.len(), 1);
+        assert_eq!(updated.platforms[0].command_format, "separate");
+        assert_eq!(
+            updated.platforms[0].mcp_servers_key,
+            vec!["key".to_string()]
+        );
+    }
+
+    #[test]
+    fn platform_added_when_new_in_registry() {
+        let home = TempDir::new().unwrap();
+        let canopy_dir = home.path().join(".canopy");
+
+        write_config(&canopy_dir, vec![]);
+        RegistryBaseline {
+            clis: vec![],
+            platforms: vec![],
+        }
+        .save(&canopy_dir)
+        .unwrap();
+
+        let platform = Platform {
+            name: "brandnew".to_string(),
+            config_path: "brandnew.marker".to_string(),
+            config_format: None,
+            toml_array_format: false,
+            command_format: "separate".to_string(),
+            mcp_servers_key: vec!["mcpServers".to_string()],
+            deprecated_keys: vec![],
+            unsupported_keys: vec![],
+            fields_mapping: std::collections::HashMap::new(),
+            required_fields: std::collections::HashMap::new(),
+            server_extras: std::collections::HashMap::new(),
+            skills_dir: None,
+            instruction_file: None,
+            cli: Some(serde_json::json!({"binary": "ls", "headless_mode": "--headless"})),
+        };
+        std::fs::write(home.path().join(&platform.config_path), "").unwrap();
+
+        let registry = registry_of(vec![platform]);
+        apply_registry_refresh(home.path(), &registry).unwrap();
+
+        let updated = RegistryBaseline::load(&canopy_dir).unwrap();
+        assert_eq!(updated.platforms.len(), 1);
+        assert_eq!(updated.platforms[0].name, "brandnew");
+    }
+
+    #[test]
+    fn platform_deleted_when_removed_from_registry() {
+        let home = TempDir::new().unwrap();
+        let canopy_dir = home.path().join(".canopy");
+
+        let platform = Platform {
+            name: "oldone".to_string(),
+            config_path: "oldone.marker".to_string(),
+            config_format: None,
+            toml_array_format: false,
+            command_format: "separate".to_string(),
+            mcp_servers_key: vec![],
+            deprecated_keys: vec![],
+            unsupported_keys: vec![],
+            fields_mapping: std::collections::HashMap::new(),
+            required_fields: std::collections::HashMap::new(),
+            server_extras: std::collections::HashMap::new(),
+            skills_dir: None,
+            instruction_file: None,
+            cli: Some(serde_json::json!({"binary": "ls"})),
+        };
+        std::fs::write(home.path().join(&platform.config_path), "").unwrap();
+
+        write_config(&canopy_dir, vec![]);
+        RegistryBaseline {
+            clis: vec![],
+            platforms: vec![platform],
+        }
+        .save(&canopy_dir)
+        .unwrap();
+
+        let registry = registry_of(vec![]);
+        apply_registry_refresh(home.path(), &registry).unwrap();
+
+        let updated = RegistryBaseline::load(&canopy_dir).unwrap();
+        assert!(updated.platforms.is_empty());
+    }
+
+    #[test]
+    fn refresh_is_idempotent_for_platforms() {
+        let home = TempDir::new().unwrap();
+        let canopy_dir = home.path().join(".canopy");
+
+        let old_platform = Platform {
+            name: "testcli".to_string(),
+            config_path: "testcli.marker".to_string(),
+            config_format: None,
+            toml_array_format: false,
+            command_format: "separate".to_string(),
+            mcp_servers_key: vec!["old_key".to_string()],
+            deprecated_keys: vec![],
+            unsupported_keys: vec![],
+            fields_mapping: std::collections::HashMap::new(),
+            required_fields: std::collections::HashMap::new(),
+            server_extras: std::collections::HashMap::new(),
+            skills_dir: None,
+            instruction_file: None,
+            cli: Some(serde_json::json!({"binary": "ls"})),
+        };
+        std::fs::write(home.path().join(&old_platform.config_path), "").unwrap();
+
+        write_config(&canopy_dir, vec![]);
+        RegistryBaseline {
+            clis: vec![],
+            platforms: vec![old_platform],
+        }
+        .save(&canopy_dir)
+        .unwrap();
+
+        let new_platform = Platform {
+            name: "testcli".to_string(),
+            config_path: "testcli.marker".to_string(),
+            config_format: None,
+            toml_array_format: false,
+            command_format: "merged".to_string(),
+            mcp_servers_key: vec!["new_key".to_string()],
+            deprecated_keys: vec![],
+            unsupported_keys: vec![],
+            fields_mapping: std::collections::HashMap::new(),
+            required_fields: std::collections::HashMap::new(),
+            server_extras: std::collections::HashMap::new(),
+            skills_dir: None,
+            instruction_file: None,
+            cli: Some(serde_json::json!({"binary": "ls"})),
+        };
+        let registry = registry_of(vec![new_platform]);
+
+        apply_registry_refresh(home.path(), &registry).unwrap();
+        let after_first = RegistryBaseline::load(&canopy_dir).unwrap();
+        let first_platform = after_first
+            .platforms
+            .iter()
+            .find(|p| p.name == "testcli")
+            .unwrap()
+            .clone();
+
+        apply_registry_refresh(home.path(), &registry).unwrap();
+        let after_second = RegistryBaseline::load(&canopy_dir).unwrap();
+        let second_platform = after_second
+            .platforms
+            .iter()
+            .find(|p| p.name == "testcli")
+            .unwrap();
+
+        assert_eq!(
+            first_platform.command_format,
+            second_platform.command_format
+        );
+        assert_eq!(
+            first_platform.mcp_servers_key,
+            second_platform.mcp_servers_key
+        );
+        // Second refresh must be idempotent: still exactly one platform, unchanged.
+        assert_eq!(after_second.platforms.len(), 1);
     }
 }

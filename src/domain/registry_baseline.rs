@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use super::cli_config::CliConfig;
+use crate::setup_module::models::Platform;
 
 /// File name of the baseline sidecar, relative to the canopy data directory.
 pub const REGISTRY_BASELINE_FILE_NAME: &str = "registry-baseline.toml";
@@ -22,6 +23,8 @@ pub const REGISTRY_BASELINE_FILE_NAME: &str = "registry-baseline.toml";
 pub struct RegistryBaseline {
     #[serde(default)]
     pub clis: Vec<CliConfig>,
+    #[serde(default)]
+    pub platforms: Vec<Platform>,
 }
 
 impl RegistryBaseline {
@@ -44,6 +47,13 @@ impl RegistryBaseline {
     /// about it.
     pub fn get(&self, name: &str) -> Option<&CliConfig> {
         self.clis.iter().find(|c| c.name == name)
+    }
+
+    /// The baselined view of a single platform by name, if the last refresh
+    /// knew about it.
+    #[allow(dead_code)]
+    pub fn get_platform(&self, name: &str) -> Option<&Platform> {
+        self.platforms.iter().find(|p| p.name == name)
     }
 }
 
@@ -72,6 +82,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let baseline = RegistryBaseline {
             clis: vec![sample_cli("codex"), sample_cli("cursor")],
+            ..Default::default()
         };
         baseline.save(dir.path()).unwrap();
 
@@ -86,12 +97,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         RegistryBaseline {
             clis: vec![sample_cli("codex")],
+            ..Default::default()
         }
         .save(dir.path())
         .unwrap();
 
         RegistryBaseline {
             clis: vec![sample_cli("cursor")],
+            ..Default::default()
         }
         .save(dir.path())
         .unwrap();
@@ -116,6 +129,7 @@ mod tests {
     fn get_finds_by_name() {
         let baseline = RegistryBaseline {
             clis: vec![sample_cli("a"), sample_cli("b")],
+            ..Default::default()
         };
         assert_eq!(baseline.get("b").unwrap().name, "b");
     }

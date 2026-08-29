@@ -6,6 +6,44 @@ mod setup_module {
     pub struct PlatformWithCli {
         pub cli: Option<crate::domain::cli_config::CliConfig>,
     }
+
+    pub mod models {
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+        pub struct Platform {
+            pub name: String,
+            pub config_path: String,
+            #[serde(default)]
+            pub config_format: Option<String>,
+            #[serde(default)]
+            pub toml_array_format: bool,
+            #[serde(default = "default_command_format")]
+            pub command_format: String,
+            #[serde(alias = "servers_key")]
+            pub mcp_servers_key: Vec<String>,
+            #[serde(default)]
+            pub deprecated_keys: Vec<String>,
+            #[serde(default)]
+            pub unsupported_keys: Vec<String>,
+            #[serde(default)]
+            pub fields_mapping: std::collections::HashMap<String, String>,
+            #[serde(default)]
+            pub required_fields: std::collections::HashMap<String, Vec<String>>,
+            #[serde(default)]
+            pub server_extras: std::collections::HashMap<String, serde_json::Value>,
+            #[serde(default)]
+            pub skills_dir: Option<String>,
+            #[serde(default)]
+            pub instruction_file: Option<String>,
+            #[serde(default)]
+            pub cli: Option<serde_json::Value>,
+        }
+
+        fn default_command_format() -> String {
+            "separate".to_string()
+        }
+    }
 }
 
 #[path = "../src/domain/mod.rs"]
