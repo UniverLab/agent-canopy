@@ -131,6 +131,25 @@ pub struct CliConfig {
     /// rather than just closing multi-line entry. Defaults to 1.
     #[serde(default = "default_paste_submit_presses")]
     pub paste_submit_presses: u8,
+    /// Declarative template for argv assembly. Whitespace-separated tokens;
+    /// each token may contain `{{marker}}` placeholders. Markers:
+    /// `{{prompt}}`, `{{model}}`, `{{effort}}`, `{{mcp_config}}`,
+    /// `{{session_id}}`, `{{session_flag}}`, `{{workdir}}`. Headless mode
+    /// flags (`headless_mode`) are always prepended before the template tokens;
+    /// they are not part of the template. When `None`, falls back to the legacy
+    /// fixed-order assembly (backward compat for platforms not yet migrated).
+    ///
+    /// Substitution rules:
+    /// - A token containing any unavailable marker is dropped entirely.
+    /// - A literal flag token (starts with `-`) immediately followed by a
+    ///   dropped token is also dropped (prevents orphan flags).
+    /// - A token like `--flag={{marker}}` is dropped as a unit if the marker
+    ///   is unavailable (no orphan flag possible).
+    /// - A token like `{{model}}[effort={{effort}}]` is dropped if either
+    ///   marker is unavailable; if both are available, the result is one
+    ///   argv word (no shell reinterpretation).
+    #[serde(default)]
+    pub invocation_template: Option<String>,
 }
 
 fn default_paste_submit_presses() -> u8 {
@@ -332,6 +351,7 @@ mod tests {
             paste_submit_delay_ms: None,
             paste_submit_key: None,
             paste_submit_presses: 1,
+            invocation_template: None,
         }
     }
 
@@ -554,6 +574,7 @@ mod tests {
         assert!(config.paste_submit_key.is_none());
         // Default derive uses u8::default() = 0, not the serde default fn
         assert_eq!(config.paste_submit_presses, 0);
+        assert!(config.invocation_template.is_none());
     }
 
     #[test]

@@ -62,6 +62,8 @@ pub struct CliStrategy {
     ///
     /// [`CliConfig::trust_flag`]: super::cli_config::CliConfig::trust_flag
     pub trust_flag: Option<String>,
+    /// Declarative argv template. See [`CliConfig::invocation_template`].
+    pub invocation_template: Option<String>,
 }
 
 /// A CLI's configured `binary` could not be resolved to an executable.
@@ -197,6 +199,7 @@ impl CliStrategy {
             session_id_pattern: cli_config.session_id_pattern.clone(),
             session_resume_cmd: cli_config.session_resume_cmd.clone(),
             trust_flag: cli_config.trust_flag.clone(),
+            invocation_template: cli_config.invocation_template.clone(),
         }
     }
 
@@ -276,6 +279,92 @@ impl CliStrategy {
         self.session_resume_cmd.is_some()
     }
 
+    /// Build argv from the invocation template. Returns the substituted
+    /// argv words (without headless flags) for the given marker values.
+    /// Effort and mcp_config are declared but not yet wired (CB3/CB4).
+    #[allow(clippy::too_many_arguments)]
+    fn build_argv_from_template(
+        &self,
+        template: &str,
+        prompt: &str,
+        model: Option<&str>,
+        working_dir: Option<&str>,
+        session_arg: Option<(&str, &str)>,
+        effort: Option<&str>,
+        mcp_config: Option<&str>,
+    ) -> Vec<String> {
+        let mut markers: HashMap<&str, Option<&str>> = HashMap::new();
+        // When prompt is delivered via stdin, treat {{prompt}} as unavailable
+        // so it and any preceding flag are elided from argv.
+        if self.prompt_via_stdin {
+            markers.insert("prompt", None);
+        } else {
+            markers.insert("prompt", Some(prompt));
+        }
+        markers.insert("model", model);
+        markers.insert("workdir", working_dir);
+        markers.insert("effort", effort);
+        markers.insert("mcp_config", mcp_config);
+        let session_id_val = session_arg.map(|(_, id)| id);
+        markers.insert("session_id", session_id_val);
+        let session_flag_val = session_arg.map(|(flag, _)| flag);
+        markers.insert("session_flag", session_flag_val);
+
+        let tokens: Vec<&str> = template.split_whitespace().collect();
+        let mut argv: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < tokens.len() {
+            let token = tokens[i];
+            let has_marker = token.contains("{{");
+            if !has_marker {
+                // Literal token: check if it's a flag that should be dropped
+                // because the next token (which contains a marker) is unavailable.
+                let next_dropped = if i + 1 < tokens.len() {
+                    let next = tokens[i + 1];
+                    next.contains("{{") && !Self::all_markers_available(next, &markers)
+                } else {
+                    false
+                };
+                if token.starts_with('-') && next_dropped {
+                    i += 1;
+                    continue;
+                }
+                argv.push(token.to_string());
+                i += 1;
+            } else {
+                // Token contains markers: drop entirely if any marker unavailable.
+                if Self::all_markers_available(token, &markers) {
+                    argv.push(Self::substitute_token(token, &markers));
+                }
+                i += 1;
+            }
+        }
+        argv
+    }
+
+    /// Check if all `{{marker}}` references in a token have available values.
+    fn all_markers_available(token: &str, markers: &HashMap<&str, Option<&str>>) -> bool {
+        for (name, value) in markers {
+            let placeholder = format!("{{{{{}}}}}", name);
+            if token.contains(&placeholder) && value.is_none() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Substitute all `{{marker}}` references in a token with their values.
+    fn substitute_token(token: &str, markers: &HashMap<&str, Option<&str>>) -> String {
+        let mut result = token.to_string();
+        for (name, value) in markers {
+            if let Some(val) = value {
+                let placeholder = format!("{{{{{}}}}}", name);
+                result = result.replace(&placeholder, val);
+            }
+        }
+        result
+    }
+
     /// Shared core for every headless spawn (cold or resume). `session_arg`,
     /// when `Some((flag, id))`, injects that flag + id immediately before the
     /// positional prompt so the id can never be mistaken for the prompt. The
@@ -307,48 +396,90 @@ impl CliStrategy {
             cmd.env(key, value);
         }
 
-        // Add headless mode flags (before prompt)
-        for arg in shell_words::split(&self.headless_mode).unwrap_or_default() {
-            cmd.arg(arg);
-        }
+        if let Some(ref template) = self.invocation_template {
+            // Template-driven argv assembly (CB2).
+            let argv = self.build_argv_from_template(
+                template,
+                prompt,
+                model,
+                working_dir,
+                session_arg,
+                None, // effort: CB4 will provide this
+                None, // mcp_config: CB3 will provide this
+            );
 
-        // Inject the session flag + id (set-at-spawn for a cold start, or the
-        // resume-by-id flag for a resume) before the positional prompt.
-        if let Some((flag, id)) = session_arg {
-            cmd.arg(flag).arg(id);
-        }
-
-        // Deliver the prompt via stdin (backed by an anonymous temp file) or
-        // argv, per the CLI's registered capability. argv has an OS-level
-        // per-argument/argv size cliff (Linux MAX_ARG_STRLEN, ARG_MAX) that a
-        // large composed prompt (e.g. one embedding a prior node's full
-        // output) can cross, crashing the spawn with E2BIG. Node outputs are
-        // arbitrarily large, so any CLI that can read the prompt from stdin
-        // instead should.
-        if self.prompt_via_stdin {
-            let mut file = tempfile::tempfile().context("failed to create temp file for prompt")?;
-            file.write_all(prompt.as_bytes())
-                .context("failed to write prompt to temp file")?;
-            file.seek(SeekFrom::Start(0))
-                .context("failed to rewind prompt temp file")?;
-            cmd.stdin(std::process::Stdio::from(file));
-        } else {
-            cmd.arg(prompt);
-            cmd.stdin(std::process::Stdio::null());
-        }
-
-        // Add model if specified
-        if let Some(m) = model {
-            if let Some(ref flag) = self.model_flag {
-                cmd.arg(flag).arg(m);
+            // Headless flags are always prepended (not part of template).
+            for arg in shell_words::split(&self.headless_mode).unwrap_or_default() {
+                cmd.arg(arg);
             }
-        }
 
-        // Add working directory if supported
-        if self.supports_working_dir {
-            if let Some(dir) = working_dir {
-                if let Some(ref flag) = self.working_dir_flag {
-                    cmd.arg(flag).arg(dir);
+            // Deliver prompt via stdin vs argv. When prompt_via_stdin is true,
+            // {{prompt}} is already elided (markers inserted as None), but for
+            // safety filter any argv word that equals the prompt text.
+            for arg in &argv {
+                if self.prompt_via_stdin && arg == prompt {
+                    continue;
+                }
+                cmd.arg(arg);
+            }
+
+            if self.prompt_via_stdin {
+                let mut file =
+                    tempfile::tempfile().context("failed to create temp file for prompt")?;
+                file.write_all(prompt.as_bytes())
+                    .context("failed to write prompt to temp file")?;
+                file.seek(SeekFrom::Start(0))
+                    .context("failed to rewind prompt temp file")?;
+                cmd.stdin(std::process::Stdio::from(file));
+            } else {
+                cmd.stdin(std::process::Stdio::null());
+            }
+        } else {
+            // Legacy: fixed-order assembly (unchanged).
+            // Add headless mode flags (before prompt)
+            for arg in shell_words::split(&self.headless_mode).unwrap_or_default() {
+                cmd.arg(arg);
+            }
+
+            // Inject the session flag + id (set-at-spawn for a cold start, or the
+            // resume-by-id flag for a resume) before the positional prompt.
+            if let Some((flag, id)) = session_arg {
+                cmd.arg(flag).arg(id);
+            }
+
+            // Deliver the prompt via stdin (backed by an anonymous temp file) or
+            // argv, per the CLI's registered capability. argv has an OS-level
+            // per-argument/argv size cliff (Linux MAX_ARG_STRLEN, ARG_MAX) that a
+            // large composed prompt (e.g. one embedding a prior node's full
+            // output) can cross, crashing the spawn with E2BIG. Node outputs are
+            // arbitrarily large, so any CLI that can read the prompt from stdin
+            // instead should.
+            if self.prompt_via_stdin {
+                let mut file =
+                    tempfile::tempfile().context("failed to create temp file for prompt")?;
+                file.write_all(prompt.as_bytes())
+                    .context("failed to write prompt to temp file")?;
+                file.seek(SeekFrom::Start(0))
+                    .context("failed to rewind prompt temp file")?;
+                cmd.stdin(std::process::Stdio::from(file));
+            } else {
+                cmd.arg(prompt);
+                cmd.stdin(std::process::Stdio::null());
+            }
+
+            // Add model if specified
+            if let Some(m) = model {
+                if let Some(ref flag) = self.model_flag {
+                    cmd.arg(flag).arg(m);
+                }
+            }
+
+            // Add working directory if supported
+            if self.supports_working_dir {
+                if let Some(dir) = working_dir {
+                    if let Some(ref flag) = self.working_dir_flag {
+                        cmd.arg(flag).arg(dir);
+                    }
                 }
             }
         }
@@ -446,6 +577,7 @@ mod tests {
             session_id_pattern: None,
             session_resume_cmd: None,
             trust_flag: None,
+            invocation_template: None,
         }
     }
 
@@ -881,5 +1013,209 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("my-cli"));
         assert!(msg.contains("/usr/bin:/bin"));
+    }
+
+    #[test]
+    fn template_prompt_positional_at_end() {
+        // Case 1: prompt as positional at end (majority of current platforms).
+        let mut s = sample_strategy();
+        s.invocation_template =
+            Some("--session-id {{session_id}} {{prompt}} --model {{model}}".to_string());
+        s.session_id_set_flag = Some("--session-id".to_string());
+
+        let cmd = s
+            .build_command_with_session("the prompt", Some("gpt-4"), None, Some("ses_123"))
+            .unwrap();
+        let cmd_str = format!("{:?}", cmd);
+
+        // Assert order: headless flags, then session-id, then prompt, then model.
+        let headless_at = cmd_str.find("--headless").unwrap();
+        let session_at = cmd_str.find("--session-id").unwrap();
+        let prompt_at = cmd_str.find("the prompt").unwrap();
+        let model_at = cmd_str.find("--model").unwrap();
+        assert!(headless_at < session_at);
+        assert!(session_at < prompt_at);
+        assert!(prompt_at < model_at);
+    }
+
+    #[test]
+    fn template_prompt_as_flag_value() {
+        // Case 2: prompt as value of a flag (copilot -p). The flag that consumes
+        // the next argv word must be immediately followed by the prompt, not by
+        // --session-id (which would be misinterpreted as the prompt).
+        let mut s = sample_strategy();
+        s.invocation_template = Some("-p {{prompt}} --session-id {{session_id}}".to_string());
+        s.session_id_set_flag = Some("--session-id".to_string());
+
+        let cmd = s
+            .build_command_with_session("the prompt", None, None, Some("ses_456"))
+            .unwrap();
+        let cmd_str = format!("{:?}", cmd);
+
+        // Assert: -p immediately followed by prompt (no --session-id in between).
+        let p_flag_at = cmd_str.find("-p").unwrap();
+        let prompt_at = cmd_str.find("the prompt").unwrap();
+        let session_at = cmd_str.find("--session-id").unwrap();
+        assert!(p_flag_at < prompt_at);
+        assert!(prompt_at < session_at);
+        // Critical: --session-id must NOT appear between -p and the prompt.
+        let between = &cmd_str[p_flag_at..prompt_at];
+        assert!(!between.contains("--session-id"));
+    }
+
+    #[test]
+    fn template_flag_equals_value_form() {
+        // Case 3: --flag=value in a single word.
+        let mut s = sample_strategy();
+        s.invocation_template = Some("--model={{model}} {{prompt}}".to_string());
+
+        let cmd = s.build_command("the prompt", Some("gpt-4"), None).unwrap();
+        let cmd_str = format!("{:?}", cmd);
+
+        // Assert: --model=gpt-4 is a single argv word (no space between flag and value).
+        assert!(cmd_str.contains("--model=gpt-4"));
+        // And it's distinct from --model gpt-4 (two words).
+        assert!(!cmd_str.contains("--model \"gpt-4\""));
+    }
+
+    #[test]
+    fn template_composite_marker_in_value() {
+        // Case 4: marker composed within another marker's value (cursor effort).
+        let s = sample_strategy();
+        let argv = s.build_argv_from_template(
+            "{{model}}[context=1m,effort={{effort}},fast=false] {{prompt}}",
+            "the prompt",
+            Some("claude-opus-4-8"),
+            None,
+            None,
+            Some("high"),
+            None,
+        );
+
+        assert_eq!(argv.len(), 2);
+        assert_eq!(
+            argv[0],
+            "claude-opus-4-8[context=1m,effort=high,fast=false]"
+        );
+        assert_eq!(argv[1], "the prompt");
+    }
+
+    #[test]
+    fn template_elides_unavailable_marker_and_companion_flag() {
+        // If {{model}} is unavailable, --model is also elided (no orphan flag).
+        let mut s = sample_strategy();
+        s.invocation_template = Some("--model {{model}} {{prompt}}".to_string());
+
+        let cmd = s.build_command("the prompt", None, None).unwrap();
+        let cmd_str = format!("{:?}", cmd);
+
+        assert!(cmd_str.contains("the prompt"));
+        assert!(!cmd_str.contains("--model"));
+    }
+
+    #[test]
+    fn template_elides_flag_equals_value_when_marker_unavailable() {
+        // If {{model}} is unavailable, --model={{model}} is elided as a unit.
+        let mut s = sample_strategy();
+        s.invocation_template = Some("--model={{model}} {{prompt}}".to_string());
+
+        let cmd = s.build_command("the prompt", None, None).unwrap();
+        let cmd_str = format!("{:?}", cmd);
+
+        assert!(cmd_str.contains("the prompt"));
+        assert!(!cmd_str.contains("--model"));
+    }
+
+    #[test]
+    fn template_elides_composite_when_any_marker_unavailable() {
+        // If {{effort}} is unavailable, the whole composite token is elided.
+        let s = sample_strategy();
+        let argv = s.build_argv_from_template(
+            "{{model}}[context=1m,effort={{effort}},fast=false] {{prompt}}",
+            "the prompt",
+            Some("claude-opus-4-8"),
+            None,
+            None,
+            None, // effort unavailable
+            None,
+        );
+
+        assert_eq!(argv.len(), 1);
+        assert_eq!(argv[0], "the prompt");
+    }
+
+    #[test]
+    fn template_none_falls_back_to_legacy_assembly() {
+        // Backward compat: no template → legacy fixed-order behavior.
+        let s = sample_strategy(); // invocation_template is None
+        let cmd = s
+            .build_command("the prompt", Some("gpt-4"), Some("/tmp"))
+            .unwrap();
+        let cmd_str = format!("{:?}", cmd);
+
+        // Legacy order: headless, prompt, model, workdir.
+        assert!(cmd_str.contains("--headless"));
+        assert!(cmd_str.contains("the prompt"));
+        assert!(cmd_str.contains("--model"));
+        assert!(cmd_str.contains("gpt-4"));
+        assert!(cmd_str.contains("--workdir"));
+        assert!(cmd_str.contains("/tmp"));
+    }
+
+    #[test]
+    fn template_resume_uses_correct_flag() {
+        let mut s = sample_strategy();
+        s.invocation_template = Some("{{session_flag}} {{session_id}} {{prompt}}".to_string());
+        s.session_resume_cmd = Some("--resume".to_string());
+        s.session_id_set_flag = Some("--session-id".to_string());
+
+        let cmd = s
+            .build_resume_command("ses_123", "the prompt", None, None)
+            .unwrap();
+        let cmd_str = format!("{:?}", cmd);
+
+        assert!(cmd_str.contains("--resume"));
+        assert!(cmd_str.contains("ses_123"));
+        assert!(cmd_str.contains("the prompt"));
+        // Critical: --session-id must NOT appear (resume uses --resume, not --session-id)
+        let resume_at = cmd_str.find("--resume").unwrap();
+        let ses_at = cmd_str.find("ses_123").unwrap();
+        let between = &cmd_str[resume_at..ses_at];
+        assert!(!between.contains("--session-id"));
+    }
+
+    #[test]
+    fn template_stdin_forced_elides_prompt_marker() {
+        let mut s = sample_strategy();
+        s.invocation_template = Some("--model {{model}} {{prompt}}".to_string());
+        s.prompt_via_stdin = true;
+
+        let cmd = s.build_command("the prompt", Some("gpt-4"), None).unwrap();
+        let cmd_str = format!("{:?}", cmd);
+
+        assert!(cmd_str.contains("--model"));
+        assert!(cmd_str.contains("gpt-4"));
+        // Prompt is delivered via stdin, not argv
+        assert!(!cmd_str.contains("the prompt"));
+    }
+
+    #[test]
+    fn template_workdir_marker() {
+        let mut s = sample_strategy();
+        s.invocation_template = Some("--workdir {{workdir}} {{prompt}}".to_string());
+
+        let cmd = s
+            .build_command("the prompt", None, Some("/tmp/project"))
+            .unwrap();
+        let cmd_str = format!("{:?}", cmd);
+        assert!(cmd_str.contains("--workdir"));
+        assert!(cmd_str.contains("/tmp/project"));
+        assert!(cmd_str.contains("the prompt"));
+
+        // Without workdir, --workdir is elided
+        let cmd2 = s.build_command("the prompt", None, None).unwrap();
+        let cmd_str2 = format!("{:?}", cmd2);
+        assert!(!cmd_str2.contains("--workdir"));
+        assert!(cmd_str2.contains("the prompt"));
     }
 }

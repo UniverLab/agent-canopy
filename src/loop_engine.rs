@@ -6675,6 +6675,7 @@ mod tests {
             session_id_pattern: None,
             session_resume_cmd: None,
             trust_flag: None,
+            invocation_template: None,
         }
     }
 
@@ -6817,6 +6818,7 @@ esac
             session_id_pattern: Some(r#""id"\s*:\s*"([^"]+)""#.to_string()),
             session_resume_cmd: None,
             trust_flag: None,
+            invocation_template: None,
         }
     }
 
