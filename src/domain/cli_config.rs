@@ -150,6 +150,26 @@ pub struct CliConfig {
     ///   argv word (no shell reinterpretation).
     #[serde(default)]
     pub invocation_template: Option<String>,
+    /// Declarative effort support. See [`EffortDeclaration`].
+    #[serde(default)]
+    pub effort_declaration: Option<EffortDeclaration>,
+}
+
+/// How this CLI exposes reasoning-effort control.
+/// `None` = not yet declared (legacy compat); `Some` with empty `values`
+/// = explicitly not supported; `Some` with values = supported.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EffortDeclaration {
+    /// The flag/form used to pass effort. Examples:
+    /// - `"--effort"` (claude) — simple flag, value as next arg
+    /// - `"-c"` (codex) — value is `'model_reasoning_effort="{{effort}}"'`
+    /// - `""` (platforms that don't support effort)
+    #[serde(default)]
+    pub form: Option<String>,
+    /// The values this CLI accepts, e.g. `["low", "medium", "high"]`.
+    /// Empty = not supported.
+    #[serde(default)]
+    pub values: Vec<String>,
 }
 
 fn default_paste_submit_presses() -> u8 {
@@ -352,6 +372,7 @@ mod tests {
             paste_submit_key: None,
             paste_submit_presses: 1,
             invocation_template: None,
+            effort_declaration: None,
         }
     }
 
@@ -575,6 +596,7 @@ mod tests {
         // Default derive uses u8::default() = 0, not the serde default fn
         assert_eq!(config.paste_submit_presses, 0);
         assert!(config.invocation_template.is_none());
+        assert!(config.effort_declaration.is_none());
     }
 
     #[test]
@@ -664,5 +686,45 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: CliConfig = serde_json::from_str(&json).unwrap();
         assert!(deserialized.accent_color.is_none());
+    }
+
+    #[test]
+    fn effort_declaration_deserialize_supported() {
+        let json =
+            r#"{"effort_declaration": {"form": "--effort", "values": ["low", "medium", "high"]}}"#;
+        let config: CliConfig = serde_json::from_str(json).unwrap();
+        assert!(config.effort_declaration.is_some());
+        let decl = config.effort_declaration.unwrap();
+        assert_eq!(decl.form, Some("--effort".to_string()));
+        assert_eq!(decl.values, vec!["low", "medium", "high"]);
+    }
+
+    #[test]
+    fn effort_declaration_deserialize_not_supported() {
+        let json = r#"{"effort_declaration": {"form": "", "values": []}}"#;
+        let config: CliConfig = serde_json::from_str(json).unwrap();
+        assert!(config.effort_declaration.is_some());
+        let decl = config.effort_declaration.unwrap();
+        assert_eq!(decl.form, Some(String::new()));
+        assert!(decl.values.is_empty());
+    }
+
+    #[test]
+    fn effort_declaration_absent_when_not_in_json() {
+        let json = r#"{}"#;
+        let config: CliConfig = serde_json::from_str(json).unwrap();
+        assert!(config.effort_declaration.is_none());
+    }
+
+    #[test]
+    fn effort_declaration_serde_roundtrip() {
+        let mut config = sample_cli_config();
+        config.effort_declaration = Some(EffortDeclaration {
+            form: Some("--variant".to_string()),
+            values: vec!["high".to_string(), "max".to_string()],
+        });
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: CliConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.effort_declaration, config.effort_declaration);
     }
 }

@@ -1218,4 +1218,361 @@ mod tests {
         assert!(!cmd_str2.contains("--workdir"));
         assert!(cmd_str2.contains("the prompt"));
     }
+
+    // ── CB3: real registry templates as fixtures ─────────────────
+    // All `invocation_template` strings below are copied verbatim from
+    // `canopy-registry` commit `0f90d39` (branch `feat/invocation-template`),
+    // one fixture per platform. Tests call `build_argv_from_template` directly
+    // and assert the exact argv word list — no CLI is spawned, no network.
+    fn strategy_with_template(template: &str) -> CliStrategy {
+        let mut s = sample_strategy();
+        s.headless_mode = String::new();
+        s.invocation_template = Some(template.to_string());
+        s
+    }
+
+    #[test]
+    fn real_template_copilot_prompt_immediately_after_p_flag() {
+        // Source: canopy-registry/platforms/copilot.toml @ 0f90d39
+        // Template: "-p {{prompt}} {{session_flag}} {{session_id}} --model {{model}}"
+        let template = "-p {{prompt}} {{session_flag}} {{session_id}} --model {{model}}";
+        let s = strategy_with_template(template);
+
+        // Without session: session markers elided, no orphan flags.
+        let argv = s.build_argv_from_template(
+            template,
+            "fix the bug",
+            Some("gpt-4"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(argv, vec!["-p", "fix the bug", "--model", "gpt-4"]);
+        assert_eq!(argv[0], "-p");
+        assert_eq!(argv[1], "fix the bug");
+
+        // With session: -p still immediately followed by prompt, not by session flag.
+        let argv2 = s.build_argv_from_template(
+            template,
+            "fix the bug",
+            Some("gpt-4"),
+            None,
+            Some(("--session-id", "uuid-123")),
+            None,
+            None,
+        );
+        assert_eq!(
+            argv2,
+            vec![
+                "-p",
+                "fix the bug",
+                "--session-id",
+                "uuid-123",
+                "--model",
+                "gpt-4"
+            ]
+        );
+        assert_eq!(argv2[0], "-p");
+        assert_eq!(argv2[1], "fix the bug");
+        // Guard against the RS1 regression: `copilot -p --session-id <uuid> <PROMPT>`
+        assert_ne!(argv2[1], "--session-id");
+    }
+
+    #[test]
+    fn real_template_claude_argv_with_effort() {
+        // Source: canopy-registry/platforms/claude.toml @ 0f90d39
+        // Template: "--effort {{effort}} --model {{model}} {{session_flag}} {{session_id}} {{prompt}}"
+        let template =
+            "--effort {{effort}} --model {{model}} {{session_flag}} {{session_id}} {{prompt}}";
+        let s = strategy_with_template(template);
+        let argv = s.build_argv_from_template(
+            template,
+            "do the thing",
+            Some("claude-opus-4-8"),
+            None,
+            Some(("--session-id", "ses_abc")),
+            Some("high"),
+            None,
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "--effort",
+                "high",
+                "--model",
+                "claude-opus-4-8",
+                "--session-id",
+                "ses_abc",
+                "do the thing"
+            ]
+        );
+    }
+
+    #[test]
+    fn real_template_claude_argv_without_effort_elides_flag() {
+        // Source: canopy-registry/platforms/claude.toml @ 0f90d39
+        let template =
+            "--effort {{effort}} --model {{model}} {{session_flag}} {{session_id}} {{prompt}}";
+        let s = strategy_with_template(template);
+        let argv = s.build_argv_from_template(
+            template,
+            "do the thing",
+            Some("claude-opus-4-8"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(argv, vec!["--model", "claude-opus-4-8", "do the thing"]);
+        assert!(!argv.contains(&"--effort".to_string()));
+        assert!(!argv.contains(&"--session-id".to_string()));
+    }
+
+    #[test]
+    fn real_template_gemini_session_flag_before_prompt() {
+        // Source: canopy-registry/platforms/gemini.toml @ 0f90d39
+        // Template: "{{session_flag}} {{session_id}} -p {{prompt}} --model {{model}}"
+        let template = "{{session_flag}} {{session_id}} -p {{prompt}} --model {{model}}";
+        let s = strategy_with_template(template);
+        let argv = s.build_argv_from_template(
+            template,
+            "analyze this",
+            Some("gemini-2.5-pro"),
+            None,
+            Some(("--session-id", "ses_gem")),
+            None,
+            None,
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "--session-id",
+                "ses_gem",
+                "-p",
+                "analyze this",
+                "--model",
+                "gemini-2.5-pro"
+            ]
+        );
+        // Without session: session markers elided, no orphan flags.
+        let argv2 = s.build_argv_from_template(
+            template,
+            "analyze this",
+            Some("gemini-2.5-pro"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            argv2,
+            vec!["-p", "analyze this", "--model", "gemini-2.5-pro"]
+        );
+    }
+
+    #[test]
+    fn real_template_codex_effort_as_single_argv_word() {
+        // Source: canopy-registry/platforms/codex.toml @ 0f90d39
+        // Template: "-m {{model}} -C {{workdir}} -c 'model_reasoning_effort=\"{{effort}}\"' {{prompt}}"
+        let template =
+            "-m {{model}} -C {{workdir}} -c 'model_reasoning_effort=\"{{effort}}\"' {{prompt}}";
+        let s = strategy_with_template(template);
+        let argv = s.build_argv_from_template(
+            template,
+            "refactor",
+            Some("o3"),
+            Some("/proj"),
+            None,
+            Some("high"),
+            None,
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "-m",
+                "o3",
+                "-C",
+                "/proj",
+                "-c",
+                "'model_reasoning_effort=\"high\"'",
+                "refactor"
+            ]
+        );
+        // Verify -c value is one single argv word containing the quotes.
+        assert_eq!(argv[4], "-c");
+        assert_eq!(argv[5], "'model_reasoning_effort=\"high\"'");
+        // Without effort: flag and quoted token elided together.
+        let argv2 = s.build_argv_from_template(
+            template,
+            "refactor",
+            Some("o3"),
+            Some("/proj"),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(argv2, vec!["-m", "o3", "-C", "/proj", "refactor"]);
+        assert!(!argv2.contains(&"-c".to_string()));
+    }
+
+    #[test]
+    fn real_template_cursor_effort_embedded_in_model() {
+        // Source: canopy-registry/platforms/cursor.toml @ 0f90d39
+        // Template: "{{model}}[context=1m,effort={{effort}},fast=false] --workspace {{workdir}} {{prompt}}"
+        let template =
+            "{{model}}[context=1m,effort={{effort}},fast=false] --workspace {{workdir}} {{prompt}}";
+        let s = strategy_with_template(template);
+        let argv = s.build_argv_from_template(
+            template,
+            "build ui",
+            Some("claude-opus-4-8"),
+            Some("/proj"),
+            None,
+            Some("high"),
+            None,
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "claude-opus-4-8[context=1m,effort=high,fast=false]",
+                "--workspace",
+                "/proj",
+                "build ui"
+            ]
+        );
+        assert_eq!(
+            argv[0],
+            "claude-opus-4-8[context=1m,effort=high,fast=false]"
+        );
+    }
+
+    #[test]
+    fn real_template_cursor_effort_elided_when_unavailable() {
+        // Source: canopy-registry/platforms/cursor.toml @ 0f90d39
+        let template =
+            "{{model}}[context=1m,effort={{effort}},fast=false] --workspace {{workdir}} {{prompt}}";
+        let s = strategy_with_template(template);
+        // Without effort, the whole composite token must be elided (both markers required).
+        let argv = s.build_argv_from_template(
+            template,
+            "build ui",
+            Some("claude-opus-4-8"),
+            Some("/proj"),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(argv, vec!["--workspace", "/proj", "build ui"]);
+        assert!(!argv.iter().any(|w| w.contains("effort=")));
+    }
+
+    #[test]
+    fn real_template_cline_thinking_flag() {
+        // Source: canopy-registry/platforms/cline.toml @ 0f90d39
+        // Template: "--thinking {{effort}} -m {{model}} -c {{workdir}} {{prompt}}"
+        let template = "--thinking {{effort}} -m {{model}} -c {{workdir}} {{prompt}}";
+        let s = strategy_with_template(template);
+        let argv = s.build_argv_from_template(
+            template,
+            "explain",
+            Some("gpt-4"),
+            Some("/proj"),
+            None,
+            Some("medium"),
+            None,
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "--thinking",
+                "medium",
+                "-m",
+                "gpt-4",
+                "-c",
+                "/proj",
+                "explain"
+            ]
+        );
+        // Without effort: no orphan --thinking flag.
+        let argv2 = s.build_argv_from_template(
+            template,
+            "explain",
+            Some("gpt-4"),
+            Some("/proj"),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(argv2, vec!["-m", "gpt-4", "-c", "/proj", "explain"]);
+        assert!(!argv2.contains(&"--thinking".to_string()));
+    }
+
+    #[test]
+    fn real_template_opencode_variant_flag() {
+        // Source: canopy-registry/platforms/opencode.toml @ 0f90d39
+        // Template: "-m {{model}} --dir {{workdir}} --variant {{effort}} {{prompt}}"
+        let template = "-m {{model}} --dir {{workdir}} --variant {{effort}} {{prompt}}";
+        let s = strategy_with_template(template);
+        let argv = s.build_argv_from_template(
+            template,
+            "implement",
+            Some("opencode/big-pickle"),
+            Some("/proj"),
+            None,
+            Some("max"),
+            None,
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "-m",
+                "opencode/big-pickle",
+                "--dir",
+                "/proj",
+                "--variant",
+                "max",
+                "implement"
+            ]
+        );
+        // Without effort: --variant elided.
+        let argv2 = s.build_argv_from_template(
+            template,
+            "implement",
+            Some("opencode/big-pickle"),
+            Some("/proj"),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            argv2,
+            vec!["-m", "opencode/big-pickle", "--dir", "/proj", "implement"]
+        );
+        assert!(!argv2.contains(&"--variant".to_string()));
+    }
+
+    #[test]
+    fn real_template_antigravity_no_effort_elides_cleanly() {
+        // Source: canopy-registry/platforms/antigravity.toml @ 0f90d39
+        // Template: "-p {{prompt}} --add-dir {{workdir}}"
+        // effort_declaration = { form = "", values = [] } — declared as not supporting effort.
+        let template = "-p {{prompt}} --add-dir {{workdir}}";
+        let s = strategy_with_template(template);
+        let argv =
+            s.build_argv_from_template(template, "hello", None, Some("/proj"), None, None, None);
+        assert_eq!(argv, vec!["-p", "hello", "--add-dir", "/proj"]);
+        // Even if effort is passed, template has no {{effort}} marker so argv is unchanged.
+        let argv2 = s.build_argv_from_template(
+            template,
+            "hello",
+            None,
+            Some("/proj"),
+            None,
+            Some("high"),
+            None,
+        );
+        assert_eq!(argv2, vec!["-p", "hello", "--add-dir", "/proj"]);
+        assert!(!argv2.iter().any(|w| w.contains("high")));
+    }
 }
