@@ -3244,13 +3244,12 @@ mod tests {
     fn send_edit_adjust_day() {
         let mut dialog = SimplePromptDialog::new();
         dialog.send_begin_edit();
+        let before = dialog.send_edit.as_ref().unwrap().value;
         dialog.send_edit.as_mut().unwrap().field = 2; // day
         dialog.send_edit_adjust(1);
         let edit = dialog.send_edit.unwrap();
-        assert_eq!(
-            edit.value.day(),
-            chrono::Local::now().naive_local().day() + 1
-        );
+        let expected = (before + chrono::Duration::days(1)).day();
+        assert_eq!(edit.value.day(), expected);
     }
 
     #[test]
