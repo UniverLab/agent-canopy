@@ -1708,25 +1708,40 @@ impl SimplePromptDialog {
 
     // ── Scheduled-sends list panel (B33) ────────────────────────────────
 
-    /// Load a queued scheduled send into the Raw tab for in-place editing.
-    /// A scheduled send stores a single already-resolved string, which the
-    /// Normal field-stack cannot un-compose — so the Raw free-text field is its
-    /// natural home. Switches to the Raw tab, loads the prompt (cursor at end),
-    /// preseeds the send control with the entry's fire time, and records the id
-    /// so re-confirming a schedule replaces that row instead of duplicating it.
+    /// Load a queued scheduled send for in-place editing. If `builder_state`
+    /// carries valid JSON, the structured view is restored (Normal tab with
+    /// its sections); otherwise falls back to the Raw tab with the flat text.
+    /// Records the id so re-confirming a schedule replaces that row.
     pub fn load_scheduled_for_edit(
         &mut self,
         id: &str,
         prompt: &str,
         fire_local: chrono::NaiveDateTime,
+        builder_state: Option<&str>,
     ) {
-        self.active_tab = PromptTab::Raw;
         self.raw_preview = None;
         self.raw_preview_scroll = 0;
-        self.sections
-            .insert(RAW_SECTION_ID.to_string(), prompt.to_string());
-        let end = prompt.chars().count();
-        self.section_cursors.insert(RAW_SECTION_ID.to_string(), end);
+
+        let restored =
+            builder_state.and_then(|json| serde_json::from_str::<PersistedBuilderState>(json).ok());
+
+        if let Some(state) = restored {
+            state.restore_into(self);
+            let has_raw_only =
+                state.sections.len() == 1 && state.sections.contains_key(RAW_SECTION_ID);
+            if has_raw_only {
+                self.active_tab = PromptTab::Raw;
+            } else {
+                self.active_tab = PromptTab::Normal;
+            }
+        } else {
+            self.active_tab = PromptTab::Raw;
+            self.sections
+                .insert(RAW_SECTION_ID.to_string(), prompt.to_string());
+            let end = prompt.chars().count();
+            self.section_cursors.insert(RAW_SECTION_ID.to_string(), end);
+        }
+
         // Raw's first focus target is the buffer (index 1), never the send control.
         self.focused_section = 1;
         self.editing_scheduled_id = Some(id.to_string());
@@ -2559,7 +2574,7 @@ mod tests {
             .unwrap()
             .and_hms_opt(9, 15, 0)
             .unwrap();
-        dialog.load_scheduled_for_edit("ss-42", "deliver this later", fire);
+        dialog.load_scheduled_for_edit("ss-42", "deliver this later", fire, None);
 
         assert_eq!(dialog.active_tab, PromptTab::Raw);
         assert_eq!(dialog.raw_text(), "deliver this later");
@@ -2573,6 +2588,71 @@ mod tests {
         // Focus lands on the raw buffer, and the list focus is released.
         assert_eq!(dialog.focused_section, 1);
         assert!(dialog.scheduled_list_selected.is_none());
+    }
+
+    #[test]
+    fn load_scheduled_for_edit_with_builder_state_restores_structured_view() {
+        let mut source = SimplePromptDialog::new();
+        source.set_tab(PromptTab::Normal);
+        source.set_section_content("instruction_1", "do the thing".to_string());
+        source.set_section_content("context_1", "some context".to_string());
+
+        let snapshot = PersistedBuilderState::from_dialog(&source);
+        let json = serde_json::to_string(&snapshot).unwrap();
+
+        let mut dialog = SimplePromptDialog::new();
+        let fire = chrono::NaiveDate::from_ymd_opt(2030, 6, 15)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap();
+        dialog.load_scheduled_for_edit(
+            "ss-struct",
+            "ignored when state present",
+            fire,
+            Some(&json),
+        );
+
+        assert_eq!(dialog.active_tab, PromptTab::Normal);
+        assert_eq!(
+            dialog.sections.get("instruction_1").map(|s| s.as_str()),
+            Some("do the thing")
+        );
+        assert_eq!(
+            dialog.sections.get("context_1").map(|s| s.as_str()),
+            Some("some context")
+        );
+        assert_eq!(dialog.editing_scheduled_id.as_deref(), Some("ss-struct"));
+        assert_eq!(dialog.send_choice, SendChoice::Date);
+        assert_eq!(dialog.send_at, Some(fire));
+        assert!(dialog.scheduled_list_selected.is_none());
+    }
+
+    #[test]
+    fn load_scheduled_for_edit_with_none_builder_state_falls_back_to_raw() {
+        let mut dialog = SimplePromptDialog::new();
+        let fire = chrono::NaiveDate::from_ymd_opt(2030, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        dialog.load_scheduled_for_edit("ss-old", "plain text prompt", fire, None);
+
+        assert_eq!(dialog.active_tab, PromptTab::Raw);
+        assert_eq!(dialog.raw_text(), "plain text prompt");
+        assert_eq!(dialog.editing_scheduled_id.as_deref(), Some("ss-old"));
+    }
+
+    #[test]
+    fn load_scheduled_for_edit_with_invalid_json_falls_back_to_raw() {
+        let mut dialog = SimplePromptDialog::new();
+        let fire = chrono::NaiveDate::from_ymd_opt(2030, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        dialog.load_scheduled_for_edit("ss-bad", "fallback text", fire, Some("not valid json{{{"));
+
+        assert_eq!(dialog.active_tab, PromptTab::Raw);
+        assert_eq!(dialog.raw_text(), "fallback text");
+        assert_eq!(dialog.editing_scheduled_id.as_deref(), Some("ss-bad"));
     }
 
     #[test]

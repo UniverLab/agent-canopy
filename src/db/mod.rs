@@ -611,6 +611,21 @@ impl Database {
                 .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
         }
 
+        let has_scheduled_builder_state: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('scheduled_sends') WHERE name = 'builder_state'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_scheduled_builder_state {
+            conn.execute(
+                "ALTER TABLE scheduled_sends ADD COLUMN builder_state TEXT",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
         let has_session_type: bool = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('interactive_sessions') WHERE name = 'session_type'",

@@ -1217,6 +1217,7 @@ mod tests {
             "sess-1",
             Some(workdir),
             chrono::Utc::now(),
+            None,
         )
         .unwrap();
         db.insert_failed_scheduled_send(

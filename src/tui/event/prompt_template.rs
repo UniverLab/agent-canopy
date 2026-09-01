@@ -1408,10 +1408,31 @@ fn schedule_send_prompt(app: &mut App, prompt: &str, when: chrono::NaiveDateTime
     // Persist the scheduled send.
     let id = format!("ss-{}", uuid::Uuid::new_v4());
     let workdir_opt = (!target_workdir.is_empty()).then_some(target_workdir.as_str());
-    if let Err(e) =
-        app.db
-            .insert_scheduled_send(&id, prompt, &target_session_id, workdir_opt, fire_time)
-    {
+    // Only persist the structured view when it is what's being sent. A
+    // non-empty Raw buffer sends verbatim (see `resolve_outgoing_prompt`), so
+    // the structured sections no longer describe the outgoing text — raw
+    // wins, and the structure is discarded (spec CP2). Reopening such a row
+    // then falls back to the Raw tab with the flat text, rather than
+    // restoring stale sections the user never sees.
+    let raw_wins = app.simple_prompt_dialog.as_ref().is_some_and(|d| {
+        d.active_tab == crate::tui::app::dialog::PromptTab::Raw && !d.raw_is_empty()
+    });
+    let builder_state_json = if raw_wins {
+        None
+    } else {
+        app.simple_prompt_dialog
+            .as_ref()
+            .map(crate::tui::app::dialog::PersistedBuilderState::from_dialog)
+            .and_then(|state| serde_json::to_string(&state).ok())
+    };
+    if let Err(e) = app.db.insert_scheduled_send(
+        &id,
+        prompt,
+        &target_session_id,
+        workdir_opt,
+        fire_time,
+        builder_state_json.as_deref(),
+    ) {
         tracing::error!("Failed to persist scheduled send: {e}");
         crate::domain::notification::send_notification(
             "Schedule failed",
@@ -1552,8 +1573,9 @@ fn handle_scheduled_list_key(app: &mut App, code: KeyCode, modifiers: KeyModifie
             let send = &pending[sel];
             let fire_local = send.fire_at.with_timezone(&chrono::Local).naive_local();
             let (id, prompt) = (send.id.clone(), send.prompt.clone());
+            let builder_state = send.builder_state.clone();
             if let Some(dialog) = app.simple_prompt_dialog.as_mut() {
-                dialog.load_scheduled_for_edit(&id, &prompt, fire_local);
+                dialog.load_scheduled_for_edit(&id, &prompt, fire_local, builder_state.as_deref());
             }
         }
         _ => {}
@@ -2079,6 +2101,52 @@ mod recall_last_prompt_tests {
         );
         // Raw fallback is a single section — no structure to have restored.
         assert_eq!(dialog.enabled_sections, vec!["instruction_1".to_string()]);
+    }
+
+    /// A scheduled send confirmed from the Raw tab persists NO structured
+    /// state: the raw buffer is what gets delivered, so the stale sections are
+    /// discarded and reopening the row lands back in Raw with the flat text
+    /// (spec CP2: raw wins when it is out of sync with the structure).
+    #[test]
+    fn scheduling_from_the_raw_tab_discards_structure_and_reopens_in_raw() {
+        use crate::tui::app::dialog::{PromptTab, SimplePromptDialog, RAW_SECTION_ID};
+
+        let (mut app, _dir) = test_app();
+        app.open_simple_prompt_dialog(None);
+        {
+            let dialog = app.simple_prompt_dialog.as_mut().unwrap();
+            dialog.set_section_content("instruction_1", "stale structured leftover".to_string());
+            dialog.set_tab(PromptTab::Raw);
+            dialog.set_section_content(RAW_SECTION_ID, "raw text that wins".to_string());
+        }
+
+        let when = (chrono::Local::now() + chrono::Duration::hours(1)).naive_local();
+        super::schedule_send_prompt(&mut app, "raw text that wins", when);
+
+        let rows = app
+            .db
+            .list_due_scheduled_sends(chrono::Utc::now() + chrono::Duration::hours(2))
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|s| s.prompt == "raw text that wins")
+            .expect("scheduled row persisted");
+        assert!(
+            row.builder_state.is_none(),
+            "a raw-tab schedule must not persist structured state"
+        );
+
+        // Reopening lands in Raw with the flat text — never the stale section.
+        let mut fresh = SimplePromptDialog::new();
+        let fire_local = row.fire_at.with_timezone(&chrono::Local).naive_local();
+        fresh.load_scheduled_for_edit(
+            &row.id,
+            &row.prompt,
+            fire_local,
+            row.builder_state.as_deref(),
+        );
+        assert_eq!(fresh.active_tab, PromptTab::Raw);
+        assert_eq!(fresh.raw_text(), "raw text that wins");
     }
 }
 

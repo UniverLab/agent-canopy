@@ -342,6 +342,7 @@ mod tests {
                 "session-that-no-longer-exists",
                 Some(workdir),
                 fire_at,
+                None,
             )
             .expect("insert scheduled send");
 
@@ -386,7 +387,7 @@ mod tests {
         assert!(!app.scheduled_sends_restored);
         let fire_at = chrono::Utc::now() - chrono::Duration::minutes(5);
         app.db
-            .insert_scheduled_send("ss-held", "later", "resuming-session", None, fire_at)
+            .insert_scheduled_send("ss-held", "later", "resuming-session", None, fire_at, None)
             .expect("insert scheduled send");
 
         app.deliver_due_scheduled_sends();
@@ -415,7 +416,14 @@ mod tests {
         let workdir = "/home/user/gone-project";
         let fire_at = chrono::Utc::now() - chrono::Duration::minutes(1);
         app.db
-            .insert_scheduled_send("ss-gone", "orphan", "gone-session", Some(workdir), fire_at)
+            .insert_scheduled_send(
+                "ss-gone",
+                "orphan",
+                "gone-session",
+                Some(workdir),
+                fire_at,
+                None,
+            )
             .expect("insert scheduled send");
         // No sessions were resumed.
         assert!(app.interactive_agents.is_empty());
