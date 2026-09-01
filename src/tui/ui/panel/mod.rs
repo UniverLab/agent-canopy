@@ -92,9 +92,10 @@ fn recent_project_session_summaries(
     project: &crate::domain::project::Project,
     limit: usize,
 ) -> Vec<(String, String)> {
-    let Ok(nodes) =
-        app.db
-            .search_intelligence_nodes(&project.path, Some("session"), limit.saturating_mul(4))
+    let Ok(nodes) = app
+        .db
+        .search_intelligence_nodes(&project.path, Some("session"), limit.saturating_mul(4))
+        .map(|r| r.results)
     else {
         return Vec::new();
     };

@@ -51,6 +51,12 @@ pub struct IntelligenceNodeInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntelligenceSearchResult {
+    pub results: Vec<IntelligenceNodeRecord>,
+    pub examined_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntelligenceGraphWalk {
     pub root: IntelligenceNodeRecord,
     pub nodes: Vec<IntelligenceNodeRecord>,
@@ -282,10 +288,17 @@ impl Database {
         query: &str,
         kind: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<IntelligenceNodeRecord>> {
+    ) -> Result<IntelligenceSearchResult> {
         let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+
+        // Always report how many nodes would be considered for this kind filter.
+        let examined_count = self.count_intelligence_nodes_for_search(kind)?;
+
         if terms.is_empty() {
-            return Ok(Vec::new());
+            return Ok(IntelligenceSearchResult {
+                results: Vec::new(),
+                examined_count,
+            });
         }
 
         let conn = self
@@ -293,28 +306,55 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
 
-        // ?1 is reserved for kind and the final placeholder is the limit; each
-        // term gets its own placeholder in between, reused across all indexed
-        // fields so terms are ANDed together and fields are ORed.
-        let term_clauses: Vec<String> = (0..terms.len())
-            .map(|i| {
-                let p = i + 2;
-                format!(
-                    "(instr(lower(id), ?{p}) > 0 OR instr(lower(kind), ?{p}) > 0 OR \
-                     instr(lower(title), ?{p}) > 0 OR instr(lower(body), ?{p}) > 0 OR \
-                     instr(lower(coalesce(metadata, '')), ?{p}) > 0)"
-                )
-            })
-            .collect();
+        // Ranking follows the spec guideline: order primarily by how many
+        // distinct query terms match anywhere, then break ties by *where* they
+        // match (a title hit outweighs a body hit), then by recency. The WHERE
+        // clause keeps OR semantics — any term matching any field is enough, so
+        // extra words degrade a node's rank but never drop it from the results.
+        let mut match_count_parts: Vec<String> = Vec::with_capacity(terms.len());
+        let mut score_parts: Vec<String> = Vec::with_capacity(terms.len() * 5);
+        let mut or_clauses: Vec<String> = Vec::with_capacity(terms.len() * 5);
+        for i in 0..terms.len() {
+            let p = i + 2;
+            score_parts.push(format!(
+                "(CASE WHEN instr(lower(title), ?{p}) > 0 THEN 3 ELSE 0 END)"
+            ));
+            score_parts.push(format!(
+                "(CASE WHEN instr(lower(body), ?{p}) > 0 THEN 1 ELSE 0 END)"
+            ));
+            score_parts.push(format!(
+                "(CASE WHEN instr(lower(coalesce(metadata, '')), ?{p}) > 0 THEN 1 ELSE 0 END)"
+            ));
+            score_parts.push(format!(
+                "(CASE WHEN instr(lower(id), ?{p}) > 0 THEN 1 ELSE 0 END)"
+            ));
+            score_parts.push(format!(
+                "(CASE WHEN instr(lower(kind), ?{p}) > 0 THEN 1 ELSE 0 END)"
+            ));
+
+            let term_fields: Vec<String> =
+                ["id", "kind", "title", "body", "coalesce(metadata, '')"]
+                    .into_iter()
+                    .map(|field| format!("instr(lower({field}), ?{p}) > 0"))
+                    .collect();
+            match_count_parts.push(format!(
+                "(CASE WHEN {} THEN 1 ELSE 0 END)",
+                term_fields.join(" OR ")
+            ));
+            or_clauses.extend(term_fields);
+        }
+
+        let match_count_expr = match_count_parts.join(" + ");
+        let score_expr = score_parts.join(" + ");
+        let or_clause = or_clauses.join(" OR ");
         let limit_placeholder = terms.len() + 2;
         let sql = format!(
-            "SELECT id, kind, title, body, metadata, project_hash, session_id, created_at, updated_at
-             FROM intelligence_nodes
-             WHERE (?1 IS NULL OR kind = ?1)
-               AND {}
-             ORDER BY updated_at DESC
-             LIMIT ?{limit_placeholder}",
-            term_clauses.join(" AND ")
+            "SELECT id, kind, title, body, metadata, project_hash, session_id, created_at, updated_at, \
+             ({match_count_expr}) AS match_count, ({score_expr}) AS score \
+             FROM intelligence_nodes \
+             WHERE (?1 IS NULL OR kind = ?1) AND ({or_clause}) \
+             ORDER BY match_count DESC, score DESC, updated_at DESC \
+             LIMIT ?{limit_placeholder}"
         );
 
         let mut stmt = conn.prepare(&sql)?;
@@ -327,7 +367,21 @@ impl Database {
         let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(Box::as_ref).collect();
 
         let rows = stmt.query_map(param_refs.as_slice(), Self::read_intelligence_node)?;
-        Ok(rows.filter_map(|row| row.ok()).collect())
+        let results: Vec<IntelligenceNodeRecord> = rows.filter_map(|row| row.ok()).collect();
+        Ok(IntelligenceSearchResult {
+            results,
+            examined_count,
+        })
+    }
+
+    fn count_intelligence_nodes_for_search(&self, kind: Option<&str>) -> Result<i64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn
+            .prepare("SELECT COUNT(*) FROM intelligence_nodes WHERE (?1 IS NULL OR kind = ?1)")?;
+        Ok(stmt.query_row(rusqlite::params![kind], |row| row.get(0))?)
     }
 
     pub fn list_recent_intelligence_edges(

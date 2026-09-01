@@ -38,7 +38,9 @@ pub struct LaunchpadDialog {
 
 impl LaunchpadDialog {
     pub fn for_workdir(db: &Database, workdir: &str) -> Result<Self> {
-        let nodes = db.search_intelligence_nodes(workdir, Some("session"), 50)?;
+        let nodes = db
+            .search_intelligence_nodes(workdir, Some("session"), 50)?
+            .results;
         let mut recent_missions: Vec<LaunchpadContext> = Vec::new();
         let mut seen_titles = std::collections::HashSet::new();
         let mut run_summary: Option<String> = None;

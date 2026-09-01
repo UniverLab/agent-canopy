@@ -550,8 +550,8 @@ fn test_intelligence_upsert_search_and_graph_walk() {
     let search = db
         .search_intelligence_nodes("connection", Some("pattern"), 10)
         .unwrap();
-    assert_eq!(search.len(), 1);
-    assert_eq!(search[0].id, "node-b");
+    assert_eq!(search.results.len(), 1);
+    assert_eq!(search.results[0].id, "node-b");
 
     let walk = db
         .walk_intelligence_graph(&base.id, 2)
@@ -577,25 +577,170 @@ fn test_intelligence_search_tokenizes_multi_term_queries() {
     })
     .unwrap();
 
-    // 1. Terms in different places of the body both match with AND semantics.
+    // 1. Both terms match the same node — still found (OR semantics).
     let both = db
         .search_intelligence_nodes("alpha beta", None, 10)
         .unwrap();
-    assert_eq!(both.len(), 1);
-    assert_eq!(both[0].id, "node-multi");
+    assert_eq!(both.results.len(), 1);
+    assert_eq!(both.results[0].id, "node-multi");
 
-    // 2. A query with one absent term should not match.
-    let missing = db.search_intelligence_nodes("alpha zzz", None, 10).unwrap();
-    assert!(missing.is_empty());
+    // 2. One present term + one absent term now returns the partial match (OR).
+    let partial = db.search_intelligence_nodes("alpha zzz", None, 10).unwrap();
+    assert_eq!(partial.results.len(), 1);
+    assert_eq!(partial.results[0].id, "node-multi");
+    assert_eq!(partial.examined_count, 1);
 
     // 3. Single-term queries keep working as before.
     let single = db.search_intelligence_nodes("beta", None, 10).unwrap();
-    assert_eq!(single.len(), 1);
-    assert_eq!(single[0].id, "node-multi");
+    assert_eq!(single.results.len(), 1);
+    assert_eq!(single.results[0].id, "node-multi");
 
-    // 4. Empty/whitespace-only queries return an empty list.
+    // 4. Empty/whitespace-only queries return empty results but report count.
     let empty = db.search_intelligence_nodes("   ", None, 10).unwrap();
-    assert!(empty.is_empty());
+    assert!(empty.results.is_empty());
+    assert_eq!(empty.examined_count, 1);
+}
+
+#[test]
+fn test_intelligence_search_or_ranking() {
+    let db = test_db();
+
+    // Node A: matches "retry" in body only → 1pt
+    db.upsert_intelligence_node(IntelligenceNodeInput {
+        id: Some("node-a".to_string()),
+        kind: "fact".to_string(),
+        title: "Unrelated title".to_string(),
+        body: "Discusses retry strategies.".to_string(),
+        metadata: None,
+        project_hash: Some("proj".to_string()),
+        session_id: None,
+        relations: None,
+    })
+    .unwrap();
+
+    // Node B: matches "retry" in title + "backoff" in body → 2 terms
+    db.upsert_intelligence_node(IntelligenceNodeInput {
+        id: Some("node-b".to_string()),
+        kind: "fact".to_string(),
+        title: "Retry patterns".to_string(),
+        body: "Covers backoff strategies.".to_string(),
+        metadata: None,
+        project_hash: Some("proj".to_string()),
+        session_id: None,
+        relations: None,
+    })
+    .unwrap();
+
+    // Node C: matches "retry", "backoff" and "future" in body → 3 terms
+    db.upsert_intelligence_node(IntelligenceNodeInput {
+        id: Some("node-c".to_string()),
+        kind: "fact".to_string(),
+        title: "Overview".to_string(),
+        body: "Retry logic, backoff, and future plans.".to_string(),
+        metadata: None,
+        project_hash: Some("proj".to_string()),
+        session_id: None,
+        relations: None,
+    })
+    .unwrap();
+
+    // Node D: matches nothing
+    db.upsert_intelligence_node(IntelligenceNodeInput {
+        id: Some("node-d".to_string()),
+        kind: "fact".to_string(),
+        title: "Other".to_string(),
+        body: "Nothing relevant.".to_string(),
+        metadata: None,
+        project_hash: Some("proj".to_string()),
+        session_id: None,
+        relations: None,
+    })
+    .unwrap();
+
+    // Seven-word query whose matching terms are spread across the nodes; the
+    // four trailing words match nothing and must degrade rank without emptying.
+    let result = db
+        .search_intelligence_nodes(
+            "retry backoff future missingp missingq missingr missings",
+            None,
+            10,
+        )
+        .unwrap();
+
+    // Primary ordering is number of matching terms (guideline), so the
+    // three-term body match outranks the two-term match that includes a title:
+    //   node-c: 3 terms (retry+backoff+future, all body)
+    //   node-b: 2 terms (retry in title, backoff in body)
+    //   node-a: 1 term  (retry in body)
+    //   node-d: excluded
+    assert_eq!(result.results.len(), 3);
+    assert_eq!(result.results[0].id, "node-c");
+    assert_eq!(result.results[1].id, "node-b");
+    assert_eq!(result.results[2].id, "node-a");
+    assert_eq!(result.examined_count, 4);
+}
+
+#[test]
+fn test_intelligence_search_ranks_title_over_body_on_equal_term_count() {
+    let db = test_db();
+
+    // Both nodes match exactly one term; the tiebreak is *where* it matches.
+    // The title match is inserted first so that a naive recency-only ordering
+    // would put the body match on top — only the field weighting flips them.
+    db.upsert_intelligence_node(IntelligenceNodeInput {
+        id: Some("title-hit".to_string()),
+        kind: "fact".to_string(),
+        title: "Resilience".to_string(),
+        body: "Body text with no query terms at all.".to_string(),
+        metadata: None,
+        project_hash: Some("proj".to_string()),
+        session_id: None,
+        relations: None,
+    })
+    .unwrap();
+    db.upsert_intelligence_node(IntelligenceNodeInput {
+        id: Some("body-hit".to_string()),
+        kind: "fact".to_string(),
+        title: "Generic heading".to_string(),
+        body: "A passing mention of resilience somewhere in here.".to_string(),
+        metadata: None,
+        project_hash: Some("proj".to_string()),
+        session_id: None,
+        relations: None,
+    })
+    .unwrap();
+
+    let result = db
+        .search_intelligence_nodes("resilience", None, 10)
+        .unwrap();
+    assert_eq!(result.results.len(), 2);
+    assert_eq!(result.results[0].id, "title-hit");
+    assert_eq!(result.results[1].id, "body-hit");
+}
+
+#[test]
+fn test_intelligence_search_zero_match_returns_count() {
+    let db = test_db();
+
+    for i in 0..3 {
+        db.upsert_intelligence_node(IntelligenceNodeInput {
+            id: Some(format!("node-{i}")),
+            kind: "fact".to_string(),
+            title: format!("Fact {i}"),
+            body: format!("Body {i}"),
+            metadata: None,
+            project_hash: Some("proj".to_string()),
+            session_id: None,
+            relations: None,
+        })
+        .unwrap();
+    }
+
+    let result = db
+        .search_intelligence_nodes("xyzzy nonexistent", None, 10)
+        .unwrap();
+    assert_eq!(result.results.len(), 0);
+    assert_eq!(result.examined_count, 3);
 }
 
 // ── Loop persistence ──────────────────────────────────────────

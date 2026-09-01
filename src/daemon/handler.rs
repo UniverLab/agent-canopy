@@ -3291,7 +3291,7 @@ impl TaskTriggerHandler {
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_nursery(parts.as_ref())?;
         let limit = params.limit.unwrap_or(10).min(50);
-        let results = self
+        let search_result = self
             .db
             .search_intelligence_nodes(&params.query, params.kind.as_deref(), limit)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -3299,8 +3299,9 @@ impl TaskTriggerHandler {
         let out = serde_json::json!({
             "query": params.query,
             "kind": params.kind,
-            "count": results.len(),
-            "results": results.iter().map(intelligence_node_json).collect::<Vec<_>>(),
+            "count": search_result.results.len(),
+            "examined_count": search_result.examined_count,
+            "results": search_result.results.iter().map(intelligence_node_json).collect::<Vec<_>>(),
         });
 
         Ok(CallToolResult::success(vec![Content::text(
