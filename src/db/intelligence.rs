@@ -77,10 +77,58 @@ pub struct IntelligenceProjectDependencyRecord {
 }
 
 impl Database {
+    /// Resolve a node id prefix (e.g. "3a476c63") to exactly one node.
+    /// - Ok(Some(full_id)) if exactly one node matches
+    /// - Ok(None) if no nodes match
+    /// - Err with candidate listing if multiple nodes match (ambiguous)
+    ///
+    /// Search is global (no project_hash filter) so a prefix that lives in a
+    /// different project hash still resolves — the corpus is split across two
+    /// hashes and callers cite ids by prefix regardless of project.
+    pub fn resolve_node_id_by_prefix(&self, prefix: &str) -> Result<Option<String>> {
+        if prefix.is_empty() {
+            return Ok(None);
+        }
+        // If exact match exists, return it without LIKE scan — handles full
+        // UUIDs and avoids ambiguous error when the exact id happens to share
+        // a prefix with others.
+        if let Some(_node) = self.get_intelligence_node(prefix)? {
+            return Ok(Some(prefix.to_string()));
+        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        // Escape LIKE metacharacters so a prefix that happens to contain '%' or
+        // '_' (or the escape char itself) is matched literally rather than as a
+        // wildcard — otherwise a stray '_' would silently over-match and turn a
+        // single valid target into a spurious "ambiguous" error.
+        let escaped_prefix = prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let mut stmt =
+            conn.prepare("SELECT id FROM intelligence_nodes WHERE id LIKE ?1 || '%' ESCAPE '\\'")?;
+        let ids: Vec<String> = stmt
+            .query_map(rusqlite::params![escaped_prefix], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        match ids.len() {
+            0 => Ok(None),
+            1 => Ok(Some(ids.into_iter().next().unwrap())),
+            _ => Err(anyhow!(
+                "Ambiguous node id prefix '{}' matches {} nodes: {}",
+                prefix,
+                ids.len(),
+                ids.join(", ")
+            )),
+        }
+    }
+
     pub fn upsert_intelligence_node(
         &self,
         input: IntelligenceNodeInput,
-    ) -> Result<IntelligenceNodeRecord> {
+    ) -> Result<(IntelligenceNodeRecord, bool)> {
         let node_id = input.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let now = Utc::now().timestamp();
         let metadata = input.metadata.map(|value| value.to_string());
@@ -88,6 +136,16 @@ impl Database {
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        // Determine creation vs update before the INSERT — ON CONFLICT would
+        // otherwise hide the distinction. For auto-generated ids this is always
+        // creation. Done inside the same lock as the INSERT to avoid a race
+        // where another thread inserts between the check and the insert.
+        let was_created: bool = {
+            let mut stmt =
+                conn.prepare("SELECT 1 FROM intelligence_nodes WHERE id = ?1 LIMIT 1")?;
+            let mut rows = stmt.query(rusqlite::params![&node_id])?;
+            rows.next()?.is_none()
+        };
 
         conn.execute(
             "INSERT INTO intelligence_nodes (
@@ -137,8 +195,10 @@ impl Database {
         }
 
         drop(conn);
-        self.get_intelligence_node(&node_id)?
-            .ok_or_else(|| anyhow!("Failed to load intelligence node '{}'", node_id))
+        let record = self
+            .get_intelligence_node(&node_id)?
+            .ok_or_else(|| anyhow!("Failed to load intelligence node '{}'", node_id))?;
+        Ok((record, was_created))
     }
 
     pub fn get_intelligence_node(&self, id: &str) -> Result<Option<IntelligenceNodeRecord>> {
@@ -553,6 +613,7 @@ impl Database {
             session_id: None,
             relations: None,
         })
+        .map(|(record, _created)| record)
     }
 
     /// Create missing `kind='project'` root nodes for already-registered
@@ -1013,5 +1074,254 @@ mod tests {
 
         let projects = db.list_intelligence_projects(None, 100).unwrap();
         assert_eq!(projects.len(), 2);
+    }
+
+    #[test]
+    fn resolve_prefix_unique_match() {
+        let db = test_db();
+        let full = "3a476c63-6b4a-4860-9c18-1c784b40a4b2";
+        // A decoy that shares the first six characters but diverges inside the
+        // 8-char prefix — the LIKE must actually discriminate, not just return
+        // the only row in the table.
+        for id in [full, "3a476c99-dead-4860-9c18-1c784b40a4b2"] {
+            db.upsert_intelligence_node(IntelligenceNodeInput {
+                id: Some(id.to_string()),
+                kind: "fact".to_string(),
+                title: "Original".to_string(),
+                body: "body".to_string(),
+                metadata: None,
+                project_hash: Some("proj-a".to_string()),
+                session_id: None,
+                relations: None,
+            })
+            .unwrap();
+        }
+        let resolved = db.resolve_node_id_by_prefix("3a476c63").unwrap();
+        assert_eq!(resolved, Some(full.to_string()));
+    }
+
+    #[test]
+    fn resolve_prefix_ambiguous() {
+        let db = test_db();
+        let id1 = "abc123-0000-0000-0000-000000000001";
+        let id2 = "abc456-0000-0000-0000-000000000002";
+        for id in [id1, id2] {
+            db.upsert_intelligence_node(IntelligenceNodeInput {
+                id: Some(id.to_string()),
+                kind: "fact".to_string(),
+                title: format!("Node {id}"),
+                body: "body".to_string(),
+                metadata: None,
+                project_hash: Some("proj-a".to_string()),
+                session_id: None,
+                relations: None,
+            })
+            .unwrap();
+        }
+        let err = db.resolve_node_id_by_prefix("abc").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Ambiguous"),
+            "expected ambiguous error, got: {msg}"
+        );
+        assert!(msg.contains(id1), "expected candidate {id1} in: {msg}");
+        assert!(msg.contains(id2), "expected candidate {id2} in: {msg}");
+    }
+
+    #[test]
+    fn resolve_prefix_no_match() {
+        let db = test_db();
+        db.upsert_intelligence_node(IntelligenceNodeInput {
+            id: Some("xyz-0000-0000-0000-000000000001".to_string()),
+            kind: "fact".to_string(),
+            title: "X".to_string(),
+            body: "body".to_string(),
+            metadata: None,
+            project_hash: Some("proj-a".to_string()),
+            session_id: None,
+            relations: None,
+        })
+        .unwrap();
+        let resolved = db.resolve_node_id_by_prefix("abc").unwrap();
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn resolve_prefix_treats_like_wildcards_literally() {
+        let db = test_db();
+        // Two ids that differ only at position 2. A naive `LIKE prefix || '%'`
+        // where `prefix` contains '_' would match BOTH and raise a bogus
+        // "ambiguous" error; escaped, "ab_cd" matches neither.
+        for id in [
+            "ab1cd-0000-0000-0000-000000000001",
+            "ab2cd-0000-0000-0000-000000000002",
+        ] {
+            db.upsert_intelligence_node(IntelligenceNodeInput {
+                id: Some(id.to_string()),
+                kind: "fact".to_string(),
+                title: "N".to_string(),
+                body: "body".to_string(),
+                metadata: None,
+                project_hash: Some("proj-a".to_string()),
+                session_id: None,
+                relations: None,
+            })
+            .unwrap();
+        }
+        let resolved = db.resolve_node_id_by_prefix("ab_cd").unwrap();
+        assert_eq!(resolved, None, "'_' must be a literal, not a wildcard");
+    }
+
+    #[test]
+    fn upsert_returns_created_true_for_new_node() {
+        let db = test_db();
+        let (_record, created) = db
+            .upsert_intelligence_node(IntelligenceNodeInput {
+                id: Some("new-node-1".to_string()),
+                kind: "fact".to_string(),
+                title: "First".to_string(),
+                body: "body".to_string(),
+                metadata: None,
+                project_hash: Some("proj-a".to_string()),
+                session_id: None,
+                relations: None,
+            })
+            .unwrap();
+        assert!(created, "expected created=true for new node");
+    }
+
+    #[test]
+    fn upsert_returns_created_false_for_existing_node() {
+        let db = test_db();
+        let id = "existing-node-1";
+        db.upsert_intelligence_node(IntelligenceNodeInput {
+            id: Some(id.to_string()),
+            kind: "fact".to_string(),
+            title: "First".to_string(),
+            body: "body".to_string(),
+            metadata: None,
+            project_hash: Some("proj-a".to_string()),
+            session_id: None,
+            relations: None,
+        })
+        .unwrap();
+        let (record, created) = db
+            .upsert_intelligence_node(IntelligenceNodeInput {
+                id: Some(id.to_string()),
+                kind: "fact".to_string(),
+                title: "Updated".to_string(),
+                body: "body2".to_string(),
+                metadata: None,
+                project_hash: Some("proj-a".to_string()),
+                session_id: None,
+                relations: None,
+            })
+            .unwrap();
+        assert!(!created, "expected created=false for update");
+        assert_eq!(record.title, "Updated");
+    }
+
+    #[test]
+    fn intelligence_upsert_with_prefix_updates_existing() {
+        let db = test_db();
+        let full = "3a476c63-6b4a-4860-9c18-1c784b40a4b2";
+        db.upsert_intelligence_node(IntelligenceNodeInput {
+            id: Some(full.to_string()),
+            kind: "fact".to_string(),
+            title: "Original".to_string(),
+            body: "body".to_string(),
+            metadata: None,
+            project_hash: Some("proj-a".to_string()),
+            session_id: None,
+            relations: None,
+        })
+        .unwrap();
+        // Simulate handler prefix resolution: 8-char prefix should resolve to full.
+        let resolved = db.resolve_node_id_by_prefix("3a476c63").unwrap().unwrap();
+        assert_eq!(resolved, full);
+        let (record, created) = db
+            .upsert_intelligence_node(IntelligenceNodeInput {
+                id: Some(resolved),
+                kind: "fact".to_string(),
+                title: "Updated via prefix".to_string(),
+                body: "body2".to_string(),
+                metadata: None,
+                project_hash: Some("proj-a".to_string()),
+                session_id: None,
+                relations: None,
+            })
+            .unwrap();
+        assert!(!created, "prefix upsert should be update, not create");
+        assert_eq!(record.id, full);
+        assert_eq!(record.title, "Updated via prefix");
+        // Ensure no duplicate was created.
+        let all = db.list_intelligence_nodes(None, 100).unwrap();
+        assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn intelligence_upsert_with_ambiguous_prefix_errors() {
+        let db = test_db();
+        let id1 = "abc123-0000-0000-0000-000000000001";
+        let id2 = "abc456-0000-0000-0000-000000000002";
+        for id in [id1, id2] {
+            db.upsert_intelligence_node(IntelligenceNodeInput {
+                id: Some(id.to_string()),
+                kind: "fact".to_string(),
+                title: format!("Node {id}"),
+                body: "body".to_string(),
+                metadata: None,
+                project_hash: Some("proj-a".to_string()),
+                session_id: None,
+                relations: None,
+            })
+            .unwrap();
+        }
+        let err = db.resolve_node_id_by_prefix("abc").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Ambiguous"));
+        assert!(msg.contains(id1));
+        assert!(msg.contains(id2));
+    }
+
+    #[test]
+    fn intelligence_graph_walk_with_prefix() {
+        let db = test_db();
+        let full = "deadbeef-0000-0000-0000-000000000001";
+        db.upsert_intelligence_node(IntelligenceNodeInput {
+            id: Some(full.to_string()),
+            kind: "fact".to_string(),
+            title: "Root".to_string(),
+            body: "body".to_string(),
+            metadata: None,
+            project_hash: Some("proj-a".to_string()),
+            session_id: None,
+            relations: None,
+        })
+        .unwrap();
+        let resolved = db.resolve_node_id_by_prefix("deadbeef").unwrap().unwrap();
+        let walk = db.walk_intelligence_graph(&resolved, 1).unwrap().unwrap();
+        assert_eq!(walk.root.id, full);
+    }
+
+    #[test]
+    fn intelligence_delete_node_with_prefix() {
+        let db = test_db();
+        let full = "feedface-0000-0000-0000-000000000001";
+        db.upsert_intelligence_node(IntelligenceNodeInput {
+            id: Some(full.to_string()),
+            kind: "fact".to_string(),
+            title: "To delete".to_string(),
+            body: "body".to_string(),
+            metadata: None,
+            project_hash: Some("proj-a".to_string()),
+            session_id: None,
+            relations: None,
+        })
+        .unwrap();
+        let resolved = db.resolve_node_id_by_prefix("feedface").unwrap().unwrap();
+        let removed = db.delete_intelligence_node(&resolved).unwrap();
+        assert_eq!(removed, Some(0));
+        assert!(db.get_intelligence_node(full).unwrap().is_none());
     }
 }

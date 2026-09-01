@@ -3245,8 +3245,28 @@ impl TaskTriggerHandler {
             Some(crate::domain::project::workdir_hash(&workdir))
         });
 
+        // Track an explicit id that resolved to nothing: the caller almost
+        // certainly mistyped or truncated the id of a node they meant to
+        // update, so a bare `created: true` (which also fires for the normal
+        // auto-generated-id path) is not a loud enough signal — see CB13.
+        let mut unresolved_explicit_id: Option<String> = None;
+        let resolved_id = match &params.node_data.id {
+            Some(raw_id) if !raw_id.trim().is_empty() => {
+                let raw_id = raw_id.trim();
+                match self.db.resolve_node_id_by_prefix(raw_id) {
+                    Ok(Some(full)) => Some(full),
+                    Ok(None) => {
+                        unresolved_explicit_id = Some(raw_id.to_string());
+                        Some(raw_id.to_string())
+                    }
+                    Err(e) => return Ok(error_result(&e.to_string())),
+                }
+            }
+            _ => params.node_data.id.clone(),
+        };
+
         let node = crate::db::intelligence::IntelligenceNodeInput {
-            id: params.node_data.id,
+            id: resolved_id,
             kind: params.node_data.kind,
             title: params.node_data.title,
             body: params.node_data.body,
@@ -3267,16 +3287,28 @@ impl TaskTriggerHandler {
             }),
         };
 
-        let record = self
+        let (record, created) = self
             .db
             .upsert_intelligence_node(node)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
+        let mut out = serde_json::json!({
+            "node": intelligence_node_json(&record),
+            "created": created,
+        });
+        if created {
+            if let Some(bad_id) = unresolved_explicit_id {
+                out["warning"] = serde_json::json!(format!(
+                    "Created a NEW node with id '{}'. No existing node matched that id or \
+                     prefix, so nothing was updated. If you meant to update an existing node, \
+                     the id you passed is wrong — look it up with intelligence_search first.",
+                    bad_id
+                ));
+            }
+        }
+
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&serde_json::json!({
-                "node": intelligence_node_json(&record),
-            }))
-            .unwrap_or_default(),
+            serde_json::to_string_pretty(&out).unwrap_or_default(),
         )]))
     }
 
@@ -3318,7 +3350,17 @@ impl TaskTriggerHandler {
         Parameters(params): Parameters<IntelligenceGraphWalkParams>,
     ) -> Result<CallToolResult, McpError> {
         let depth = params.depth.unwrap_or(2).min(8);
-        let graph = match self.db.walk_intelligence_graph(&params.node_id, depth) {
+        let effective_id = match self.db.resolve_node_id_by_prefix(&params.node_id) {
+            Ok(Some(full)) => full,
+            Ok(None) => {
+                return Ok(error_result(&format!(
+                    "Intelligence node '{}' not found.",
+                    params.node_id
+                )))
+            }
+            Err(e) => return Ok(error_result(&e.to_string())),
+        };
+        let graph = match self.db.walk_intelligence_graph(&effective_id, depth) {
             Ok(Some(g)) => g,
             Ok(None) => {
                 return Ok(error_result(&format!(
@@ -3361,7 +3403,18 @@ impl TaskTriggerHandler {
         let effective_project_hash =
             self.effective_project_hash_for_delete(parts.as_ref(), params.project_hash.as_deref());
 
-        let node = match self.db.get_intelligence_node(&params.node_id) {
+        let effective_id = match self.db.resolve_node_id_by_prefix(&params.node_id) {
+            Ok(Some(full)) => full,
+            Ok(None) => {
+                return Ok(error_result(&format!(
+                    "Intelligence node '{}' not found.",
+                    params.node_id
+                )))
+            }
+            Err(e) => return Ok(error_result(&e.to_string())),
+        };
+
+        let node = match self.db.get_intelligence_node(&effective_id) {
             Ok(Some(node)) => node,
             Ok(None) => {
                 return Ok(error_result(&format!(
@@ -3378,7 +3431,7 @@ impl TaskTriggerHandler {
             return Ok(scope_error);
         }
 
-        let relations_removed = match self.db.delete_intelligence_node(&params.node_id) {
+        let relations_removed = match self.db.delete_intelligence_node(&effective_id) {
             Ok(Some(count)) => count,
             Ok(None) => {
                 return Ok(error_result(&format!(
@@ -3391,7 +3444,7 @@ impl TaskTriggerHandler {
 
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&serde_json::json!({
-                "deleted_node_id": params.node_id,
+                "deleted_node_id": effective_id,
                 "relations_removed": relations_removed,
             }))
             .unwrap_or_default(),
@@ -18875,5 +18928,361 @@ mod endpoint_tests {
             }))
             .await;
         assert!(missing.is_err());
+    }
+
+    // ── intelligence prefix resolution + created field ──────────────
+
+    #[tokio::test]
+    async fn intelligence_upsert_returns_created_true_for_new_node() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let _agent_guard = AgentIdVar::set("agent-intel-created-1");
+
+        let result = handler
+            .intelligence_upsert(
+                Parameters(IntelligenceUpsertParams {
+                    node_data: IntelligenceNodeParams {
+                        id: Some("brand-new-node-1".to_string()),
+                        kind: "fact".to_string(),
+                        title: "First time".to_string(),
+                        body: "body".to_string(),
+                        metadata: None,
+                        project_hash: None,
+                        session_id: None,
+                        relations: None,
+                    },
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!is_err(&result), "{}", text(&result));
+        let body = raw_text(&result);
+        assert!(
+            body.contains("\"created\": true"),
+            "expected created:true in: {body}"
+        );
+        // An explicit id that matched nothing must produce a loud warning, not
+        // just `created: true` (which also fires on the auto-id path).
+        assert!(
+            body.contains("\"warning\":") && body.contains("brand-new-node-1"),
+            "explicit unknown id should warn about creating a new node: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn intelligence_upsert_returns_created_false_for_update() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let _agent_guard = AgentIdVar::set("agent-intel-created-2");
+
+        let first = handler
+            .intelligence_upsert(
+                Parameters(IntelligenceUpsertParams {
+                    node_data: IntelligenceNodeParams {
+                        id: Some("update-me-1".to_string()),
+                        kind: "fact".to_string(),
+                        title: "Original".to_string(),
+                        body: "v1".to_string(),
+                        metadata: None,
+                        project_hash: None,
+                        session_id: None,
+                        relations: None,
+                    },
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!is_err(&first), "{}", text(&first));
+        assert!(
+            raw_text(&first).contains("\"created\": true"),
+            "first upsert should be created:true: {}",
+            raw_text(&first)
+        );
+
+        let second = handler
+            .intelligence_upsert(
+                Parameters(IntelligenceUpsertParams {
+                    node_data: IntelligenceNodeParams {
+                        id: Some("update-me-1".to_string()),
+                        kind: "fact".to_string(),
+                        title: "Updated".to_string(),
+                        body: "v2".to_string(),
+                        metadata: None,
+                        project_hash: None,
+                        session_id: None,
+                        relations: None,
+                    },
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!is_err(&second), "{}", text(&second));
+        assert!(
+            raw_text(&second).contains("\"created\": false"),
+            "second upsert should be created:false: {}",
+            raw_text(&second)
+        );
+        // Updating an existing node must not carry the "created a new node"
+        // warning.
+        assert!(
+            !raw_text(&second).contains("\"warning\":"),
+            "update path should not warn: {}",
+            raw_text(&second)
+        );
+    }
+
+    #[tokio::test]
+    async fn intelligence_upsert_with_prefix_updates_existing() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let _agent_guard = AgentIdVar::set("agent-intel-prefix-1");
+
+        let full_id = "3a476c63-6b4a-4860-9c18-1c784b40a4b2";
+        let create = handler
+            .intelligence_upsert(
+                Parameters(IntelligenceUpsertParams {
+                    node_data: IntelligenceNodeParams {
+                        id: Some(full_id.to_string()),
+                        kind: "fact".to_string(),
+                        title: "Original".to_string(),
+                        body: "v1".to_string(),
+                        metadata: None,
+                        project_hash: None,
+                        session_id: None,
+                        relations: None,
+                    },
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!is_err(&create), "{}", text(&create));
+
+        let via_prefix = handler
+            .intelligence_upsert(
+                Parameters(IntelligenceUpsertParams {
+                    node_data: IntelligenceNodeParams {
+                        id: Some("3a476c63".to_string()),
+                        kind: "fact".to_string(),
+                        title: "Updated via prefix".to_string(),
+                        body: "v2".to_string(),
+                        metadata: None,
+                        project_hash: None,
+                        session_id: None,
+                        relations: None,
+                    },
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!is_err(&via_prefix), "{}", text(&via_prefix));
+        let body = raw_text(&via_prefix);
+        assert!(
+            body.contains("\"created\": false"),
+            "prefix upsert should update, not create: {body}"
+        );
+        assert!(
+            body.contains(full_id),
+            "response should contain the full UUID: {body}"
+        );
+        assert!(
+            body.contains("Updated via prefix"),
+            "response should contain the new title: {body}"
+        );
+
+        let searched = handler
+            .intelligence_search(
+                Parameters(IntelligenceSearchParams {
+                    query: "Updated via prefix".to_string(),
+                    kind: Some("fact".to_string()),
+                    limit: Some(10),
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        let search_body = raw_text(&searched);
+        assert!(
+            search_body.contains(full_id),
+            "the node should exist with updated title: {search_body}"
+        );
+        assert!(
+            search_body.contains("\"count\": 1"),
+            "exactly one node must match — the prefix upsert must not have created a duplicate: {search_body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn intelligence_upsert_with_ambiguous_prefix_errors() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let _agent_guard = AgentIdVar::set("agent-intel-prefix-ambig");
+
+        let id1 = "abc12300-0000-0000-0000-000000000001";
+        let id2 = "abc45600-0000-0000-0000-000000000002";
+        for id in [id1, id2] {
+            let r = handler
+                .intelligence_upsert(
+                    Parameters(IntelligenceUpsertParams {
+                        node_data: IntelligenceNodeParams {
+                            id: Some(id.to_string()),
+                            kind: "fact".to_string(),
+                            title: format!("Node {id}"),
+                            body: "body".to_string(),
+                            metadata: None,
+                            project_hash: None,
+                            session_id: None,
+                            relations: None,
+                        },
+                    }),
+                    OptionalExtension(None),
+                )
+                .await
+                .unwrap();
+            assert!(!is_err(&r), "{}", text(&r));
+        }
+
+        let ambiguous = handler
+            .intelligence_upsert(
+                Parameters(IntelligenceUpsertParams {
+                    node_data: IntelligenceNodeParams {
+                        id: Some("abc".to_string()),
+                        kind: "fact".to_string(),
+                        title: "Should fail".to_string(),
+                        body: "body".to_string(),
+                        metadata: None,
+                        project_hash: None,
+                        session_id: None,
+                        relations: None,
+                    },
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(
+            is_err(&ambiguous),
+            "ambiguous prefix should error: {}",
+            text(&ambiguous)
+        );
+        let err_body = raw_text(&ambiguous);
+        assert!(
+            err_body.contains("Ambiguous"),
+            "error should mention Ambiguous: {err_body}"
+        );
+        assert!(
+            err_body.contains(id1),
+            "error should list candidate {id1}: {err_body}"
+        );
+        assert!(
+            err_body.contains(id2),
+            "error should list candidate {id2}: {err_body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn intelligence_graph_walk_with_prefix() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let _agent_guard = AgentIdVar::set("agent-intel-walk-prefix");
+
+        let full_id = "deadbeef-0000-0000-0000-000000000001";
+        let created = handler
+            .intelligence_upsert(
+                Parameters(IntelligenceUpsertParams {
+                    node_data: IntelligenceNodeParams {
+                        id: Some(full_id.to_string()),
+                        kind: "fact".to_string(),
+                        title: "Walk me".to_string(),
+                        body: "body".to_string(),
+                        metadata: None,
+                        project_hash: None,
+                        session_id: None,
+                        relations: None,
+                    },
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!is_err(&created), "{}", text(&created));
+
+        let walked = handler
+            .intelligence_graph_walk(Parameters(IntelligenceGraphWalkParams {
+                node_id: "deadbeef".to_string(),
+                depth: Some(1),
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !is_err(&walked),
+            "prefix walk should succeed: {}",
+            text(&walked)
+        );
+        let body = raw_text(&walked);
+        assert!(
+            body.contains(full_id),
+            "walk response should contain the full UUID: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn intelligence_delete_node_with_prefix() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let _agent_guard = AgentIdVar::set("agent-intel-del-prefix");
+
+        let full_id = "feedface-0000-0000-0000-000000000001";
+        let created = handler
+            .intelligence_upsert(
+                Parameters(IntelligenceUpsertParams {
+                    node_data: IntelligenceNodeParams {
+                        id: Some(full_id.to_string()),
+                        kind: "fact".to_string(),
+                        title: "Delete me by prefix".to_string(),
+                        body: "body".to_string(),
+                        metadata: None,
+                        project_hash: None,
+                        session_id: None,
+                        relations: None,
+                    },
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!is_err(&created), "{}", text(&created));
+
+        let deleted = handler
+            .intelligence_delete_node(
+                Parameters(IntelligenceDeleteNodeParams {
+                    node_id: "feedface".to_string(),
+                    project_hash: None,
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !is_err(&deleted),
+            "prefix delete should succeed: {}",
+            text(&deleted)
+        );
+        let body = raw_text(&deleted);
+        assert!(
+            body.contains(full_id),
+            "delete response should contain the full UUID: {body}"
+        );
+
+        let walked = handler
+            .intelligence_graph_walk(Parameters(IntelligenceGraphWalkParams {
+                node_id: full_id.to_string(),
+                depth: Some(1),
+            }))
+            .await
+            .unwrap();
+        assert!(
+            is_err(&walked),
+            "node should be gone after prefix delete: {}",
+            text(&walked)
+        );
     }
 }

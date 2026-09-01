@@ -545,7 +545,8 @@ fn test_intelligence_upsert_search_and_graph_walk() {
                 weight: Some(0.8),
             }]),
         })
-        .unwrap();
+        .unwrap()
+        .0;
 
     let search = db
         .search_intelligence_nodes("connection", Some("pattern"), 10)
