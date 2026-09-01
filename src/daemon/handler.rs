@@ -5825,6 +5825,68 @@ impl TaskTriggerHandler {
             Err(e) => return Err(internal_error(e.to_string())),
         };
 
+        // Graph-level structural validation (CB8) — same validate_loop_graph
+        // used by loop_import, before spending quota on platform probes.
+        {
+            let router_labels: Vec<Vec<String>> = details
+                .graph_nodes
+                .iter()
+                .map(|n| {
+                    if n.kind == crate::domain::loops::LoopNodeKind::Router {
+                        n.config
+                            .get("routes")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|entry| {
+                                        entry
+                                            .get("label")
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.to_string())
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect();
+            let node_views: Vec<crate::domain::validation::GraphNodeView> = details
+                .graph_nodes
+                .iter()
+                .enumerate()
+                .map(|(idx, n)| crate::domain::validation::GraphNodeView {
+                    id: &n.id,
+                    kind: n.kind,
+                    route_labels: &router_labels[idx],
+                })
+                .collect();
+            let edge_views: Vec<crate::domain::validation::GraphEdgeView> = details
+                .graph_edges
+                .iter()
+                .map(|e| crate::domain::validation::GraphEdgeView {
+                    from: &e.from_node,
+                    to: &e.to_node,
+                    condition: &e.condition,
+                })
+                .collect();
+            if let Err(e) = crate::domain::validation::validate_loop_graph(&node_views, &edge_views)
+            {
+                // The validator names nodes by id; a live graph's ids are
+                // opaque UUIDs, so enrich with the display name where we can
+                // (same treatment loop_import gives its message).
+                let mut enriched = e;
+                for n in &details.graph_nodes {
+                    if enriched.contains(n.id.as_str()) {
+                        enriched =
+                            enriched.replace(n.id.as_str(), &format!("{} ({})", n.name, n.id));
+                    }
+                }
+                return Ok(error_result(&enriched));
+            }
+        }
+
         let loop_targets = crate::daemon::probe::distinct_targets_for_loop(&details);
         if loop_targets.is_empty() {
             return Ok(success_result(&format!(
@@ -15042,7 +15104,7 @@ mod endpoint_tests {
             .unwrap();
         let n3_id = extract_id(&n3, "node_id");
 
-        for (from, to, condition) in [(&n1_id, &n2_id, "always"), (&n2_id, &n3_id, "pass")] {
+        for (from, to, condition) in [(&n1_id, &n2_id, "always"), (&n2_id, &n3_id, "always")] {
             let edge = handler
                 .loop_add_edge(Parameters(LoopAddEdgeParams {
                     spec_id: None,
@@ -15451,6 +15513,70 @@ mod endpoint_tests {
         // Identical except the name (decision 4 renamed it on collision).
         second_doc["name"] = first_doc["name"].clone();
         assert_eq!(first_doc, second_doc);
+    }
+
+    #[tokio::test]
+    async fn loop_preflight_reports_graph_validation_errors() {
+        // Two agent nodes with no edge between them => multiple entry points.
+        let (dir, _db, handler) = endpoint_test_handler();
+        let workdir = dir.path().to_string_lossy().to_string();
+        let created = handler
+            .loop_create(Parameters(LoopCreateParams {
+                name: "Preflight Graph Loop".to_string(),
+                description: None,
+                workdir,
+                trigger: None,
+            }))
+            .await
+            .unwrap();
+        let loop_id = extract_id(&created, "loop_id");
+
+        handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: None,
+                loop_id: Some(loop_id.clone()),
+                name: "alpha".to_string(),
+                kind: Some("agent".to_string()),
+                config: Some(agent_node_config("claude")),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: None,
+                loop_id: Some(loop_id.clone()),
+                name: "beta".to_string(),
+                kind: Some("agent".to_string()),
+                config: Some(agent_node_config("claude")),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+
+        let result = handler
+            .loop_preflight(Parameters(LoopPreflightParams {
+                loop_id: loop_id.clone(),
+                timeout_seconds: None,
+            }))
+            .await
+            .unwrap();
+        assert!(
+            is_err(&result),
+            "preflight should report graph error: {}",
+            text(&result)
+        );
+        let msg = text(&result).to_lowercase();
+        assert!(
+            msg.contains("entry"),
+            "preflight error should mention entry points, got: {msg}"
+        );
+        assert!(
+            msg.contains("alpha") && msg.contains("beta"),
+            "preflight error should name the concrete nodes, got: {msg}"
+        );
     }
 
     #[tokio::test]

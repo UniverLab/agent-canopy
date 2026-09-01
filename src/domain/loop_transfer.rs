@@ -26,7 +26,9 @@ use crate::domain::loops::{
     Ensemble, EnsembleDetails, EnsembleMember, Loop, LoopEdge, LoopEdgeCondition, LoopNode,
     LoopNodeKind,
 };
-use crate::domain::validation::validate_ensembles_in_graph;
+use crate::domain::validation::{
+    validate_ensembles_in_graph, validate_loop_graph, GraphEdgeView, GraphNodeView,
+};
 
 /// The only `format_version` this build understands. An unrecognized or
 /// missing version is a refusal, never a best-effort parse (decision 6).
@@ -260,6 +262,23 @@ fn export_node_config(kind: LoopNodeKind, config: &Value, with_models: bool) -> 
     map.remove("platform");
     map.remove("model");
     Value::Object(map)
+}
+
+fn extract_router_labels(config: &Value) -> Vec<String> {
+    config
+        .get("routes")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| {
+                    entry
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .map(|s| s.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn edge_sort_key(edge: &LoopExportEdge) -> String {
@@ -605,6 +624,59 @@ pub fn build_import_plan(
     }
     validate_ensembles_in_graph(&ensemble_details, &all_nodes, &edges)?;
 
+    // Graph-level structural validation (CB8): validate the complete expanded
+    // graph as a whole. This catches unreachable nodes, multiple entry points,
+    // missing outgoing coverage, and dangling edges — properties that only a
+    // whole-graph check can see. For ensembles, the expanded graph includes
+    // member/join nodes and wiring, so a document whose plain nodes appear
+    // disconnected (kickoff/downstream with only ensemble bridging them) is
+    // correctly considered connected.
+    {
+        let router_labels: Vec<Vec<String>> = all_nodes
+            .iter()
+            .map(|n| {
+                if n.kind == LoopNodeKind::Router {
+                    extract_router_labels(&n.config)
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+        let node_views: Vec<GraphNodeView> = all_nodes
+            .iter()
+            .enumerate()
+            .map(|(idx, n)| GraphNodeView {
+                id: &n.id,
+                kind: n.kind,
+                route_labels: &router_labels[idx],
+            })
+            .collect();
+        let edge_views: Vec<GraphEdgeView> = edges
+            .iter()
+            .map(|e| GraphEdgeView {
+                from: &e.from_node,
+                to: &e.to_node,
+                condition: &e.condition,
+            })
+            .collect();
+        if let Err(e) = validate_loop_graph(&node_views, &edge_views) {
+            // For import, the document names are more actionable than fresh
+            // UUIDs, so enrich the message with names where we can resolve them.
+            let mut enriched = e;
+            // Try to map UUIDs back to names for friendlier messages: build id->name map.
+            let id_to_name: std::collections::HashMap<&str, &str> = all_nodes
+                .iter()
+                .map(|n| (n.id.as_str(), n.name.as_str()))
+                .collect();
+            for (id, name) in id_to_name {
+                if enriched.contains(id) {
+                    enriched = enriched.replace(id, &format!("{name} ({id})"));
+                }
+            }
+            return Err(enriched);
+        }
+    }
+
     Ok(LoopImportPlan {
         nodes,
         edges,
@@ -745,7 +817,7 @@ mod tests {
         ];
         let edges = vec![
             make_edge("e1", "n1", "n2", LoopEdgeCondition::Always),
-            make_edge("e2", "n2", "n3", LoopEdgeCondition::Pass),
+            make_edge("e2", "n2", "n3", LoopEdgeCondition::Always),
         ];
         (lp, nodes, edges)
     }
@@ -1165,5 +1237,127 @@ mod tests {
         };
         let err = build_import_plan(&doc, "new-loop").unwrap_err();
         assert!(err.contains("2-8 members"));
+    }
+
+    #[test]
+    fn import_plan_rejects_unreachable_node() {
+        // A -> B, C self-loop (single entry A, C unreachable)
+        let doc = LoopExportDocument {
+            format_version: 1,
+            name: "x".to_string(),
+            description: None,
+            nodes: vec![
+                LoopExportNode {
+                    name: "A".to_string(),
+                    kind: LoopNodeKind::Agent,
+                    position: 1,
+                    config: serde_json::json!({"platform": "claude", "prompt_template": "a"}),
+                },
+                LoopExportNode {
+                    name: "B".to_string(),
+                    kind: LoopNodeKind::Agent,
+                    position: 2,
+                    config: serde_json::json!({"platform": "claude", "prompt_template": "b"}),
+                },
+                LoopExportNode {
+                    name: "C".to_string(),
+                    kind: LoopNodeKind::Agent,
+                    position: 3,
+                    config: serde_json::json!({"platform": "claude", "prompt_template": "c"}),
+                },
+            ],
+            edges: vec![
+                LoopExportEdge {
+                    from_node: "A".to_string(),
+                    to_node: "B".to_string(),
+                    condition: LoopEdgeCondition::Always,
+                },
+                LoopExportEdge {
+                    from_node: "C".to_string(),
+                    to_node: "C".to_string(),
+                    condition: LoopEdgeCondition::Always,
+                },
+            ],
+            ensembles: vec![],
+        };
+        let err = build_import_plan(&doc, "new-loop").unwrap_err();
+        assert!(err.contains('C'), "err should name C: {err}");
+        assert!(
+            err.to_lowercase().contains("unreachable"),
+            "err should mention unreachable: {err}"
+        );
+    }
+
+    #[test]
+    fn import_plan_rejects_multiple_entry_points() {
+        // A and B both with no incoming => multiple entries
+        let doc = LoopExportDocument {
+            format_version: 1,
+            name: "x".to_string(),
+            description: None,
+            nodes: vec![
+                LoopExportNode {
+                    name: "A".to_string(),
+                    kind: LoopNodeKind::Agent,
+                    position: 1,
+                    config: serde_json::json!({"platform": "claude", "prompt_template": "a"}),
+                },
+                LoopExportNode {
+                    name: "B".to_string(),
+                    kind: LoopNodeKind::Agent,
+                    position: 2,
+                    config: serde_json::json!({"platform": "claude", "prompt_template": "b"}),
+                },
+                LoopExportNode {
+                    name: "C".to_string(),
+                    kind: LoopNodeKind::Agent,
+                    position: 3,
+                    config: serde_json::json!({"platform": "claude", "prompt_template": "c"}),
+                },
+            ],
+            edges: vec![LoopExportEdge {
+                from_node: "A".to_string(),
+                to_node: "C".to_string(),
+                condition: LoopEdgeCondition::Always,
+            }],
+            ensembles: vec![],
+        };
+        let err = build_import_plan(&doc, "new-loop").unwrap_err();
+        assert!(err.to_lowercase().contains("entry"), "err: {err}");
+        assert!(err.contains('A'), "err should name A: {err}");
+        assert!(err.contains('B'), "err should name B: {err}");
+    }
+
+    #[test]
+    fn import_plan_rejects_agent_missing_fail_edge() {
+        // Resilience node with only pass edge -> missing fail
+        let doc = LoopExportDocument {
+            format_version: 1,
+            name: "x".to_string(),
+            description: None,
+            nodes: vec![
+                LoopExportNode {
+                    name: "resilience".to_string(),
+                    kind: LoopNodeKind::Agent,
+                    position: 1,
+                    config: serde_json::json!({"platform": "claude", "prompt_template": "go"}),
+                },
+                LoopExportNode {
+                    name: "next".to_string(),
+                    kind: LoopNodeKind::Agent,
+                    position: 2,
+                    config: serde_json::json!({"platform": "claude", "prompt_template": "next"}),
+                },
+            ],
+            edges: vec![LoopExportEdge {
+                from_node: "resilience".to_string(),
+                to_node: "next".to_string(),
+                condition: LoopEdgeCondition::Pass,
+            }],
+            ensembles: vec![],
+        };
+        let err = build_import_plan(&doc, "new-loop").unwrap_err();
+        assert!(err.contains("resilience"), "err: {err}");
+        assert!(err.to_lowercase().contains("fail"), "err: {err}");
     }
 }

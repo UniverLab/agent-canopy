@@ -234,3 +234,193 @@ mod ensemble_graph {
         assert!(err.contains("invalid min_pass"));
     }
 }
+
+// ── validate_loop_graph (CB8) ───────────────────────────────────────
+
+mod graph_validation {
+    use super::*;
+    use crate::domain::loops::LoopNodeKind;
+
+    fn agent_node(id: &str) -> GraphNodeView<'_> {
+        static EMPTY: &[String] = &[];
+        GraphNodeView {
+            id,
+            kind: LoopNodeKind::Agent,
+            route_labels: EMPTY,
+        }
+    }
+
+    fn check_node(id: &str) -> GraphNodeView<'_> {
+        static EMPTY: &[String] = &[];
+        GraphNodeView {
+            id,
+            kind: LoopNodeKind::Check,
+            route_labels: EMPTY,
+        }
+    }
+
+    fn router_node<'a>(id: &'a str, labels: &'a [String]) -> GraphNodeView<'a> {
+        GraphNodeView {
+            id,
+            kind: LoopNodeKind::Router,
+            route_labels: labels,
+        }
+    }
+
+    fn join_node(id: &str) -> GraphNodeView<'_> {
+        static EMPTY: &[String] = &[];
+        GraphNodeView {
+            id,
+            kind: LoopNodeKind::Join,
+            route_labels: EMPTY,
+        }
+    }
+
+    fn edge<'a>(from: &'a str, to: &'a str, condition: &'a LoopEdgeCondition) -> GraphEdgeView<'a> {
+        GraphEdgeView {
+            from,
+            to,
+            condition,
+        }
+    }
+
+    #[test]
+    fn rejects_graph_with_no_entry_point() {
+        // Two nodes, cycle: A -> B -> A, every node has incoming.
+        let always = LoopEdgeCondition::Always;
+        let nodes = vec![agent_node("A"), agent_node("B")];
+        let edges = vec![edge("A", "B", &always), edge("B", "A", &always)];
+        let err = validate_loop_graph(&nodes, &edges).unwrap_err();
+        assert!(
+            err.to_lowercase().contains("no entry") || err.to_lowercase().contains("entry point"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_graph_with_multiple_entry_points() {
+        // Three nodes: A (no incoming), B (no incoming), C (incoming from A)
+        let always = LoopEdgeCondition::Always;
+        let nodes = vec![agent_node("A"), agent_node("B"), agent_node("C")];
+        let edges = vec![edge("A", "C", &always)];
+        let err = validate_loop_graph(&nodes, &edges).unwrap_err();
+        assert!(
+            err.contains("multiple entry") || err.to_lowercase().contains("entry point"),
+            "err: {err}"
+        );
+        assert!(err.contains('A'), "err should name A: {err}");
+        assert!(err.contains('B'), "err should name B: {err}");
+    }
+
+    #[test]
+    fn rejects_unreachable_node() {
+        let always = LoopEdgeCondition::Always;
+        // To get single-entry unreachable: A (entry) -> B, C self-loop so C has incoming but not reachable from A.
+        let nodes2 = vec![agent_node("A"), agent_node("B"), agent_node("C")];
+        let edges2 = vec![edge("A", "B", &always), edge("C", "C", &always)];
+        let err2 = validate_loop_graph(&nodes2, &edges2).unwrap_err();
+        assert!(err2.contains('C'), "err should name C: {err2}");
+        assert!(
+            err2.to_lowercase().contains("unreachable"),
+            "err should mention unreachable: {err2}"
+        );
+    }
+
+    #[test]
+    fn rejects_agent_node_missing_fail_edge() {
+        // A (agent) -> B (agent), only pass edge from A (fail missing)
+        let pass = LoopEdgeCondition::Pass;
+        let nodes = vec![agent_node("resilience"), agent_node("B")];
+        let edges = vec![edge("resilience", "B", &pass)];
+        let err = validate_loop_graph(&nodes, &edges).unwrap_err();
+        assert!(err.contains("resilience"), "err should name node: {err}");
+        assert!(
+            err.to_lowercase().contains("fail"),
+            "err should mention fail: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_agent_node_missing_pass_edge() {
+        let fail = LoopEdgeCondition::Fail;
+        let nodes = vec![agent_node("resilience"), agent_node("B")];
+        let edges = vec![edge("resilience", "B", &fail)];
+        let err = validate_loop_graph(&nodes, &edges).unwrap_err();
+        assert!(err.contains("resilience"), "err: {err}");
+        assert!(err.to_lowercase().contains("pass"), "err: {err}");
+    }
+
+    #[test]
+    fn accepts_agent_node_with_always_edge() {
+        // A -[always]-> B (always covers both pass and fail)
+        let always = LoopEdgeCondition::Always;
+        let nodes = vec![agent_node("A"), agent_node("B")];
+        let edges = vec![edge("A", "B", &always)];
+        assert!(validate_loop_graph(&nodes, &edges).is_ok());
+    }
+
+    #[test]
+    fn rejects_router_missing_route_edge() {
+        let always = LoopEdgeCondition::Always;
+        let approve = LoopEdgeCondition::Route("approve".to_string());
+        let labels = vec!["approve".to_string(), "reject".to_string()];
+        let nodes = vec![
+            router_node("router", &labels),
+            agent_node("next"),
+            agent_node("other"),
+        ];
+        let edges = vec![
+            edge("router", "next", &approve),
+            edge("next", "other", &always),
+        ];
+        let err = validate_loop_graph(&nodes, &edges).unwrap_err();
+        assert!(err.contains("router"), "err: {err}");
+        assert!(
+            err.contains("reject"),
+            "err should name missing route: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_edge_to_nonexistent_node() {
+        let always = LoopEdgeCondition::Always;
+        let nodes = vec![agent_node("A")];
+        let edges = vec![edge("A", "ghost", &always)];
+        let err = validate_loop_graph(&nodes, &edges).unwrap_err();
+        assert!(err.contains("ghost"), "err: {err}");
+    }
+
+    #[test]
+    fn accepts_valid_simple_graph() {
+        // A (agent) -[always]-> B (check) -[always]-> C (agent leaf, exempt)
+        let always = LoopEdgeCondition::Always;
+        let nodes = vec![agent_node("A"), check_node("B"), agent_node("C")];
+        let edges = vec![edge("A", "B", &always), edge("B", "C", &always)];
+        assert!(validate_loop_graph(&nodes, &edges).is_ok());
+    }
+
+    #[test]
+    fn empty_graph_is_valid() {
+        let nodes: Vec<GraphNodeView> = vec![];
+        let edges: Vec<GraphEdgeView> = vec![];
+        assert!(validate_loop_graph(&nodes, &edges).is_ok());
+    }
+
+    #[test]
+    fn join_nodes_are_skipped_for_outgoing_check() {
+        // Join node with only a pass edge should not trigger missing-fail
+        let always = LoopEdgeCondition::Always;
+        let pass = LoopEdgeCondition::Pass;
+        let nodes = vec![agent_node("A"), join_node("join"), agent_node("B")];
+        let edges = vec![edge("A", "join", &always), edge("join", "B", &pass)];
+        assert!(validate_loop_graph(&nodes, &edges).is_ok());
+    }
+
+    #[test]
+    fn join_nodes_skipped_even_with_no_outgoing() {
+        let always = LoopEdgeCondition::Always;
+        let nodes = vec![agent_node("A"), join_node("join")];
+        let edges = vec![edge("A", "join", &always)];
+        assert!(validate_loop_graph(&nodes, &edges).is_ok());
+    }
+}
