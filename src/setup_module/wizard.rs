@@ -48,16 +48,38 @@ pub fn run_setup(force_skills: bool) -> Result<()> {
     // ── Step 2: Select platforms ─────────────────────────────────
     wiz.render()?;
     if detected.is_empty() {
-        println!(
-            "  No supported platforms detected. Supported: {}",
-            registry
-                .platforms
-                .iter()
-                .map(|p| p.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
         println!();
+        println!("  \x1b[33mNo supported platform CLI detected on PATH.\x1b[0m");
+        println!();
+        println!("  This means no platform is installed at all — not that an");
+        println!("  installed one is failing to respond. If a platform IS installed");
+        println!("  but setup still can't see it, its binary isn't on PATH; to check");
+        println!("  whether an installed platform actually answers, run");
+        println!("  \x1b[1mcanopy doctor\x1b[0m or use \x1b[1magent_probe\x1b[0m.");
+        println!();
+        println!("  \"CLI\" here means the platform's command-line tool — the binary");
+        println!("  canopy runs to drive it. canopy needs at least one platform's");
+        println!("  CLI installed and authenticated before setup can configure");
+        println!("  anything.");
+        println!();
+        println!("  Supported platforms and the CLI binary canopy will invoke:");
+        println!();
+        for p in &registry.platforms {
+            let binary = p
+                .cli
+                .as_ref()
+                .and_then(|v| v.get("binary").and_then(|b| b.as_str()))
+                .unwrap_or("(unknown)");
+            println!(
+                "    \x1b[90m{:<14}\x1b[0m  binary: \x1b[1m{}\x1b[0m",
+                p.name, binary
+            );
+        }
+        println!();
+        println!("  Install one of the above, make sure it's on your PATH, then");
+        println!("  run \x1b[1mcanopy setup\x1b[0m again.");
+        println!();
+        return Ok(());
     }
 
     let selected = select_platforms(&detected)?;

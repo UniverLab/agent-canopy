@@ -80,20 +80,10 @@ tools will otherwise tell you the moment you actually run them for real.
 
 ### If no platform is installed
 
-`canopy setup` is meant to detect nothing, say so, list every platform it
-supports, and finish with zero platforms configured so you can install one
-and re-run. In practice it doesn't reach that message: the registry fetch
-(`src/setup_module/registry_fetch.rs`, `try_fetch_v6` / `try_fetch_v5` /
-`try_fetch_local`) filters the platform list down to already-installed
-binaries *before* returning it, and bails out if that filtered list is
-empty — discarding the full list that the "no platforms detected" branch
-(`src/setup_module/wizard.rs:50-61`) needs. Verified by running
-`canopy setup` with no supported binary on `PATH`: the real registry path
-fails with `Error: Registry returned HTTP 404 Not Found` (it falls through
-to a dead legacy endpoint), and `canopy setup --local-registry <dir>` fails
-with `Error: Local registry not found or invalid at: <dir>`. Either way,
-setup exits instead of guiding you — this is a bug in `canopy setup`,
-tracked separately, not fixed here.
+`canopy setup` detects nothing, lists every supported platform with its
+CLI binary name, and exits cleanly without writing any configuration.
+Install one of the listed binaries, make sure it's on your PATH, then
+re-run `canopy setup`.
 
 ---
 

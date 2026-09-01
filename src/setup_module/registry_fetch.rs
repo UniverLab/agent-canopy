@@ -3,9 +3,7 @@ use crate::db::Database;
 use crate::domain::cli_config::CliConfig;
 use crate::domain::db_paths::database_path;
 use crate::domain::registry_baseline::RegistryBaseline;
-use crate::setup_module::models::{
-    is_binary_available, resolve_config_path, CanonicalServers, Platform, RegistryRaw,
-};
+use crate::setup_module::models::{resolve_config_path, CanonicalServers, Platform, RegistryRaw};
 use crate::setup_module::PlatformWithCli;
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -39,6 +37,7 @@ struct RegistryIndex {
 #[derive(Deserialize)]
 struct IndexEntry {
     name: String,
+    #[allow(dead_code)]
     binary: String,
 }
 
@@ -127,16 +126,9 @@ fn try_fetch_local(base: &Path) -> Option<RegistryRaw> {
         CanonicalServers::default()
     };
 
-    // Read platform files (only for installed binaries)
-    let needed: Vec<&IndexEntry> = index
-        .platforms
-        .iter()
-        .filter(|e| is_binary_available(&e.binary))
-        .collect();
-
     let platforms_dir = base.join("platforms");
     let mut platforms = Vec::new();
-    for entry in &needed {
+    for entry in &index.platforms {
         let file_path = platforms_dir.join(format!("{}.toml", entry.name));
         match std::fs::read_to_string(&file_path) {
             Ok(text) => match toml::from_str::<Platform>(&text) {
@@ -152,10 +144,6 @@ fn try_fetch_local(base: &Path) -> Option<RegistryRaw> {
                 );
             }
         }
-    }
-
-    if platforms.is_empty() {
-        return None;
     }
 
     Some(RegistryRaw {
@@ -193,15 +181,8 @@ fn try_fetch_v6(client: &reqwest::blocking::Client) -> Option<RegistryRaw> {
         CanonicalServers::default()
     };
 
-    // Fetch platform files (only for installed binaries)
-    let needed: Vec<&IndexEntry> = index
-        .platforms
-        .iter()
-        .filter(|e| is_binary_available(&e.binary))
-        .collect();
-
     let mut platforms = Vec::new();
-    for entry in &needed {
+    for entry in &index.platforms {
         let url = format!("{REGISTRY_BASE_URL}platforms/{}.toml", entry.name);
         match client
             .get(&url)
@@ -219,10 +200,6 @@ fn try_fetch_v6(client: &reqwest::blocking::Client) -> Option<RegistryRaw> {
                 tracing::warn!("Failed to fetch platform '{}': {e}", entry.name);
             }
         }
-    }
-
-    if platforms.is_empty() {
-        return None;
     }
 
     Some(RegistryRaw {
@@ -245,14 +222,8 @@ fn try_fetch_v5(client: &reqwest::blocking::Client) -> Option<RegistryRaw> {
 
     let index: LegacyRegistryIndex = resp.json().ok()?;
 
-    let needed: Vec<&IndexEntry> = index
-        .platforms
-        .iter()
-        .filter(|e| is_binary_available(&e.binary))
-        .collect();
-
     let mut platforms = Vec::new();
-    for entry in &needed {
+    for entry in &index.platforms {
         let url = format!("{REGISTRY_BASE_URL}platforms/{}.json", entry.name);
         match client
             .get(&url)
@@ -265,10 +236,6 @@ fn try_fetch_v5(client: &reqwest::blocking::Client) -> Option<RegistryRaw> {
                 tracing::warn!("Failed to fetch platform '{}': {e}", entry.name);
             }
         }
-    }
-
-    if platforms.is_empty() {
-        return None;
     }
 
     Some(RegistryRaw {
@@ -1173,5 +1140,75 @@ mod tests {
         );
         // Second refresh must be idempotent: still exactly one platform, unchanged.
         assert_eq!(after_second.platforms.len(), 1);
+    }
+
+    fn write_local_registry(dir: &Path, entries: &[(&str, &str, &str)]) {
+        let mut index_toml = String::from("version = 6\nplatforms = [\n");
+        for (name, binary, _platform_toml) in entries {
+            index_toml.push_str(&format!(
+                "  {{ name = \"{name}\", binary = \"{binary}\" }},\n"
+            ));
+        }
+        index_toml.push_str("]\n");
+        std::fs::write(dir.join("index.toml"), &index_toml).unwrap();
+
+        let platforms_dir = dir.join("platforms");
+        std::fs::create_dir_all(&platforms_dir).unwrap();
+        for (name, _binary, platform_toml) in entries {
+            std::fs::write(platforms_dir.join(format!("{name}.toml")), platform_toml).unwrap();
+        }
+    }
+
+    const MINIMAL_PLATFORM_TOML: &str = r#"
+name = "PLACEHOLDER"
+config_path = "PLACEHOLDER.marker"
+command_format = "separate"
+mcp_servers_key = []
+deprecated_keys = []
+unsupported_keys = []
+"#;
+
+    fn platform_toml(name: &str) -> String {
+        MINIMAL_PLATFORM_TOML.replace("PLACEHOLDER", name)
+    }
+
+    #[test]
+    fn try_fetch_local_returns_all_platforms_regardless_of_binary_availability() {
+        let dir = TempDir::new().unwrap();
+        write_local_registry(
+            dir.path(),
+            &[
+                ("available_plat", "ls", &platform_toml("available_plat")),
+                (
+                    "missing_plat",
+                    "definitely_not_real_xyz",
+                    &platform_toml("missing_plat"),
+                ),
+            ],
+        );
+
+        let reg = try_fetch_local(dir.path()).expect("should succeed");
+        assert_eq!(reg.platforms.len(), 2);
+        let names: Vec<&str> = reg.platforms.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"available_plat"));
+        assert!(names.contains(&"missing_plat"));
+    }
+
+    #[test]
+    fn try_fetch_local_returns_platforms_when_no_binaries_match() {
+        let dir = TempDir::new().unwrap();
+        write_local_registry(
+            dir.path(),
+            &[(
+                "only_plat",
+                "definitely_not_real_abc",
+                &platform_toml("only_plat"),
+            )],
+        );
+
+        let reg =
+            try_fetch_local(dir.path()).expect("should succeed even with no binaries on PATH");
+        assert_eq!(reg.platforms.len(), 1);
+        assert_eq!(reg.platforms[0].name, "only_plat");
     }
 }

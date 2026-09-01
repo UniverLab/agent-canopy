@@ -147,6 +147,7 @@ pub(crate) fn save_mcp_fs_root(home: &Path, root: &str) {
     config.mcp_filesystem_root = root.to_string();
     let _ = config.save(&canopy_dir);
 }
+#[allow(dead_code)]
 pub(crate) fn is_binary_available(binary: &str) -> bool {
     let path_value = std::env::var("PATH").unwrap_or_default();
     crate::domain::cli_strategy::resolve_binary_in(binary, &path_value).is_ok()
