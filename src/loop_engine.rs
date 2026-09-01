@@ -1057,17 +1057,39 @@ impl LoopEngine {
                 for run in self.db.list_running_loop_runs(&lp.id).unwrap_or_default() {
                     self.terminate_run(&run, "iteration budget exhausted");
                 }
-                let summary = format!(
-                    "Spec '{}' exceeded max iterations for {}.",
+                // CB7: blocker explicativo que nombra spec, nodo, intentos consumidos y techo
+                let iteration_budget_blocker = format!(
+                    "Spec '{}' agotó el techo de intentos para {}: {} intentos consumidos (techo: {}). \
+                     El nodo completó sus iteraciones pero el spec no progresó; esto no es un fallo del \
+                     nodo individual sino del spec en su conjunto.",
                     spec.name,
-                    cursor_label(&cursor, &ensembles)
+                    cursor_label(&cursor, &ensembles),
+                    DEFAULT_MAX_ITERATIONS_PER_NODE,
+                    DEFAULT_MAX_ITERATIONS_PER_NODE,
                 );
+                // CB7: SIEMPRE escribir el blocker en el último run para que sea visible
+                // en loop_list/loop_get sin necesidad de encadenar loop_node_runs_list
+                if let Some(run) = self.db.list_loop_runs_for_spec(&spec.id)?.last() {
+                    self.set_run_blocker(
+                        &run.id,
+                        run.status,
+                        run.output.as_ref().unwrap_or(&serde_json::json!({})),
+                        &iteration_budget_blocker,
+                    )?;
+                }
                 // C19: every bounce that grew this counter was a genuine
                 // fail-edge routing decision, not an in-flight infra retry
                 // (those never touch `iterations` — see its increment
                 // above) — so reaching the per-node budget always reflects
                 // repeated real verdicts, never pure infrastructure noise.
-                if let Some(blocker) = self.record_spec_attempt(spec, &summary, false)? {
+                if let Some(blocker) =
+                    self.record_spec_attempt(spec, &iteration_budget_blocker, false)?
+                {
+                    // C19: this attempt also tripped the persisted cross-run
+                    // budget — overwrite the run blocker with the richer
+                    // cross-run text (it embeds the iteration message as its
+                    // "last failure"), so the single-call diagnosis still
+                    // names the cross-execution count, not just this run's.
                     if let Some(run) = self.db.list_loop_runs_for_spec(&spec.id)?.last() {
                         self.set_run_blocker(
                             &run.id,
@@ -1090,7 +1112,7 @@ impl LoopEngine {
                     None,
                     Some(chrono::Utc::now()),
                 )?;
-                return Ok(SpecExecutionOutcome::Failed(summary));
+                return Ok(SpecExecutionOutcome::Failed(iteration_budget_blocker));
             }
             let iteration_value = *iteration;
 
@@ -10843,6 +10865,21 @@ echo done
         assert!(
             runs.iter().all(|r| r.status != LoopRunStatus::Running),
             "no run should still be running after budget exhaustion"
+        );
+        // CB7: el blocker debe ser visible en el último run
+        let last_run = runs.last().expect("should have at least one run");
+        let blocker = last_run
+            .output
+            .as_ref()
+            .and_then(|o| o.get("blocker"))
+            .and_then(|v| v.as_str())
+            .expect("blocker must be set on the last run after iteration budget exhaustion");
+        assert!(
+            blocker.contains(&spec.name)
+                && blocker.contains("agotó")
+                && blocker.contains(&DEFAULT_MAX_ITERATIONS_PER_NODE.to_string()),
+            "blocker must name the spec, mention exhaustion, and state the limit; got: {}",
+            blocker
         );
     }
 
