@@ -6,6 +6,7 @@ pub mod platform_adapter;
 pub mod public_api;
 pub mod registry_fetch;
 pub mod sync_and_skills;
+pub mod uninstall;
 pub mod wizard;
 
 // Re-export public types and functions for backward compatibility

@@ -76,6 +76,19 @@ enum Commands {
         #[arg(long = "force-skills")]
         force_skills: bool,
     },
+    /// Remove canopy and optionally delete all local data.
+    Uninstall {
+        /// Preview what would be removed without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Also delete ~/.canopy (database, models, config). Without this flag,
+        /// only the tool footprint is removed; data is preserved.
+        #[arg(long)]
+        purge: bool,
+        /// Skip the interactive confirmation prompt for --purge.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Interactive wizard to configure MCP in your AI client.
     Mcp,
     /// RAG indexing management.
@@ -185,6 +198,14 @@ async fn main() -> Result<()> {
             tokio::task::block_in_place(mcp_wizard_module::run_mcp_wizard)?;
             Ok(())
         }
+        Some(Commands::Uninstall {
+            dry_run,
+            purge,
+            yes,
+        }) => {
+            tokio::task::block_in_place(|| handle_uninstall(dry_run, purge, yes))?;
+            Ok(())
+        }
         Some(Commands::Rag { action }) => handle_rag_action(action).await,
         Some(Commands::Loop { action }) => handle_loop_action(action, cli.port).await,
         Some(Commands::Spec { action }) => handle_spec_action(action, cli.port).await,
@@ -219,6 +240,31 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn handle_uninstall(dry_run: bool, purge: bool, yes: bool) -> Result<()> {
+    let plan = setup_module::uninstall::build_uninstall_plan()?;
+
+    if dry_run {
+        setup_module::uninstall::print_dry_run(&plan);
+        return Ok(());
+    }
+
+    if purge && !yes {
+        println!("  This will DELETE ~/.canopy (database, models, config, logs).");
+        println!("  Type 'yes' to confirm:");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if input.trim() != "yes" {
+            println!("  Aborted.");
+            return Ok(());
+        }
+    }
+
+    setup_module::uninstall::execute_uninstall(&plan, purge)?;
+    println!();
+    println!("  canopy has been uninstalled.");
+    Ok(())
 }
 
 pub(crate) fn resolve_port(port_override: Option<u16>) -> u16 {
