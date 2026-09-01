@@ -277,6 +277,46 @@ fn placeholder_names(content: &str) -> Vec<String> {
     names
 }
 
+/// The `{{name}}` placeholders in `template` that `supported` cannot bind.
+///
+/// A non-empty result means rendering `template` would leave a literal
+/// `{{...}}` in the output: the caller must refuse to emit it — exactly as
+/// [`render_preset`] refuses — rather than pass an unfilled template on to
+/// whatever composes it into a final prompt, where the marker would be read
+/// as an instruction.
+///
+/// Checked against the *template*, never the rendered output: a bound value
+/// (a spec body, prior feedback) may legitimately contain `{{...}}` text of
+/// its own, and that is data, not an unfilled placeholder.
+///
+/// A marker counts as unbindable when its inner text either names nothing in
+/// `supported` **or** carries surrounding whitespace (`{{ spec_content }}`):
+/// the renderers substitute the *exact* `{{name}}` byte sequence
+/// (`.replace("{{spec_content}}", …)`), so a padded marker survives that pass
+/// and reaches the agent as a literal `{{…}}` just as surely as one naming a
+/// binding that does not exist.
+pub fn unbindable_placeholders(template: &str, supported: &[&str]) -> Vec<String> {
+    let mut leftovers: Vec<String> = Vec::new();
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        let after_open = &rest[start + 2..];
+        let Some(end) = after_open.find("}}") else {
+            break;
+        };
+        let raw = &after_open[..end];
+        rest = &after_open[end + 2..];
+        let name = raw.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let bindable = raw == name && supported.contains(&name);
+        if !bindable && !leftovers.iter().any(|seen| seen == name) {
+            leftovers.push(name.to_string());
+        }
+    }
+    leftovers
+}
+
 /// Render a preset's raw content (as returned by [`resolve_prompt_preset`]
 /// or read straight from a picker entry) by substituting every `{{name}}`
 /// placeholder with `bindings[name]`. A preset is scoped to its own
@@ -620,6 +660,44 @@ mod tests {
         assert!(!rendered_b.contains("ONLY-IN-A"));
         assert!(!rendered_a.contains(&rendered_b));
         assert!(!rendered_b.contains(&rendered_a));
+    }
+
+    #[test]
+    fn unbindable_placeholders_empty_when_every_marker_is_supported() {
+        let template = "Do {{spec_content}} then read {{previous_feedback}}";
+        assert!(
+            unbindable_placeholders(template, &["spec_content", "previous_feedback"]).is_empty()
+        );
+    }
+
+    #[test]
+    fn unbindable_placeholders_names_the_markers_no_binding_covers() {
+        let template = "Do {{spec_content}} and also {{custom_thing}}";
+        assert_eq!(
+            unbindable_placeholders(template, &["spec_content", "previous_feedback"]),
+            vec!["custom_thing"]
+        );
+    }
+
+    #[test]
+    fn unbindable_placeholders_ignores_braces_in_a_bound_value_not_the_template() {
+        // The template is clean; only the eventual *value* of {{spec_content}}
+        // would contain "{{x}}" — that is data, and must not count as unbindable.
+        let template = "Implement this: {{spec_content}}";
+        assert!(unbindable_placeholders(template, &["spec_content"]).is_empty());
+    }
+
+    #[test]
+    fn unbindable_placeholders_flags_a_supported_name_padded_with_inner_whitespace() {
+        // The renderers substitute the exact `{{spec_content}}` sequence, so
+        // `{{ spec_content }}` would survive into the output as a literal
+        // marker even though `spec_content` is a supported binding — it must
+        // be refused, not emitted.
+        let template = "Do {{ spec_content }} now";
+        assert_eq!(
+            unbindable_placeholders(template, &["spec_content"]),
+            vec!["spec_content"]
+        );
     }
 
     #[test]

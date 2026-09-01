@@ -680,28 +680,38 @@ impl LoopEngine {
 
         let execution = match Cli::resolve(Some(&hook.platform)) {
             Ok(cli) => {
-                let mut strategy = cli.strategy();
-                let prompt =
-                    render_completion_hook_prompt(lp, workdir, completed_specs, &hook.prompt);
-                // Same E2BIG safety net as an agent node (see
-                // `execute_agent_node`): an oversized `{{completed_specs}}`
-                // list must not crash the spawn.
-                if prompt.len() > ARGV_SAFETY_THRESHOLD && !strategy.prompt_via_stdin {
-                    *strategy = strategy.with_stdin_forced();
-                }
-                let timeout_minutes = hook.timeout_minutes.unwrap_or(30);
+                match render_completion_hook_prompt(lp, workdir, completed_specs, &hook.prompt) {
+                    Ok(prompt) => {
+                        let mut strategy = cli.strategy();
+                        // Same E2BIG safety net as an agent node (see
+                        // `execute_agent_node`): an oversized `{{completed_specs}}`
+                        // list must not crash the spawn.
+                        if prompt.len() > ARGV_SAFETY_THRESHOLD && !strategy.prompt_via_stdin {
+                            *strategy = strategy.with_stdin_forced();
+                        }
+                        let timeout_minutes = hook.timeout_minutes.unwrap_or(30);
 
-                run_completion_hook_process(
-                    &self.db,
-                    &run_id,
-                    &cli,
-                    &strategy,
-                    &prompt,
-                    hook.model.as_deref(),
-                    workdir,
-                    timeout_minutes,
-                )
-                .await
+                        run_completion_hook_process(
+                            &self.db,
+                            &run_id,
+                            &cli,
+                            &strategy,
+                            &prompt,
+                            hook.model.as_deref(),
+                            workdir,
+                            timeout_minutes,
+                        )
+                        .await
+                    }
+                    Err(error) => HookExecution {
+                        status: LoopRunStatus::Fail,
+                        output: serde_json::json!({
+                            "platform": hook.platform,
+                            "error": error.to_string(),
+                        }),
+                        summary: format!("on_completed hook prompt is invalid: {error}"),
+                    },
+                }
             }
             Err(error) => HookExecution {
                 status: LoopRunStatus::Fail,
@@ -2490,6 +2500,7 @@ async fn execute_check_node(
     let command = raw_command
         .replace("{{spec_start_head}}", spec_start_head.unwrap_or(""))
         .replace("{{spec_committed_head}}", spec_committed_head.unwrap_or(""));
+
     let success_condition = node
         .config
         .get("success_condition")
@@ -2806,7 +2817,7 @@ async fn execute_agent_node(
                     .and_then(Value::as_str)
                     .unwrap_or(RESUME_PROMPT_DEFAULT)
             };
-            let resume_prompt = render_resume_prompt(
+            let resume_prompt = match render_resume_prompt(
                 lp,
                 spec,
                 node,
@@ -2814,7 +2825,22 @@ async fn execute_agent_node(
                 previous_output,
                 workdir,
                 run_id,
-            );
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Ok(NodeExecution {
+                        status: LoopRunStatus::Fail,
+                        output: serde_json::json!({
+                            "failure_kind": "invalid_template",
+                            "error": e.to_string(),
+                        }),
+                        summary: format!(
+                            "Agent node '{}' prompt template is invalid: {e}",
+                            node.name
+                        ),
+                    });
+                }
+            };
             let resume_prompt = append_pinned_skills(resume_prompt, node, dynamic_skills).await;
             let strategy = sized_strategy(&base_strategy, &resume_prompt);
             let execution = run_agent_process(
@@ -2871,7 +2897,7 @@ async fn execute_agent_node(
         node,
         &crate::domain::prompts::prompts_dir(&crate::domain::prompts::canopy_dir()),
     );
-    let prompt = render_agent_prompt(
+    let prompt = match render_agent_prompt(
         lp,
         spec,
         node,
@@ -2879,7 +2905,19 @@ async fn execute_agent_node(
         previous_output,
         workdir,
         run_id,
-    );
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(NodeExecution {
+                status: LoopRunStatus::Fail,
+                output: serde_json::json!({
+                    "failure_kind": "invalid_template",
+                    "error": e.to_string(),
+                }),
+                summary: format!("Agent node '{}' prompt template is invalid: {e}", node.name),
+            });
+        }
+    };
     let prompt = append_pinned_skills(prompt, node, dynamic_skills).await;
     let strategy = sized_strategy(&base_strategy, &prompt);
     let execution = run_agent_process(
@@ -4236,6 +4274,52 @@ pub(crate) fn agent_prompt_source(config: &Value) -> &'static str {
     }
 }
 
+/// Refuse to render `template` when it carries a `{{name}}` marker not in
+/// `supported` — the CP1 contract: a prompt builder must never emit a
+/// template presented as an instruction. Mirrors
+/// [`crate::domain::prompts::render_preset`]'s refusal, but for the engine's
+/// own `.replace()`-based renderers, and checks the *template* (not the
+/// rendered output) so a `{{...}}` sequence inside a bound value — a spec
+/// body, prior feedback — is treated as data, not a leftover marker.
+fn refuse_unbindable_template(node_name: &str, template: &str, supported: &[&str]) -> Result<()> {
+    let unbindable = crate::domain::prompts::unbindable_placeholders(template, supported);
+    if unbindable.is_empty() {
+        return Ok(());
+    }
+    tracing::error!(
+        node = %node_name,
+        placeholders = ?unbindable,
+        "prompt template carries markers no binding covers; refusing to emit"
+    );
+    Err(anyhow!(
+        "Node '{}' prompt template carries {} no binding covers ({}). Refusing to spawn \
+         rather than send an agent a template it would read as an instruction — fix the \
+         template or preset so every {{{{...}}}} marker is one the engine substitutes.",
+        node_name,
+        if unbindable.len() == 1 {
+            "a placeholder"
+        } else {
+            "placeholders"
+        },
+        unbindable.join(", "),
+    ))
+}
+
+/// The only `{{...}}` markers [`render_agent_prompt`] can bind. A resolved
+/// template — an explicit `prompt_template`, a `prompt_preset` body, or the
+/// default fallback — that carries any other marker is refused (CP1): the
+/// engine will not spawn an agent on a prompt still holding a literal
+/// `{{name}}` the agent would read as an instruction.
+const AGENT_PROMPT_BINDINGS: &[&str] = &[
+    "loop_name",
+    "workdir",
+    "spec_id",
+    "spec_name",
+    "spec_content",
+    "node_id",
+    "previous_feedback",
+];
+
 fn render_agent_prompt(
     lp: &crate::domain::loops::Loop,
     spec: &LoopSpec,
@@ -4244,7 +4328,9 @@ fn render_agent_prompt(
     previous_output: Option<&Value>,
     workdir: &str,
     run_id: &str,
-) -> String {
+) -> Result<String> {
+    refuse_unbindable_template(&node.name, prompt_template, AGENT_PROMPT_BINDINGS)?;
+
     let previous_feedback = previous_output
         .map(|value| serde_json::to_string_pretty(value).unwrap_or_default())
         .unwrap_or_else(|| "(none)".to_string());
@@ -4282,7 +4368,7 @@ fn render_agent_prompt(
     // agent that ignores its own termination and calls the tool anyway) would
     // otherwise be matched to "whatever's currently active for this node_id"
     // and silently corrupt a newer, unrelated run.
-    format!(
+    Ok(format!(
         "# [LOOP CONTEXT]\n<loop>\n  <name>{}</name>\n  <spec>{}</spec>\n  <node>{}</node>\n  <workdir>{}</workdir>\n</loop>\n{}\n# [SPEC]\n{}\n\n# [PREVIOUS FEEDBACK]\n{}\n\n# [REPORTING]\nWhen you finish this node, call loop_complete_node with run_id=\"{}\", node_id=\"{}\", status=\"pass\"|\"fail\", a concise summary, and your output.\nIf you are blocked and need human intervention, call loop_report_blocker with run_id=\"{}\", node_id=\"{}\" and the blocker description.\n",
         lp.name,
         spec.name,
@@ -4295,7 +4381,7 @@ fn render_agent_prompt(
         node.id,
         run_id,
         node.id
-    )
+    ))
 }
 
 /// Default incremental prompt for a SAME-SPEC resumed agent run (RS2): a
@@ -4343,13 +4429,15 @@ fn render_resume_prompt(
     previous_output: Option<&Value>,
     workdir: &str,
     run_id: &str,
-) -> String {
+) -> Result<String> {
+    refuse_unbindable_template(&node.name, template, RESUME_PROMPT_BINDINGS)?;
+
     let previous_feedback = previous_output
         .map(|value| serde_json::to_string_pretty(value).unwrap_or_default())
         .unwrap_or_else(|| "(none)".to_string());
     let previous_feedback = bound_previous_feedback(previous_feedback);
     let spec_content = spec.description.as_deref().unwrap_or(&spec.name);
-    template
+    Ok(template
         .replace("{{loop_name}}", &lp.name)
         .replace("{{workdir}}", workdir)
         .replace("{{spec_id}}", &spec.id)
@@ -4358,8 +4446,25 @@ fn render_resume_prompt(
         .replace("{{node}}", &node.name)
         .replace("{{node_id}}", &node.id)
         .replace("{{run_id}}", run_id)
-        .replace("{{previous_feedback}}", &previous_feedback)
+        .replace("{{previous_feedback}}", &previous_feedback))
 }
+
+/// The only `{{...}}` markers [`render_resume_prompt`] can bind — the
+/// same-spec ([`RESUME_PROMPT_DEFAULT`]) and cross-spec
+/// ([`RESUME_PROMPT_CROSS_SPEC_DEFAULT`]) defaults, and any per-node
+/// `resume_prompt` override, are all refused (CP1) if they carry anything
+/// else.
+const RESUME_PROMPT_BINDINGS: &[&str] = &[
+    "loop_name",
+    "workdir",
+    "spec_id",
+    "spec_name",
+    "spec_content",
+    "node",
+    "node_id",
+    "run_id",
+    "previous_feedback",
+];
 
 /// Render the `on_completed` hook's prompt template (N2). The hook has no
 /// spec/node graph context to template against (it fires once per whole run,
@@ -4377,7 +4482,13 @@ fn render_completion_hook_prompt(
     workdir: &str,
     completed_specs: &[(String, String)],
     prompt_template: &str,
-) -> String {
+) -> Result<String> {
+    refuse_unbindable_template(
+        "on_completed hook",
+        prompt_template,
+        COMPLETION_HOOK_BINDINGS,
+    )?;
+
     let completed_specs_text = if completed_specs.is_empty() {
         "(none)".to_string()
     } else {
@@ -4388,11 +4499,16 @@ fn render_completion_hook_prompt(
             .join("\n")
     };
 
-    prompt_template
+    Ok(prompt_template
         .replace("{{loop_name}}", &lp.name)
         .replace("{{workdir}}", workdir)
-        .replace("{{completed_specs}}", &completed_specs_text)
+        .replace("{{completed_specs}}", &completed_specs_text))
 }
+
+/// The only `{{...}}` markers [`render_completion_hook_prompt`] can bind; a
+/// hook prompt carrying anything else is refused (CP1) and the firing is
+/// recorded as failed rather than sent.
+const COMPLETION_HOOK_BINDINGS: &[&str] = &["loop_name", "workdir", "completed_specs"];
 
 /// The workdir's current `git rev-parse HEAD`, or `None` if it isn't a git
 /// repo (or the command otherwise fails). Never errors the caller — a check
@@ -6181,7 +6297,8 @@ mod tests {
             Some(&serde_json::json!({"feedback":"ok"})),
             &lp.workdir,
             "run-1",
-        );
+        )
+        .unwrap();
 
         assert!(prompt.contains("loop_complete_node"));
         assert!(prompt.contains("loop_report_blocker"));
@@ -6252,7 +6369,8 @@ mod tests {
             None,
             &lp.workdir,
             "run-1",
-        );
+        )
+        .unwrap();
         assert!(!pending_prompt.contains("[CONTINUATION]"));
 
         spec.status = LoopSpecStatus::Interrupted;
@@ -6264,7 +6382,8 @@ mod tests {
             None,
             &lp.workdir,
             "run-1",
-        );
+        )
+        .unwrap();
         assert!(interrupted_prompt.contains("[CONTINUATION]"));
         assert!(interrupted_prompt.contains("interrupted"));
         assert!(interrupted_prompt.contains("git status"));
@@ -6436,7 +6555,8 @@ mod tests {
             Some(&serde_json::json!({"stdout": huge_log})),
             &lp.workdir,
             "run-1",
-        );
+        )
+        .unwrap();
 
         assert!(prompt.contains("bytes elided"));
         assert!(prompt.len() < 600 * 1024);
@@ -9807,7 +9927,8 @@ echo done
             Some(&serde_json::json!({"stdout": huge_log})),
             &lp.workdir,
             "run-1",
-        );
+        )
+        .unwrap();
         assert!(
             prompt.contains("bytes elided"),
             "composed prompt must contain the elision marker"
@@ -12017,7 +12138,8 @@ echo done
             &lp.workdir,
             &completed_specs,
             "Loop={{loop_name}} Workdir={{workdir}} Specs={{completed_specs}}",
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             result,
@@ -12047,7 +12169,8 @@ echo done
             on_completed: None,
         };
 
-        let result = render_completion_hook_prompt(&lp, &lp.workdir, &[], "{{completed_specs}}");
+        let result =
+            render_completion_hook_prompt(&lp, &lp.workdir, &[], "{{completed_specs}}").unwrap();
 
         assert_eq!(result, "(none)");
     }
@@ -15004,6 +15127,69 @@ echo done
             stdout.len() <= 64 * 1024 + 100,
             "truncated stdout must be bounded, got len {}",
             stdout.len()
+        );
+    }
+
+    #[test]
+    fn render_agent_prompt_refuses_template_with_unbindable_placeholder() {
+        let lp = crate::domain::loops::Loop {
+            archived: false,
+            paused_by_reconciliation: false,
+            id: "wf".to_string(),
+            name: "Loop".to_string(),
+            description: None,
+            workdir: "/tmp/project".to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        };
+        let spec = LoopSpec {
+            id: "spec".to_string(),
+            loop_id: Some("wf".to_string()),
+            name: "Spec".to_string(),
+            description: Some("do the thing".to_string()),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        let node = LoopNode {
+            id: "node-1".to_string(),
+            spec_id: Some("spec".to_string()),
+            loop_id: None,
+            name: "Agent".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+        let template = "Do this: {{spec_content}} and also {{custom_var}}";
+
+        let result =
+            render_agent_prompt(&lp, &spec, &node, template, None, "/tmp/project", "run-1");
+
+        assert!(
+            result.is_err(),
+            "template with unbindable placeholder must be refused"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("custom_var"),
+            "error must name the unbindable placeholder: {err_msg}"
         );
     }
 }
