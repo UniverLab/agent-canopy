@@ -15,6 +15,11 @@ use crate::domain::loops::{
 };
 use crate::domain::models::Cli;
 
+// CONVENTION: Any spec that asks an agent to compile or execute a canopy
+// binary MUST instruct the agent to set HOME to a disposable temp directory
+// (e.g., `export HOME=$(mktemp -d)`) so the binary builds its own empty
+// state instead of touching the real ~/.canopy.
+
 // Five bounces of the same (spec,node) pair is enough signal that a spec
 // needs a human or a redesign; ten burned entire quota windows ping-ponging.
 const DEFAULT_MAX_ITERATIONS_PER_NODE: usize = 5;

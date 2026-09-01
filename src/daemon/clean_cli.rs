@@ -33,7 +33,7 @@ pub async fn handle_clean_action(
 ) -> Result<()> {
     let data_dir = crate::ensure_data_dir()?;
     let db_path = database_path(&data_dir);
-    let db = Database::new(&db_path)?;
+    let db = Database::new_safe(&db_path, &data_dir)?;
     let config = CanopyConfig::load(&data_dir);
     let retention_days = older_than.unwrap_or(config.clean.retention_days);
     let now_ts = chrono::Utc::now().timestamp();

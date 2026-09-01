@@ -1639,6 +1639,126 @@ async fn reconcile_orphaned_loops_skips_everything_when_foreign_daemon_pid_is_li
     let _ = foreign_daemon.wait();
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn reconcile_orphaned_loops_skips_kill_for_own_ancestor_pid() {
+    let Some(current_boot_id) = crate::system::boot_id() else {
+        return;
+    };
+
+    // Read our own PPid — the parent of this test process. This process's
+    // own pid can't be used (it would be killed), but the parent is an
+    // ancestor and must be skipped by the ancestor guard.
+    let ppid: u32 = std::fs::read_to_string("/proc/self/status")
+        .expect("read /proc/self/status")
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("PPid:")
+                .and_then(|rest| rest.trim().parse::<u32>().ok())
+        })
+        .expect("PPid line must be present");
+    assert!(ppid != 0 && ppid != 1);
+    // Sanity: parent must be alive at test start.
+    assert!(
+        crate::daemon::process::is_process_running(ppid),
+        "parent pid {ppid} must be alive"
+    );
+
+    let db = test_db();
+    let data_dir = tempdir().unwrap();
+    let mut lp = sample_loop("wf-ancestor-skip");
+    lp.status = LoopStatus::Running;
+    let mut spec = sample_loop_spec(&lp.id, "spec-ancestor-skip", 1);
+    spec.status = LoopSpecStatus::Running;
+    let node = sample_loop_node(&spec.id, "node-ancestor-skip", 1);
+    let run = LoopNodeRun {
+        id: "run-ancestor-skip".to_string(),
+        loop_id: lp.id.clone(),
+        spec_id: spec.id.clone(),
+        node_id: node.id.clone(),
+        status: LoopRunStatus::Running,
+        input: None,
+        output: None,
+        started_at: Utc::now(),
+        completed_at: None,
+        iteration: 1,
+        pid: Some(ppid as i64),
+        boot_id: Some(current_boot_id),
+        session_id: None,
+    };
+
+    db.insert_loop(&lp).unwrap();
+    db.insert_loop_spec(&spec).unwrap();
+    db.insert_loop_node(&node).unwrap();
+    db.insert_loop_run(&run).unwrap();
+
+    let reconciled = db.reconcile_orphaned_loops(data_dir.path()).unwrap();
+    assert_eq!(reconciled, 1);
+
+    // Run must be marked interrupted in DB, but parent process must still be alive.
+    let run_after = db.get_loop_run(&run.id).unwrap().unwrap();
+    assert_ne!(run_after.status, LoopRunStatus::Running);
+    assert_eq!(
+        run_after
+            .output
+            .as_ref()
+            .and_then(|value| value.get("interrupted")),
+        Some(&serde_json::json!(true))
+    );
+    assert!(
+        crate::daemon::process::is_process_running(ppid),
+        "ancestor pid {ppid} must still be alive — the guard must have skipped the kill"
+    );
+}
+
+#[test]
+fn new_safe_skips_migration_when_foreign_daemon_is_live() {
+    let data_dir = tempdir().unwrap();
+    // Simulate a live daemon by writing our own pid (guaranteed live).
+    std::fs::write(
+        data_dir.path().join("daemon.pid"),
+        std::process::id().to_string(),
+    )
+    .unwrap();
+
+    let db_path = data_dir.path().join("fresh.db");
+    // Empty DB, but foreign daemon is live — new_safe must skip migrations.
+    let _db = Database::new_safe(&db_path, data_dir.path())
+        .expect("new_safe should open without migrating");
+    drop(_db);
+    // Verify no tables were created: `loops` table must not exist.
+    let loops_exists: i32 = rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'loops'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        loops_exists, 0,
+        "new_safe with a live daemon must not have run migrations (loops table must not exist)"
+    );
+
+    // Without the foreign daemon, the same path must migrate normally.
+    std::fs::remove_file(data_dir.path().join("daemon.pid")).unwrap();
+    let _db2 = Database::new_safe(&db_path, data_dir.path())
+        .expect("new_safe without daemon should migrate");
+    drop(_db2);
+    let loops_exists_after: i32 = rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'loops'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        loops_exists_after, 1,
+        "new_safe without a live daemon must run migrations"
+    );
+}
+
 fn loop_with_trigger(id: &str, trigger: Option<Trigger>) -> Loop {
     Loop {
         trigger,

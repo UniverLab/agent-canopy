@@ -1681,15 +1681,24 @@ impl Database {
                 // meaningless and killing it could hit an unrelated process.
                 if let (Some(pid), Some(run_boot_id)) = (run.pid, run.boot_id.as_deref()) {
                     if crate::system::boot_id().as_deref() == Some(run_boot_id) {
-                        tracing::warn!(
-                            "Reconciling orphaned loop '{}': attempting best-effort kill of survivor pid {} from the same boot.",
-                            lp.id,
-                            pid
-                        );
-                        crate::daemon::process::terminate_process_group_async(
-                            pid,
-                            crate::daemon::process::KILL_GRACE,
-                        );
+                        let ancestors = crate::daemon::process::ancestor_pids();
+                        if ancestors.contains(&(pid as u32)) {
+                            tracing::warn!(
+                                "Reconciling orphaned loop '{}': skipping kill of pid {} — it is an ancestor of this process",
+                                lp.id,
+                                pid
+                            );
+                        } else {
+                            tracing::warn!(
+                                "Reconciling orphaned loop '{}': attempting best-effort kill of survivor pid {} from the same boot.",
+                                lp.id,
+                                pid
+                            );
+                            crate::daemon::process::terminate_process_group_async(
+                                pid,
+                                crate::daemon::process::KILL_GRACE,
+                            );
+                        }
                     }
                 }
                 let output = serde_json::json!({

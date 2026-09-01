@@ -161,7 +161,7 @@ fn register_standalone_session(agent_id: &str, workdir: &str) {
     // real session's codename (e.g. "boletus") instead of the bare, collidable
     // literal "standalone".
     let result = crate::ensure_data_dir()
-        .and_then(|data_dir| Database::new(&database_path(&data_dir)))
+        .and_then(|data_dir| Database::new_safe(&database_path(&data_dir), &data_dir))
         .and_then(|db| {
             db.insert_interactive_session(
                 agent_id,
@@ -183,7 +183,7 @@ fn register_standalone_session(agent_id: &str, workdir: &str) {
 fn finish_standalone_session(agent_id: &str, success: bool) {
     let exit_code = if success { 0 } else { 1 };
     let result = crate::ensure_data_dir()
-        .and_then(|data_dir| Database::new(&database_path(&data_dir)))
+        .and_then(|data_dir| Database::new_safe(&database_path(&data_dir), &data_dir))
         .and_then(|db| db.finish_interactive_session(agent_id, exit_code));
 
     if let Err(err) = result {
@@ -527,7 +527,7 @@ pub(crate) fn resolve_bridge_port(port_arg: Option<u16>) -> u16 {
 
 fn read_port_from_state(data_dir: &Path) -> Option<u16> {
     let db_path = database_path(data_dir);
-    let db = Database::new(&db_path).ok()?;
+    let db = Database::new_safe(&db_path, data_dir).ok()?;
     let port_str = db.get_state("port").ok()??;
     port_str.trim().parse::<u16>().ok()
 }

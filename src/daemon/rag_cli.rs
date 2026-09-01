@@ -47,7 +47,7 @@ pub(crate) enum ModelAction {
 
 pub(crate) async fn handle_rag_action(action: RagAction) -> Result<()> {
     let data_dir = crate::ensure_data_dir()?;
-    let db = Database::new(&database_path(&data_dir))?;
+    let db = Database::new_safe(&database_path(&data_dir), &data_dir)?;
 
     match action {
         RagAction::AutoIndex {

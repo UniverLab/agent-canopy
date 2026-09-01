@@ -40,6 +40,25 @@ impl Database {
         Ok(db)
     }
 
+    /// Open the database, running migrations only if no foreign daemon is live.
+    /// If a daemon is running, opens the file without running migrations or
+    /// seeding (reads and ordinary writes against the existing schema still
+    /// work) so a newer binary's migrations don't rename columns under a live
+    /// older daemon. Every non-daemon path that opens the real `~/.canopy`
+    /// database must use this instead of `new` — `run_http_server` is the one
+    /// exception, because it holds the daemon lock and therefore *is* the
+    /// daemon.
+    pub fn new_safe(db_path: &PathBuf, data_dir: &std::path::Path) -> Result<Self> {
+        if crate::daemon::process::other_instance_may_be_running(data_dir) {
+            let conn = Connection::open(db_path)?;
+            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+            return Ok(Database {
+                conn: Arc::new(Mutex::new(conn)),
+            });
+        }
+        Database::new(db_path)
+    }
+
     /// Refuses to open a database stamped with a schema version newer than
     /// this binary knows about. Without this, an older binary meeting a
     /// renamed/restructured schema would pass every `IF NOT EXISTS` guard

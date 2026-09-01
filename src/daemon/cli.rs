@@ -69,7 +69,7 @@ pub(crate) fn configured_port(data_dir: &std::path::Path) -> u16 {
     let db_path = database_path(data_dir);
     db_path
         .exists()
-        .then(|| Database::new(&db_path).ok())
+        .then(|| Database::new_safe(&db_path, data_dir).ok())
         .flatten()
         .and_then(|db| db.get_state("port").ok().flatten())
         .and_then(|s| s.parse().ok())
@@ -291,7 +291,7 @@ fn handle_status(data_dir: &std::path::Path) -> Result<()> {
         DaemonState::Running { pid } => pid,
     };
 
-    let Ok(db) = Database::new(&database_path(data_dir)) else {
+    let Ok(db) = Database::new_safe(&database_path(data_dir), data_dir) else {
         println!("Daemon: RUNNING (PID: {pid})");
         return Ok(());
     };
@@ -372,7 +372,7 @@ fn handle_health_check(data_dir: &std::path::Path) -> Result<()> {
         return Ok(());
     }
     let backup_path = health_routine::backup_path(data_dir);
-    let db = Database::new(&db_path)?;
+    let db = Database::new_safe(&db_path, data_dir)?;
 
     println!("Running database health check...");
     let status = health_routine::run_health_check(&db, &db_path, &backup_path);

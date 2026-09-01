@@ -264,7 +264,7 @@ pub(crate) async fn run_stdio_server() -> Result<()> {
     tracing::info!("Starting in stdio MCP transport mode");
 
     let data_dir = crate::ensure_data_dir()?;
-    let db = Arc::new(Database::new(&database_path(&data_dir))?);
+    let db = Arc::new(Database::new_safe(&database_path(&data_dir), &data_dir)?);
     let startup = stdio_server_startup(Arc::clone(&db), &data_dir).await;
 
     let handler = TaskTriggerHandler::new(

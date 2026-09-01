@@ -203,6 +203,40 @@ pub(crate) fn other_instance_may_be_running(data_dir: &std::path::Path) -> bool 
     read_pid(data_dir).is_some_and(is_process_running)
 }
 
+/// Walk the process's ancestor chain via `/proc/<pid>/status` PPid lines.
+/// Returns the full chain of ancestor PIDs (parent, grandparent, etc.)
+/// up to but not including PID 1 (init) or PID 0.
+/// Empty vec on non-Linux or if `/proc` is unavailable.
+#[cfg(target_os = "linux")]
+pub(crate) fn ancestor_pids() -> Vec<u32> {
+    let mut pids = Vec::new();
+    let mut current = std::process::id();
+    for _ in 0..128 {
+        let status_path = format!("/proc/{current}/status");
+        let Ok(content) = std::fs::read_to_string(&status_path) else {
+            break;
+        };
+        let ppid = content.lines().find_map(|line| {
+            line.strip_prefix("PPid:")
+                .and_then(|rest| rest.trim().parse::<u32>().ok())
+        });
+        let Some(ppid) = ppid else {
+            break;
+        };
+        if ppid == 0 || ppid == 1 {
+            break;
+        }
+        pids.push(ppid);
+        current = ppid;
+    }
+    pids
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn ancestor_pids() -> Vec<u32> {
+    Vec::new()
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn is_systemd_available() -> bool {
     std::process::Command::new("systemctl")
@@ -1119,5 +1153,27 @@ LISTEN  0       128     0.0.0.0:8080        0.0.0.0:*
         let joined = d.describe().join("\n");
         assert!(!joined.contains("unit owns"));
         assert!(!joined.contains("Orphan:"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ancestor_pids_returns_parent_chain() {
+        let ancestors = ancestor_pids();
+        assert!(
+            !ancestors.is_empty(),
+            "ancestor chain must not be empty on Linux"
+        );
+        let ppid: u32 = std::fs::read_to_string("/proc/self/status")
+            .expect("read /proc/self/status")
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("PPid:")
+                    .and_then(|rest| rest.trim().parse::<u32>().ok())
+            })
+            .expect("PPid line must be present");
+        assert_eq!(
+            ancestors[0], ppid,
+            "first ancestor must be the direct parent PID"
+        );
     }
 }

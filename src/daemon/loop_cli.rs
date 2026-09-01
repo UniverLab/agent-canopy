@@ -131,7 +131,7 @@ pub(crate) async fn handle_loop_action(
     port_override: Option<u16>,
 ) -> Result<()> {
     let data_dir = crate::ensure_data_dir()?;
-    let db = Database::new(&database_path(&data_dir))?;
+    let db = Database::new_safe(&database_path(&data_dir), &data_dir)?;
 
     match action {
         LoopAction::List { workdir } => handle_loop_list(&db, workdir.as_deref()),

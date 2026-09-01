@@ -60,7 +60,7 @@ pub(crate) async fn run_doctor() -> Result<()> {
     // print the same green line as a healthy one because the old code
     // printed the tick before attempting `Database::new`.
     if db_path.exists() {
-        match Database::new(&db_path) {
+        match Database::new_safe(&db_path, &canopy_dir) {
             Ok(db) => {
                 success(format!("Database: {}", db_path.display()));
                 if let Ok(agents) = db.list_agents() {
@@ -173,7 +173,7 @@ pub(crate) async fn run_doctor() -> Result<()> {
     let state_pid = raw_pid.filter(|&p| is_process_running(p));
     let port: u16 = db_path
         .exists()
-        .then(|| Database::new(&db_path).ok())
+        .then(|| Database::new_safe(&db_path, &canopy_dir).ok())
         .flatten()
         .and_then(|db| db.get_state("port").ok().flatten())
         .and_then(|s| s.parse().ok())
@@ -368,7 +368,7 @@ pub(crate) async fn run_doctor() -> Result<()> {
                     // setup.
                     let acquisition = db_path
                         .exists()
-                        .then(|| Database::new(&db_path).ok())
+                        .then(|| Database::new_safe(&db_path, &canopy_dir).ok())
                         .flatten()
                         .and_then(|db| {
                             crate::rag::status::read_acquisition_state(
@@ -654,7 +654,7 @@ pub(crate) async fn run_doctor() -> Result<()> {
 
     // Queue count from SQLite
     if db_path.exists() {
-        if let Ok(db) = Database::new(&db_path) {
+        if let Ok(db) = Database::new_safe(&db_path, &canopy_dir) {
             if let Ok((queued, processing)) = db.rag_queue_counts() {
                 if queued > 0 || processing > 0 {
                     if processing > 0 {

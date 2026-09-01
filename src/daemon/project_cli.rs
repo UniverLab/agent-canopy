@@ -50,7 +50,7 @@ async fn handle_remap(
     force: bool,
 ) -> Result<()> {
     let data_dir = crate::ensure_data_dir()?;
-    let db = Database::new(&database_path(&data_dir))?;
+    let db = Database::new_safe(&database_path(&data_dir), &data_dir)?;
 
     let resolved = resolve_remap_path(new_path, force)?;
 

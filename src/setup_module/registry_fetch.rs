@@ -321,7 +321,7 @@ fn needs_refresh(canopy_dir: &Path) -> bool {
     let db_path = database_path(canopy_dir);
     let last_refresh = db_path
         .exists()
-        .then(|| Database::new(&db_path).ok())
+        .then(|| Database::new_safe(&db_path, canopy_dir).ok())
         .flatten()
         .and_then(|db| db.get_state(REGISTRY_LAST_REFRESH_STATE_KEY).ok().flatten());
 
@@ -541,7 +541,7 @@ fn apply_registry_refresh(home: &Path, registry: &RegistryRaw) -> Result<()> {
     }
     .save(&canopy_dir)?;
 
-    let db = Database::new(&database_path(&canopy_dir))?;
+    let db = Database::new_safe(&database_path(&canopy_dir), &canopy_dir)?;
     db.set_state(
         REGISTRY_LAST_REFRESH_STATE_KEY,
         &chrono::Utc::now().to_rfc3339(),
