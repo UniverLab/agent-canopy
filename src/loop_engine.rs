@@ -1486,7 +1486,16 @@ impl LoopEngine {
 
             match next_step {
                 Some(step) => {
-                    previous_output = Some(final_execution.output);
+                    // CB6: a routed router's output is control-flow metadata
+                    // (the route label), not data. That label already drove
+                    // edge selection above (`is_routed_router` /
+                    // `select_router_step`); propagating it as
+                    // `previous_output` would overwrite what the next node is
+                    // meant to see — the data the router read. A failed router
+                    // is not routed, so its failure payload still propagates.
+                    if !is_routed_router {
+                        previous_output = Some(final_execution.output);
+                    }
                     cursor = step;
                 }
                 None if final_execution.status == LoopRunStatus::Pass => {
@@ -14231,6 +14240,120 @@ echo done
                 Some(false)
             );
         }
+    }
+
+    /// CB6: a router must be transparent — the node after it must see what
+    /// the router read (`previous_output` before the router), not the
+    /// router's own `{kind, route}` verdict. This covers the natural
+    /// placement `check(fail) -> router -> check`, where the check after
+    /// the router needs the failure payload the reviewer produced.
+    #[tokio::test]
+    async fn router_preserves_previous_output_for_next_node() {
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "reviewer".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "reviewer".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "echo 'CHANGE_LIST: fix line 42, update test' && exit 1",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let router_script = write_member_script(dir.path(), "router.sh", "printf 'changes\\n'");
+        let fake_home = setup_multi_cli_home(&[("router-cli", &router_script)]);
+
+        db.insert_loop_node(&router_node(
+            "router",
+            &spec_id,
+            "router-cli",
+            &[
+                ("changes", "Reviewer asked for changes"),
+                ("quota", "Quota exhausted"),
+            ],
+            "changes",
+            2,
+        ))
+        .unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "implementer".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "implementer".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "true",
+                "success_condition": "exit_code_0"
+            }),
+            position: 3,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        db.insert_loop_edge(&LoopEdge {
+            id: "e1".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "reviewer".to_string(),
+            to_node: "router".to_string(),
+            condition: LoopEdgeCondition::Fail,
+        })
+        .unwrap();
+        db.insert_loop_edge(&route_edge(
+            "e2",
+            &spec_id,
+            "router",
+            "implementer",
+            "changes",
+        ))
+        .unwrap();
+
+        let _home = HomeGuard::set(fake_home.path());
+        let result = engine.run_loop(loop_id.clone(), None, None).await;
+        drop(_home);
+        result.unwrap();
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        let impl_run = runs.iter().find(|r| r.node_id == "implementer").unwrap();
+        let input = impl_run
+            .input
+            .as_ref()
+            .expect("implementer must have input");
+
+        // Implementer must receive the reviewer's check output, not the router's.
+        assert!(
+            input.get("kind").is_none()
+                || input.get("kind").and_then(Value::as_str) != Some("router"),
+            "implementer input must not be the router's output, got: {input}"
+        );
+        assert!(
+            input.get("route").is_none(),
+            "implementer input must not contain router's route field, got: {input}"
+        );
+        assert!(
+            input.get("stdout").is_some(),
+            "implementer input must be the reviewer's check output (has stdout field), got: {input}"
+        );
+        assert_eq!(
+            input.get("exit_code").and_then(Value::as_u64),
+            Some(1),
+            "implementer input must be the reviewer's failed check output, got: {input}"
+        );
+        assert!(
+            input
+                .get("stdout")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .contains("CHANGE_LIST"),
+            "implementer must see the reviewer's stdout, got: {input}"
+        );
     }
 
     /// Concurrency invariant: starting, pausing, resuming, and finishing one
