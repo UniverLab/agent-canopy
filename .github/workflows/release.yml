@@ -10,16 +10,218 @@ on:
 permissions:
   contents: write
 
+# Serialize releases — never cancel a release mid-flight, but
+# don't let two run at once and race on tag/publish.
+concurrency:
+  group: rust-release-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  release:
+  create-tag:
+    name: Create Release Tag
     if: github.event.pull_request.merged == true || github.event_name == 'workflow_dispatch'
-    uses: UniverLab/workflows/.github/workflows/rust-release.yml@main
-    with:
-      binary-name: canopy
-      system-packages: protobuf-compiler
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      created: ${{ steps.create.outputs.created }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/' | tr -d '\r' | xargs)
+          TAG="v${VERSION}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+
+      - name: Check if tag already exists
+        id: check_tag
+        run: |
+          if git rev-parse "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create and push tag
+        id: create
+        run: |
+          if [ "${{ steps.check_tag.outputs.exists }}" = "true" ]; then
+            echo "created=false" >> $GITHUB_OUTPUT
+            echo "Tag ${{ steps.version.outputs.tag }} already exists — skipping"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+          echo "created=true" >> $GITHUB_OUTPUT
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: create-tag
+    if: needs.create-tag.outputs.created == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            features: local-embeddings
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+            features: local-embeddings
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+            features: local-embeddings
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.create-tag.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install system packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
       # LanceDB's lance-encoding builds protobuf definitions, so protoc has to
       # exist on every target — not just the Linux ones. Different name here
       # because brew calls the package protobuf, not protobuf-compiler.
-      system-packages-brew: protobuf
-      include-windows: false
-    secrets: inherit
+      - name: Install system packages (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build
+        run: cargo build --locked --release --target ${{ matrix.target }} --features ${{ matrix.features }}
+
+      - name: Package (unix)
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf "../../../canopy-${{ needs.create-tag.outputs.tag }}-${{ matrix.target }}.tar.gz" canopy
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: canopy-${{ matrix.target }}
+          path: canopy-${{ needs.create-tag.outputs.tag }}-${{ matrix.target }}.tar.gz
+
+  github-release:
+    name: Create GitHub Release
+    needs: [create-tag, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.create-tag.outputs.tag }}
+          generate_release_notes: true
+          body: |
+            ### Packaging change: Linux binary is now glibc, not static musl
+
+            The published Linux binary now targets `x86_64-unknown-linux-gnu`
+            (previously `x86_64-unknown-linux-musl`) so it can load the ONNX
+            Runtime needed for local RAG embeddings, which are now enabled in
+            the published macOS (aarch64, x86_64) and Linux (x86_64) binaries.
+
+            The fully static musl binary is **no longer published**. If you
+            need a static, portable binary and don't need local embeddings,
+            build it from source (the `local-embeddings` feature is off by
+            default):
+            `cargo build --release --target x86_64-unknown-linux-musl`.
+          files: artifacts/*
+
+  approve:
+    name: Awaiting Manual Approval
+    needs: github-release
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    steps:
+      - run: echo "Release approved for publishing to crates.io"
+
+  ensure-owners:
+    name: Ensure crates.io owners
+    needs: create-tag
+    if: needs.create-tag.outputs.created == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.create-tag.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Add crates.io owners (best-effort)
+        env:
+          TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "No CARGO_REGISTRY_TOKEN — skipping owners update"
+            exit 0
+          fi
+          cargo owner --token "$TOKEN" --add github:univerlab:owners harness-canopy || true
+
+  publish:
+    name: Publish to crates.io
+    needs: [create-tag, approve, ensure-owners]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.create-tag.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Check stable version
+        id: version_check
+        run: |
+          VERSION=${{ needs.create-tag.outputs.version }}
+          if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "is_stable=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_stable=false" >> $GITHUB_OUTPUT
+            echo "Version $VERSION is prerelease — skipping publish"
+          fi
+
+      - name: Cargo publish
+        if: steps.version_check.outputs.is_stable == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked --allow-dirty

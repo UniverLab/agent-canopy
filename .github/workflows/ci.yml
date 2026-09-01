@@ -14,8 +14,8 @@ jobs:
       system-packages: protobuf-compiler
       # Default features only. `--all-features` turns on local-embeddings,
       # which pulls fastembed and needs an ONNX Runtime the runners do not
-      # carry — that mismatch is what pushed this repo off the shared
-      # workflow in the first place.
+      # carry. CI builds without the feature to verify the code compiles
+      # both with and without it; release builds enable it per-target.
       feature-flags: ""
       # `src/tui/ui/**` is pure ratatui rendering: functions whose whole job
       # is to draw onto a Frame, and whose correctness is visual rather than

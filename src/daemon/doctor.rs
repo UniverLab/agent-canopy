@@ -362,6 +362,18 @@ pub(crate) async fn run_doctor() -> Result<()> {
                 if crate::rag::embedding_client::provider_available(
                     crate::rag::embedding_client::EmbeddingProvider::Local,
                 ) {
+                    #[cfg(all(feature = "local-embeddings", target_os = "linux"))]
+                    match crate::rag::ort_runtime::ort_runtime_path() {
+                        Some(path) => {
+                            success_nested(format!("ONNX Runtime loaded from {}", path.display()));
+                        }
+                        None => {
+                            println!(
+                                "  \x1b[33m⚠\x1b[0m ONNX Runtime not yet downloaded (will be fetched on first local RAG use)"
+                            );
+                        }
+                    }
+
                     // Only open the DB if it already exists — doctor is a
                     // passive diagnostic and must not create the database
                     // as a side effect on a machine that's never run

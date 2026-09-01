@@ -13,7 +13,7 @@ error() { printf '  \033[1;31merror:\033[0m %s\n' "$1" >&2; exit 1; }
 # --- detect OS ---
 OS="$(uname -s)"
 case "$OS" in
-  Linux*)  OS_TARGET="unknown-linux-musl" ;;
+  Linux*)  OS_TARGET="unknown-linux-gnu" ;;
   Darwin*) OS_TARGET="apple-darwin" ;;
   *)       error "Unsupported OS: $OS (only Linux and macOS are supported)" ;;
 esac

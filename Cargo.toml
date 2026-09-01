@@ -130,7 +130,11 @@ futures = "0.3"
 pdf-extract = "0.10.0"
 
 # Local embedding models via ONNX Runtime (no API key required)
-fastembed = { version = "5", optional = true }
+# Target-specific: macOS uses default features (bundled ONNX Runtime),
+# Linux uses ort-load-dynamic (runtime-loaded from ~/.canopy). The runtime
+# download on Linux reuses the already-present flate2 + tar crates for the
+# gzip tarball Microsoft ships — no extra decompression dependency.
+# See target-specific deps below.
 # Already a transitive dependency of fastembed (its cache-path resolution
 # and blocking download client both live here) — depended on directly so we
 # can (a) check whether a model is already cached without loading it, and
@@ -149,22 +153,37 @@ hf-hub = { version = "0.5", optional = true, default-features = false, features 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# macOS/iOS: ort downloads prebuilt ONNX Runtime for Apple targets and
+# bundles it into the binary at compile time. No runtime download needed.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+fastembed = { version = "5", optional = true }
+
+# Linux: ort's prebuilt ONNX Runtime targets glibc, not musl. We compile
+# ort in `load-dynamic` mode so the binary stays thin and loads
+# libonnxruntime.so from ~/.canopy at runtime only when the user enables
+# local RAG. This also means the Linux release target must be glibc
+# (x86_64-unknown-linux-gnu), not musl — a static musl binary cannot
+# dlopen a glibc linked .so.
+[target.'cfg(target_os = "linux")'.dependencies]
+fastembed = { version = "5", optional = true, default-features = false, features = [
+    "ort-load-dynamic",
+    "hf-hub-native-tls",
+] }
+
+
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3.8"
 
 [features]
 default = []
-# Kept optional and off by default in both CI and release builds — not
-# enabled here. fastembed's `ort` backend only ships prebuilt ONNX Runtime
-# binaries for glibc targets; this crate's Linux release target is
-# x86_64-unknown-linux-musl (for a fully static, portable binary), so there
-# is no prebuilt to download there, and the released tarballs ship a single
-# binary with no mechanism to carry a matching dylib alongside it. Making
-# this a default/release feature would mean either abandoning the musl
-# target or shipping a fragile dylib+rpath bundle — for a dependency this
-# heavy (ndarray, tokenizers, image, hf-hub) on top of already ~40 MB
-# tarballs. Instead, doctor/setup/rag-status all check capability
+# Enabled in release builds for macOS (bundled ONNX Runtime via
+# ort-download-binaries) and Linux glibc (runtime-loaded via
+# ort-load-dynamic + on-demand download to ~/.canopy). The Linux musl
+# target cannot use either approach — ort ships no musl prebuilt, and a
+# static musl binary cannot dlopen a glibc .so — so the musl release
+# artifact is built without this feature and cannot serve local RAG.
+# doctor/setup/rag-status all check capability
 # (`embedding_client::provider_available`) and refuse/warn explicitly when
 # this feature is off, so the absence is visible rather than silently green.
 local-embeddings = ["dep:fastembed", "dep:hf-hub"]

@@ -289,6 +289,15 @@ pub struct LocalEmbeddingClient {
 #[cfg(feature = "local-embeddings")]
 impl LocalEmbeddingClient {
     pub fn new(model_id: &str, cache_dir: &std::path::Path) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            // `super` rather than `crate::rag` so this also resolves when
+            // `examples/rag_search.rs` pulls this file in as a flat module.
+            let ort_path = super::ort_runtime::ensure_ort_runtime()
+                .context("ONNX Runtime not available for local embeddings")?;
+            std::env::set_var("ORT_DYLIB_PATH", &ort_path);
+        }
+
         std::fs::create_dir_all(cache_dir)
             .with_context(|| format!("Cannot create model cache dir: {}", cache_dir.display()))?;
 

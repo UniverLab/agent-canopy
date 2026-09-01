@@ -50,6 +50,8 @@ mod setup_module {
 mod domain;
 #[path = "../src/rag/embedding_client.rs"]
 mod embedding_client;
+#[path = "../src/rag/ort_runtime.rs"]
+mod ort_runtime;
 #[path = "../src/rag/vector_store.rs"]
 mod vector_store;
 
