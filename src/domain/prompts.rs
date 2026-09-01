@@ -135,7 +135,7 @@ fn resilience_preset() -> String {
     );
     out.push_str(&itemized_section(&PROCEDURE, &[
         "Read the failure/blocker context below (`{{previous_feedback}}`) and pick exactly ONE diagnosis: QUOTA, GLITCH, or OTHER.",
-        "QUOTA — the failure is a rate limit, quota exhaustion, or \"try again later\" from the platform/API itself. Action: no code changes are needed; report QUOTA and that the node should be retried once quota resets.",
+        "QUOTA — the failure is a rate limit, quota exhaustion, or \"try again later\" from the platform/API itself. Action: call `loop_schedule_autorun` with `loop_id` set to this loop's ID and `quota_reset_message` set to the ENTIRE failure text below, copied verbatim — do NOT extract, truncate, reformat, or translate any part of it; the engine parses the raw text itself. Then report FAIL.",
         "GLITCH — the failure is a transient infrastructure hiccup (network blip, spurious timeout, a flaky check unrelated to the spec) with no sign of a real defect. Action: report GLITCH and recommend a plain retry of the same node.",
         "OTHER — the failure reflects a genuine problem with the work itself (wrong code, an unmet spec, a missing dependency, a decision only a human can make). Action: report OTHER with a precise, actionable explanation of what's wrong so a human or the next agent can address it.",
         "State your diagnosis and its one action clearly in your report; do not hedge between diagnoses.",
@@ -620,5 +620,23 @@ mod tests {
         assert!(!rendered_b.contains("ONLY-IN-A"));
         assert!(!rendered_a.contains(&rendered_b));
         assert!(!rendered_b.contains(&rendered_a));
+    }
+
+    #[test]
+    fn resilience_preset_includes_loop_schedule_autorun_instruction() {
+        let specs = builtin_prompt_preset_specs();
+        let (_, content) = specs.iter().find(|(n, _)| *n == "resilience").unwrap();
+        assert!(
+            content.contains("loop_schedule_autorun"),
+            "resilience preset must instruct calling loop_schedule_autorun for quota failures"
+        );
+        assert!(
+            content.contains("quota_reset_message"),
+            "resilience preset must name the quota_reset_message parameter"
+        );
+        assert!(
+            content.contains("verbatim"),
+            "resilience preset must instruct passing the text verbatim, not extracted"
+        );
     }
 }

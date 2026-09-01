@@ -361,4 +361,21 @@ mod tests {
         let err = parse_quota_reset_instant("resets", now).unwrap_err();
         assert!(err.0.contains("no 'resets"), "{err}");
     }
+
+    #[test]
+    fn resets_5_50pm_bogota_with_middle_dot_full_message() {
+        let now = bogota_now(9, 0);
+        let at = parse_quota_reset_instant(
+            "You've hit your session limit · resets 5:50pm (America/Bogota)",
+            now,
+        )
+        .unwrap();
+        // 17:50 local = 22:50 UTC, + 2min margin = 22:52 UTC
+        assert_eq!(
+            at,
+            chrono::Utc
+                .with_ymd_and_hms(2026, 7, 24, 22, 52, 0)
+                .unwrap()
+        );
+    }
 }
