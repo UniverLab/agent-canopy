@@ -2519,6 +2519,10 @@ async fn execute_check_node(
     let exit_code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    // Evaluate the success condition against the *full* captured output —
+    // the `output_contains` / `output_not_contains` conditions must see
+    // everything the command emitted, not just the tail kept for storage below.
     let combined = if stderr.is_empty() {
         stdout.clone()
     } else if stdout.is_empty() {
@@ -2528,24 +2532,35 @@ async fn execute_check_node(
     };
     let passed = evaluate_success_condition(success_condition, exit_code, &combined)?;
 
+    // Truncate only what we persist and hand to the next node, keeping the
+    // tail where compilers and test runners put the failure summary.
+    let (stdout, truncated_stdout) = truncate_check_output(stdout);
+    let (stderr, truncated_stderr) = truncate_check_output(stderr);
+    let truncated = truncated_stdout || truncated_stderr;
+
+    let mut output_json = serde_json::json!({
+        "kind": "check",
+        "loop_id": lp.id,
+        "spec_id": spec.id,
+        "node_id": node.id,
+        "command": command,
+        "success_condition": success_condition,
+        "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+        "passed": passed,
+    });
+    if truncated {
+        output_json["truncated"] = serde_json::Value::Bool(true);
+    }
+
     Ok(NodeExecution {
         status: if passed {
             LoopRunStatus::Pass
         } else {
             LoopRunStatus::Fail
         },
-        output: serde_json::json!({
-            "kind": "check",
-            "loop_id": lp.id,
-            "spec_id": spec.id,
-            "node_id": node.id,
-            "command": command,
-            "success_condition": success_condition,
-            "exit_code": exit_code,
-            "stdout": stdout,
-            "stderr": stderr,
-            "passed": passed,
-        }),
+        output: output_json,
         summary: format!(
             "Check node '{}' {}.",
             node.name,
@@ -4574,6 +4589,8 @@ fn shell_command(command: &str) -> Command {
     // for the same treatment on agent nodes.
     process.process_group(0);
     process.kill_on_drop(true);
+    process.stdout(std::process::Stdio::piped());
+    process.stderr(std::process::Stdio::piped());
     process
 }
 
@@ -4582,7 +4599,29 @@ fn shell_command(command: &str) -> Command {
     let mut process = Command::new("cmd");
     process.arg("/C").arg(command);
     process.kill_on_drop(true);
+    process.stdout(std::process::Stdio::piped());
+    process.stderr(std::process::Stdio::piped());
     process
+}
+
+const CHECK_OUTPUT_MAX_BYTES: usize = 64 * 1024;
+
+fn truncate_check_output(s: String) -> (String, bool) {
+    if s.len() <= CHECK_OUTPUT_MAX_BYTES {
+        return (s, false);
+    }
+    let mut start = s.len() - CHECK_OUTPUT_MAX_BYTES;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = &s[start..];
+    (
+        format!(
+            "[...truncated, keeping last {} bytes...]\n{}",
+            CHECK_OUTPUT_MAX_BYTES, tail
+        ),
+        true,
+    )
 }
 
 #[cfg(test)]
@@ -14591,6 +14630,213 @@ echo done
         assert_eq!(
             run_a_after, run_a_before,
             "graph A's node run must never be signalled or mutated by graph B's pause"
+        );
+    }
+
+    // ── CB5: check node failure captures output and truncates ──────────
+
+    #[tokio::test]
+    async fn check_node_failure_captures_stdout_stderr() {
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        let marker = dir.path().join("recovered.marker");
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-check-fail".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "failing-check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "echo 'FAIL_LINE_STDOUT'; echo 'FAIL_LINE_STDERR' >&2; exit 1",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-recovery".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "recovery".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": format!("touch \"{}\"", marker.display()),
+                "success_condition": "exit_code_0"
+            }),
+            position: 2,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        db.insert_loop_edge(&LoopEdge {
+            id: "edge-fail".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "node-check-fail".to_string(),
+            to_node: "node-recovery".to_string(),
+            condition: LoopEdgeCondition::Fail,
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        let check_run = runs
+            .iter()
+            .find(|r| r.node_id == "node-check-fail")
+            .expect("check run must exist");
+        assert_eq!(check_run.status, LoopRunStatus::Fail);
+        let out = check_run
+            .output
+            .as_ref()
+            .expect("check output must be persisted");
+        assert_eq!(out["passed"], serde_json::Value::Bool(false));
+        assert_eq!(out["exit_code"], serde_json::json!(1));
+        assert!(
+            out["stdout"].as_str().unwrap().contains("FAIL_LINE_STDOUT"),
+            "stdout must contain FAIL_LINE_STDOUT, got: {:?}",
+            out["stdout"]
+        );
+        assert!(
+            out["stderr"].as_str().unwrap().contains("FAIL_LINE_STDERR"),
+            "stderr must contain FAIL_LINE_STDERR, got: {:?}",
+            out["stderr"]
+        );
+        // Verify persistence via loop_node_run_get equivalent
+        let fetched = db.get_loop_run(&check_run.id).unwrap().unwrap();
+        assert_eq!(fetched.output, check_run.output);
+
+        assert!(
+            marker.exists(),
+            "fail edge must have been traversed to recovery node"
+        );
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn check_node_failure_output_reaches_next_node() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-check-fail".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "failing-check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "echo 'DISTINCT_FAIL_OUTPUT_42'; exit 1",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-next".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "next".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "exit 0",
+                "success_condition": "exit_code_0"
+            }),
+            position: 2,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        db.insert_loop_edge(&LoopEdge {
+            id: "edge-fail".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "node-check-fail".to_string(),
+            to_node: "node-next".to_string(),
+            condition: LoopEdgeCondition::Fail,
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        let check_run = runs
+            .iter()
+            .find(|r| r.node_id == "node-check-fail")
+            .unwrap();
+        let next_run = runs.iter().find(|r| r.node_id == "node-next").unwrap();
+
+        let check_stdout = check_run
+            .output
+            .as_ref()
+            .unwrap()
+            .get("stdout")
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert!(
+            check_stdout.contains("DISTINCT_FAIL_OUTPUT_42"),
+            "check stdout must contain distinctive output"
+        );
+
+        let next_input = next_run
+            .input
+            .as_ref()
+            .expect("next node input must be set");
+        let input_str = serde_json::to_string(next_input).unwrap();
+        assert!(
+            input_str.contains("DISTINCT_FAIL_OUTPUT_42"),
+            "next node input must contain previous check stdout, got: {input_str}"
+        );
+        assert_eq!(next_input["stdout"].as_str().unwrap(), check_stdout);
+    }
+
+    #[tokio::test]
+    async fn check_node_long_output_is_truncated() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-check-long".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "long-check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "head -c 70000 /dev/zero | tr '\\0' 'A'; printf 'TAIL_END'; exit 1",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        let run = runs
+            .iter()
+            .find(|r| r.node_id == "node-check-long")
+            .unwrap();
+        assert_eq!(run.status, LoopRunStatus::Fail);
+        let out = run.output.as_ref().unwrap();
+        assert_eq!(out["truncated"], serde_json::Value::Bool(true));
+        let stdout = out["stdout"].as_str().unwrap();
+        assert!(
+            stdout.contains("TAIL_END"),
+            "truncated stdout must keep tail containing TAIL_END"
+        );
+        assert!(
+            stdout.starts_with("[...truncated"),
+            "truncated stdout must start with truncation marker, got: {}",
+            &stdout[..80.min(stdout.len())]
+        );
+        // Stored stdout should be bounded: marker + 64KB
+        assert!(
+            stdout.len() <= 64 * 1024 + 100,
+            "truncated stdout must be bounded, got len {}",
+            stdout.len()
         );
     }
 }
