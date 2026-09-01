@@ -1383,6 +1383,32 @@ impl Database {
             .map_err(Into::into)
     }
 
+    pub fn count_loop_node_runs_filtered(
+        &self,
+        loop_id: &str,
+        spec_id: Option<&str>,
+        node_id: Option<&str>,
+    ) -> Result<i64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+
+        let mut sql = String::from("SELECT COUNT(*) FROM loop_runs WHERE loop_id = ?");
+        let mut query_params: Vec<&dyn rusqlite::ToSql> = vec![&loop_id];
+        if let Some(spec_id) = spec_id.as_ref() {
+            sql.push_str(" AND spec_id = ?");
+            query_params.push(spec_id);
+        }
+        if let Some(node_id) = node_id.as_ref() {
+            sql.push_str(" AND node_id = ?");
+            query_params.push(node_id);
+        }
+
+        conn.query_row(&sql, query_params.as_slice(), |row| row.get(0))
+            .map_err(Into::into)
+    }
+
     /// Most recent `loop_runs.started_at` per loop, across every loop in a
     /// single query — the sidebar's "last activity" signal. Unlike
     /// [`Self::list_loop_specs`] (a loop's own bound specs, empty for a
@@ -1915,6 +1941,94 @@ impl Database {
             specs,
             completion_hook_runs,
         }))
+    }
+
+    fn resolve_id_prefix(
+        table: &str,
+        prefix: &str,
+        conn: &std::sync::MutexGuard<'_, rusqlite::Connection>,
+    ) -> Result<Option<String>> {
+        if prefix.is_empty() {
+            return Ok(None);
+        }
+        let sql = format!("SELECT id FROM {table} WHERE id = ?1");
+        let exists: bool = conn
+            .query_row(&sql, params![prefix], |_| Ok(true))
+            .optional()
+            .map_err(|e| anyhow!("{}", e))?
+            .unwrap_or(false);
+        if exists {
+            return Ok(Some(prefix.to_string()));
+        }
+        let escaped_prefix = prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let like_sql = format!("SELECT id FROM {table} WHERE id LIKE ?1 || '%' ESCAPE '\\'");
+        let mut stmt = conn.prepare(&like_sql)?;
+        let ids: Vec<String> = stmt
+            .query_map(rusqlite::params![escaped_prefix], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        match ids.len() {
+            0 => Ok(None),
+            1 => Ok(Some(ids.into_iter().next().unwrap())),
+            _ => Err(anyhow!(
+                "Ambiguous {} id prefix '{}' matches {} ids: {}",
+                table,
+                prefix,
+                ids.len(),
+                ids.join(", ")
+            )),
+        }
+    }
+
+    pub fn resolve_spec_id_by_prefix(&self, prefix: &str) -> Result<Option<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        Self::resolve_id_prefix("loop_specs", prefix, &conn)
+    }
+
+    pub fn resolve_loop_id_by_prefix(&self, prefix: &str) -> Result<Option<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        Self::resolve_id_prefix("loops", prefix, &conn)
+    }
+
+    pub fn resolve_loop_node_id_by_prefix(&self, prefix: &str) -> Result<Option<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        Self::resolve_id_prefix("loop_nodes", prefix, &conn)
+    }
+
+    pub fn resolve_run_id_by_prefix(&self, prefix: &str) -> Result<Option<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        Self::resolve_id_prefix("loop_runs", prefix, &conn)
+    }
+
+    pub fn resolve_edge_id_by_prefix(&self, prefix: &str) -> Result<Option<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        Self::resolve_id_prefix("loop_edges", prefix, &conn)
+    }
+
+    pub fn resolve_ensemble_id_by_prefix(&self, prefix: &str) -> Result<Option<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        Self::resolve_id_prefix("ensembles", prefix, &conn)
     }
 }
 

@@ -470,6 +470,8 @@ pub struct SpecListParams {
     pub status: Option<String>,
     /// Only return specs not yet assigned to any loop.
     pub unassigned_only: Option<bool>,
+    /// Include full spec descriptions in the output. Default: false (compact — id, name, status, workdir, loop_id only).
+    pub include_descriptions: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -788,6 +790,8 @@ pub struct QueueAddSpecParams {
 pub struct QueueListParams {
     /// Existing queue ID. Omit to list every queue (summary only, no members).
     pub queue_id: Option<String>,
+    /// Include full spec descriptions in queue member listings. Default: false (compact — id, name, status, position, group only).
+    pub include_descriptions: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -852,6 +856,8 @@ pub struct LoopNodeRunsListParams {
     /// page past the default page (e.g. `offset: 20` for the next page after
     /// the default). Defaults to 0.
     pub offset: Option<u32>,
+    /// Compact mode: emit only node_name, status, iteration, spec_name, started_at, completed_at. Default: false.
+    pub compact: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

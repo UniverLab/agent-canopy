@@ -108,6 +108,19 @@ fn validate_spec_workdir(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn resolve_prefix_or_error(
+    db: &Database,
+    raw: &str,
+    resolver: fn(&Database, &str) -> anyhow::Result<Option<String>>,
+    kind_name: &str,
+) -> Result<String, CallToolResult> {
+    match resolver(db, raw) {
+        Ok(Some(full_id)) => Ok(full_id),
+        Ok(None) => Err(error_result(&format!("{kind_name} '{raw}' not found."))),
+        Err(e) => Err(error_result(&e.to_string())),
+    }
+}
+
 /// Build a loop [`Trigger`] from MCP parameters, reusing the same cron/watch
 /// validation as agents. Returns `Ok(None)` for a manual loop (no trigger or
 /// `kind = "manual"`), and an `Err(message)` for invalid input.
@@ -460,12 +473,20 @@ fn resolve_graph_target(
         }
         (None, None) => Err("Provide exactly one of spec_id or loop_id.".to_string()),
         (Some(spec_id), None) => {
-            validate_spec_exists(db, spec_id)?;
-            Ok(GraphTarget::Spec(spec_id.to_string()))
+            let resolved = db
+                .resolve_spec_id_by_prefix(spec_id)
+                .map_err(|e| e.to_string())?;
+            let full_id = resolved.as_deref().unwrap_or(spec_id);
+            validate_spec_exists(db, full_id)?;
+            Ok(GraphTarget::Spec(full_id.to_string()))
         }
         (None, Some(loop_id)) => {
-            validate_loop_exists(db, loop_id)?;
-            Ok(GraphTarget::Loop(loop_id.to_string()))
+            let resolved = db
+                .resolve_loop_id_by_prefix(loop_id)
+                .map_err(|e| e.to_string())?;
+            let full_id = resolved.as_deref().unwrap_or(loop_id);
+            validate_loop_exists(db, full_id)?;
+            Ok(GraphTarget::Loop(full_id.to_string()))
         }
     }
 }
@@ -1275,7 +1296,7 @@ fn validate_queue_reorder_locking(
     Ok(())
 }
 
-fn queue_details_json(details: &QueueDetails) -> serde_json::Value {
+fn queue_details_json(details: &QueueDetails, include_descriptions: bool) -> serde_json::Value {
     serde_json::json!({
         "id": details.queue.id,
         "name": details.queue.name,
@@ -1284,7 +1305,7 @@ fn queue_details_json(details: &QueueDetails) -> serde_json::Value {
             .iter()
             .enumerate()
             .map(|(index, spec)| {
-                let mut value = spec_summary_json(spec);
+                let mut value = spec_summary_json(spec, include_descriptions);
                 value["queue_position"] = serde_json::json!(index + 1);
                 if let Some(Some(group)) = details.member_groups.get(&spec.id) {
                     value["group"] = serde_json::json!(group);
@@ -1489,21 +1510,37 @@ fn resolve_reported_run(
     run_id: &str,
     node_id: &str,
 ) -> Result<Result<LoopNodeRun, CallToolResult>, McpError> {
-    let run = db.get_loop_run(run_id).map_err(internal_error)?;
+    let resolved_run_id = match db
+        .resolve_run_id_by_prefix(run_id)
+        .map_err(|e| e.to_string())
+    {
+        Ok(Some(id)) => id,
+        Ok(None) => run_id.to_string(),
+        Err(e) => return Ok(Err(error_result(&e))),
+    };
+    let resolved_node_id = match db
+        .resolve_loop_node_id_by_prefix(node_id)
+        .map_err(|e| e.to_string())
+    {
+        Ok(Some(id)) => id,
+        Ok(None) => node_id.to_string(),
+        Err(e) => return Ok(Err(error_result(&e))),
+    };
+    let run = db.get_loop_run(&resolved_run_id).map_err(internal_error)?;
     let Some(run) = run else {
         return Ok(Err(error_result(&format!(
-            "No loop run found with id '{run_id}'."
+            "No loop run found with id '{resolved_run_id}'."
         ))));
     };
-    if run.node_id != node_id {
+    if run.node_id != resolved_node_id {
         return Ok(Err(error_result(&format!(
-            "Run '{run_id}' belongs to node '{}', not '{node_id}'.",
+            "Run '{resolved_run_id}' belongs to node '{}', not '{resolved_node_id}'.",
             run.node_id
         ))));
     }
     if run.status != LoopRunStatus::Running {
         return Ok(Err(error_result(&format!(
-            "Run '{run_id}' for node '{node_id}' is no longer active (status: {}); this report \
+            "Run '{resolved_run_id}' for node '{resolved_node_id}' is no longer active (status: {}); this report \
              is stale — the run was already finalized (timed out, paused, reset, superseded by \
              a retry, or already reported) — and was rejected.",
             run.status.as_str()
@@ -1519,21 +1556,31 @@ fn build_spec_update_response(spec_id: &str) -> CallToolResult {
 /// Summary JSON for `spec_list` — no run/blocker info, since a standalone
 /// (unassigned) spec has never run. Compare [`loop_spec_details_json`],
 /// which adds that runtime detail for specs already inside a loop.
-fn spec_summary_json(spec: &LoopSpec) -> serde_json::Value {
-    let mut obj = serde_json::json!({
-        "id": spec.id,
-        "loop_id": spec.loop_id,
-        "name": spec.name,
-        "description": spec.description,
-        "workdir": spec.workdir,
-        "position": spec.position,
-        "parallelizable": spec.parallelizable,
-        "status": spec.status.as_str(),
-    });
-    if let Some(via) = &spec.completed_via {
-        obj["completed_via"] = serde_json::json!(via);
+fn spec_summary_json(spec: &LoopSpec, include_descriptions: bool) -> serde_json::Value {
+    if include_descriptions {
+        let mut obj = serde_json::json!({
+            "id": spec.id,
+            "loop_id": spec.loop_id,
+            "name": spec.name,
+            "description": spec.description,
+            "workdir": spec.workdir,
+            "position": spec.position,
+            "parallelizable": spec.parallelizable,
+            "status": spec.status.as_str(),
+        });
+        if let Some(via) = &spec.completed_via {
+            obj["completed_via"] = serde_json::json!(via);
+        }
+        obj
+    } else {
+        serde_json::json!({
+            "id": spec.id,
+            "loop_id": spec.loop_id,
+            "name": spec.name,
+            "status": spec.status.as_str(),
+            "workdir": spec.workdir,
+        })
     }
-    obj
 }
 
 fn blueprint_json(blueprint: &Blueprint) -> serde_json::Value {
@@ -1586,12 +1633,20 @@ fn resolve_copy_target(
     match (spec_id, loop_id) {
         (Some(_), Some(_)) => Err("Provide at most one of spec_id or loop_id.".to_string()),
         (Some(spec_id), None) => {
-            validate_spec_exists(db, spec_id)?;
-            Ok(GraphTarget::Spec(spec_id.to_string()))
+            let resolved = db
+                .resolve_spec_id_by_prefix(spec_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("Spec '{spec_id}' not found."))?;
+            validate_spec_exists(db, &resolved)?;
+            Ok(GraphTarget::Spec(resolved))
         }
         (None, Some(loop_id)) => {
-            validate_loop_exists(db, loop_id)?;
-            Ok(GraphTarget::Loop(loop_id.to_string()))
+            let resolved = db
+                .resolve_loop_id_by_prefix(loop_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("Loop '{loop_id}' not found."))?;
+            validate_loop_exists(db, &resolved)?;
+            Ok(GraphTarget::Loop(resolved))
         }
         (None, None) => {
             if let Some(spec_id) = source_spec_id {
@@ -1640,15 +1695,18 @@ struct NodeCopyPlan {
 }
 
 fn plan_node_copy(db: &Database, params: &LoopCopyNodeParams) -> Result<NodeCopyPlan, String> {
-    let source_id = params.source_node_id.trim();
-    let source = validate_node_exists(db, source_id)?;
+    let source_id = db
+        .resolve_loop_node_id_by_prefix(params.source_node_id.trim())
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Node '{}' not found.", params.source_node_id.trim()))?;
+    let source = validate_node_exists(db, &source_id)?;
     if source.kind == LoopNodeKind::Join {
         return Err(
             "Cannot copy a quorum node directly; copy its ensemble with loop_copy_ensemble."
                 .to_string(),
         );
     }
-    if let Err(e) = validate_node_not_ensemble_owned(db, source_id) {
+    if let Err(e) = validate_node_not_ensemble_owned(db, &source_id) {
         return Err(format!(
             "Cannot copy an ensemble-owned node directly; copy the whole ensemble with loop_copy_ensemble instead. {e}"
         ));
@@ -1759,7 +1817,7 @@ fn plan_node_copy(db: &Database, params: &LoopCopyNodeParams) -> Result<NodeCopy
     }
 
     Ok(NodeCopyPlan {
-        source_id: source_id.to_string(),
+        source_id,
         node,
         edges,
         wiring,
@@ -1803,9 +1861,12 @@ fn plan_ensemble_copy(
     db: &Database,
     params: &LoopCopyEnsembleParams,
 ) -> Result<EnsembleCopyPlan, String> {
-    let source_id = params.source_ensemble_id.trim();
+    let source_id = db
+        .resolve_ensemble_id_by_prefix(params.source_ensemble_id.trim())
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Ensemble '{}' not found.", params.source_ensemble_id.trim()))?;
     let details = db
-        .get_ensemble_details(source_id)
+        .get_ensemble_details(&source_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Ensemble '{source_id}' not found."))?;
     let source = &details.ensemble;
@@ -3804,11 +3865,19 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<LoopUpdateParams>,
     ) -> Result<CallToolResult, McpError> {
-        let loop_id = params.loop_id.trim();
-        if let Err(e) = validate_non_empty(loop_id, "Loop ID") {
+        let loop_id = match resolve_prefix_or_error(
+            &self.db,
+            params.loop_id.trim(),
+            Database::resolve_loop_id_by_prefix,
+            "loop",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        if let Err(e) = validate_non_empty(&loop_id, "Loop ID") {
             return Ok(error_result(&e));
         }
-        if let Err(e) = validate_loop_exists(&self.db, loop_id) {
+        if let Err(e) = validate_loop_exists(&self.db, &loop_id) {
             return Ok(error_result(&e));
         }
 
@@ -3869,27 +3938,26 @@ impl TaskTriggerHandler {
         }
 
         self.db
-            .update_loop_details(loop_id, name, description, workdir)
+            .update_loop_details(&loop_id, name, description, workdir)
             .map_err(internal_error)?;
 
         if let Some(trigger) = new_trigger {
             self.db
-                .update_loop_trigger(loop_id, trigger.as_ref())
+                .update_loop_trigger(&loop_id, trigger.as_ref())
                 .map_err(internal_error)?;
-            // Tear down any live watcher, then re-activate from the new trigger.
-            let _ = self.watcher_engine.stop_loop_watcher(loop_id).await;
-            if let Ok(Some(lp)) = self.db.get_loop(loop_id) {
+            let _ = self.watcher_engine.stop_loop_watcher(&loop_id).await;
+            if let Ok(Some(lp)) = self.db.get_loop(&loop_id) {
                 self.activate_loop_trigger(&lp).await;
             }
         }
 
         if let Some(hook) = new_completion_hook {
             self.db
-                .update_loop_completion_hook(loop_id, hook.as_ref())
+                .update_loop_completion_hook(&loop_id, hook.as_ref())
                 .map_err(internal_error)?;
         }
 
-        Ok(build_loop_update_response(loop_id))
+        Ok(build_loop_update_response(&loop_id))
     }
 
     /// Reconcile a loop's live trigger wiring after create/update: wake the
@@ -3917,12 +3985,20 @@ impl TaskTriggerHandler {
         if let Err(e) = validate_non_empty(name, "Loop spec name") {
             return Ok(error_result(&e));
         }
-        let loop_id = params.loop_id.trim();
-        if let Err(e) = validate_loop_exists(&self.db, loop_id) {
+        let loop_id = match resolve_prefix_or_error(
+            &self.db,
+            params.loop_id.trim(),
+            Database::resolve_loop_id_by_prefix,
+            "loop",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        if let Err(e) = validate_loop_exists(&self.db, &loop_id) {
             return Ok(error_result(&e));
         }
 
-        let existing_specs = self.db.list_loop_specs(loop_id).map_err(internal_error)?;
+        let existing_specs = self.db.list_loop_specs(&loop_id).map_err(internal_error)?;
         if existing_specs
             .iter()
             .any(|spec| spec.position == params.position)
@@ -3943,7 +4019,7 @@ impl TaskTriggerHandler {
 
         let spec = LoopSpec {
             id: uuid::Uuid::new_v4().to_string(),
-            loop_id: Some(loop_id.to_string()),
+            loop_id: Some(loop_id),
             name: name.to_string(),
             description: Some(description.to_string()),
             position: params.position,
@@ -3971,8 +4047,16 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<LoopUpdateSpecParams>,
     ) -> Result<CallToolResult, McpError> {
-        let spec_id = params.spec_id.trim();
-        let spec = match validate_spec_exists(&self.db, spec_id) {
+        let spec_id = match resolve_prefix_or_error(
+            &self.db,
+            params.spec_id.trim(),
+            Database::resolve_spec_id_by_prefix,
+            "spec",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        let spec = match validate_spec_exists(&self.db, &spec_id) {
             Ok(spec) => spec,
             Err(e) => return Ok(error_result(&e)),
         };
@@ -3999,7 +4083,7 @@ impl TaskTriggerHandler {
 
         if let Some(position) = params.position {
             if let Err(e) =
-                validate_position_conflict(&self.db, spec.loop_id.as_deref(), spec_id, position)
+                validate_position_conflict(&self.db, spec.loop_id.as_deref(), &spec_id, position)
             {
                 return Ok(error_result(&e));
             }
@@ -4019,7 +4103,7 @@ impl TaskTriggerHandler {
 
         self.db
             .update_loop_spec_details(
-                spec_id,
+                &spec_id,
                 name,
                 description,
                 params.position,
@@ -4027,7 +4111,7 @@ impl TaskTriggerHandler {
             )
             .map_err(internal_error)?;
 
-        Ok(build_spec_update_response(spec_id))
+        Ok(build_spec_update_response(&spec_id))
     }
 
     #[tool(
@@ -4106,11 +4190,24 @@ impl TaskTriggerHandler {
             )
             .map_err(internal_error)?;
 
+        let include_descriptions = params.include_descriptions.unwrap_or(false);
+        let total = specs.len();
+        let cap = 200usize;
+        let truncated = total > cap;
+        let omitted = total.saturating_sub(cap);
+        let visible = &specs[..specs.len().min(cap)];
+
+        let mut body = serde_json::json!({
+            "specs": visible.iter().map(|s| spec_summary_json(s, include_descriptions)).collect::<Vec<_>>(),
+            "total": total,
+        });
+        if truncated {
+            body["truncated"] = serde_json::json!(true);
+            body["omitted"] = serde_json::json!(omitted);
+        }
+
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&serde_json::json!({
-                "specs": specs.iter().map(spec_summary_json).collect::<Vec<_>>(),
-            }))
-            .unwrap_or_default(),
+            serde_json::to_string_pretty(&body).unwrap_or_default(),
         )]))
     }
 
@@ -4122,8 +4219,16 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<SpecUpdateParams>,
     ) -> Result<CallToolResult, McpError> {
-        let spec_id = params.spec_id.trim();
-        if let Err(e) = validate_spec_exists(&self.db, spec_id) {
+        let spec_id = match resolve_prefix_or_error(
+            &self.db,
+            params.spec_id.trim(),
+            Database::resolve_spec_id_by_prefix,
+            "spec",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        if let Err(e) = validate_spec_exists(&self.db, &spec_id) {
             return Ok(error_result(&e));
         }
 
@@ -4166,10 +4271,10 @@ impl TaskTriggerHandler {
         }
 
         self.db
-            .update_spec_tag_details(spec_id, name, description, workdir)
+            .update_spec_tag_details(&spec_id, name, description, workdir)
             .map_err(internal_error)?;
 
-        Ok(build_spec_update_response(spec_id))
+        Ok(build_spec_update_response(&spec_id))
     }
 
     #[tool(
@@ -4180,8 +4285,16 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<SpecSetStatusParams>,
     ) -> Result<CallToolResult, McpError> {
-        let spec_id = params.spec_id.trim();
-        if let Err(e) = validate_spec_exists(&self.db, spec_id) {
+        let spec_id = match resolve_prefix_or_error(
+            &self.db,
+            params.spec_id.trim(),
+            Database::resolve_spec_id_by_prefix,
+            "spec",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        if let Err(e) = validate_spec_exists(&self.db, &spec_id) {
             return Ok(error_result(&e));
         }
 
@@ -4195,7 +4308,7 @@ impl TaskTriggerHandler {
             return Ok(error_result("Reason must not be empty."));
         }
 
-        match self.db.set_spec_admin_status(spec_id, status, reason)
+        match self.db.set_spec_admin_status(&spec_id, status, reason)
             .map_err(internal_error)? {
             SpecAdminStatusOutcome::Success => {
                 Ok(success_result(&format!(
@@ -4229,8 +4342,16 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<SpecDeleteParams>,
     ) -> Result<CallToolResult, McpError> {
-        let spec_id = params.spec_id.trim();
-        let spec = match validate_spec_exists(&self.db, spec_id) {
+        let spec_id = match resolve_prefix_or_error(
+            &self.db,
+            params.spec_id.trim(),
+            Database::resolve_spec_id_by_prefix,
+            "spec",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        let spec = match validate_spec_exists(&self.db, &spec_id) {
             Ok(spec) => spec,
             Err(e) => return Ok(error_result(&e)),
         };
@@ -4238,7 +4359,7 @@ impl TaskTriggerHandler {
             return Ok(error_result(&e));
         }
 
-        self.db.delete_loop_spec(spec_id).map_err(internal_error)?;
+        self.db.delete_loop_spec(&spec_id).map_err(internal_error)?;
 
         Ok(success_result(&format!("Spec '{spec_id}' deleted.")))
     }
@@ -4416,12 +4537,20 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<LoopUpdateNodeParams>,
     ) -> Result<CallToolResult, McpError> {
-        let node_id = params.node_id.trim();
-        let node = match validate_node_exists(&self.db, node_id) {
+        let node_id = match resolve_prefix_or_error(
+            &self.db,
+            params.node_id.trim(),
+            Database::resolve_loop_node_id_by_prefix,
+            "node",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        let node = match validate_node_exists(&self.db, &node_id) {
             Ok(node) => node,
             Err(e) => return Ok(error_result(&e)),
         };
-        if let Err(e) = validate_node_not_ensemble_owned(&self.db, node_id) {
+        if let Err(e) = validate_node_not_ensemble_owned(&self.db, &node_id) {
             return Ok(error_result(&e));
         }
 
@@ -4445,7 +4574,7 @@ impl TaskTriggerHandler {
         }
 
         if let Some(position) = params.position {
-            if let Err(e) = validate_node_position_conflict(&self.db, &node, node_id, position) {
+            if let Err(e) = validate_node_position_conflict(&self.db, &node, &node_id, position) {
                 return Ok(error_result(&e));
             }
         }
@@ -4488,20 +4617,20 @@ impl TaskTriggerHandler {
                         .map_err(internal_error)?,
                     (None, None) => Vec::new(),
                 };
-                if let Err(e) = validate_router_edges_declared(&routes, node_id, &edges) {
+                if let Err(e) = validate_router_edges_declared(&routes, &node_id, &edges) {
                     return Ok(error_result(&e));
                 }
-                if let Err(e) = validate_router_route_coverage(&routes, node_id, &edges) {
+                if let Err(e) = validate_router_route_coverage(&routes, &node_id, &edges) {
                     return Ok(error_result(&e));
                 }
             }
         }
 
         self.db
-            .update_loop_node_details(node_id, name, kind, config.as_ref(), params.position)
+            .update_loop_node_details(&node_id, name, kind, config.as_ref(), params.position)
             .map_err(internal_error)?;
 
-        Ok(build_node_update_response(node_id))
+        Ok(build_node_update_response(&node_id))
     }
 
     #[tool(
@@ -4518,6 +4647,24 @@ impl TaskTriggerHandler {
         ) {
             Ok(c) => c,
             Err(e) => return Ok(error_result(&e)),
+        };
+        let from_node = match resolve_prefix_or_error(
+            &self.db,
+            params.from_node.trim(),
+            Database::resolve_loop_node_id_by_prefix,
+            "node",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        let to_node = match resolve_prefix_or_error(
+            &self.db,
+            params.to_node.trim(),
+            Database::resolve_loop_node_id_by_prefix,
+            "node",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
         };
         let target = match resolve_graph_target(
             &self.db,
@@ -4537,20 +4684,20 @@ impl TaskTriggerHandler {
                 .list_loop_nodes_for_loop(loop_id)
                 .map_err(internal_error)?,
         };
-        let has_from = nodes.iter().any(|node| node.id == params.from_node);
-        let has_to = nodes.iter().any(|node| node.id == params.to_node);
+        let has_from = nodes.iter().any(|node| node.id == from_node);
+        let has_to = nodes.iter().any(|node| node.id == to_node);
         if !has_from || !has_to {
             return Ok(error_result(
                 "Both loop edge endpoints must belong to the same spec or loop graph as the edge.",
             ));
         }
-        if let Err(e) = validate_node_not_ensemble_owned(&self.db, &params.from_node) {
+        if let Err(e) = validate_node_not_ensemble_owned(&self.db, &from_node) {
             return Ok(error_result(&e));
         }
-        if let Err(e) = validate_node_not_ensemble_owned(&self.db, &params.to_node) {
+        if let Err(e) = validate_node_not_ensemble_owned(&self.db, &to_node) {
             return Ok(error_result(&e));
         }
-        if let Err(e) = validate_route_edge_target(&self.db, &params.from_node, &condition) {
+        if let Err(e) = validate_route_edge_target(&self.db, &from_node, &condition) {
             return Ok(error_result(&e));
         }
 
@@ -4562,8 +4709,8 @@ impl TaskTriggerHandler {
             id: uuid::Uuid::new_v4().to_string(),
             spec_id,
             loop_id,
-            from_node: params.from_node,
-            to_node: params.to_node,
+            from_node,
+            to_node,
             condition,
         };
         self.db.insert_loop_edge(&edge).map_err(internal_error)?;
@@ -4581,7 +4728,16 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<LoopUpdateEdgeParams>,
     ) -> Result<CallToolResult, McpError> {
-        let edge = match validate_edge_exists(&self.db, params.edge_id.trim()) {
+        let edge_id = match resolve_prefix_or_error(
+            &self.db,
+            params.edge_id.trim(),
+            Database::resolve_edge_id_by_prefix,
+            "edge",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        let edge = match validate_edge_exists(&self.db, &edge_id) {
             Ok(e) => e,
             Err(e) => return Ok(error_result(&e)),
         };
@@ -4602,14 +4758,30 @@ impl TaskTriggerHandler {
             return Ok(error_result(&e));
         }
 
-        let to_node = params
-            .to_node
+        let to_node = match &params.to_node {
+            Some(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    match resolve_prefix_or_error(
+                        &self.db,
+                        trimmed,
+                        Database::resolve_loop_node_id_by_prefix,
+                        "node",
+                    ) {
+                        Ok(id) => Some(id),
+                        Err(e) => return Ok(e),
+                    }
+                }
+            }
+            None => None,
+        };
+        let target_changed = to_node
             .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        let target_changed = to_node.is_some_and(|value| value != edge.to_node);
+            .is_some_and(|value| value != edge.to_node);
         if target_changed {
-            if let Err(e) = retarget_loop_edge(&self.db, &edge.id, to_node.unwrap()) {
+            if let Err(e) = retarget_loop_edge(&self.db, &edge.id, to_node.as_deref().unwrap()) {
                 return Ok(error_result(&e));
             }
         }
@@ -4640,7 +4812,16 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<LoopDeleteEdgeParams>,
     ) -> Result<CallToolResult, McpError> {
-        match delete_loop_edge_checked(&self.db, params.edge_id.trim()) {
+        let edge_id = match resolve_prefix_or_error(
+            &self.db,
+            params.edge_id.trim(),
+            Database::resolve_edge_id_by_prefix,
+            "edge",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        match delete_loop_edge_checked(&self.db, &edge_id) {
             Ok(edge) => Ok(success_result(&format!("Loop edge '{}' deleted.", edge.id))),
             Err(e) => Ok(error_result(&e)),
         }
@@ -4654,7 +4835,16 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<LoopDeleteNodeParams>,
     ) -> Result<CallToolResult, McpError> {
-        match delete_loop_node_checked(&self.db, params.node_id.trim()) {
+        let node_id = match resolve_prefix_or_error(
+            &self.db,
+            params.node_id.trim(),
+            Database::resolve_loop_node_id_by_prefix,
+            "node",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        match delete_loop_node_checked(&self.db, &node_id) {
             Ok(node) => Ok(success_result(&format!("Loop node '{}' deleted.", node.id))),
             Err(e) => Ok(error_result(&e)),
         }
@@ -4750,39 +4940,64 @@ impl TaskTriggerHandler {
         };
         let node_exists = |id: &str| existing_nodes.iter().any(|node| node.id == id);
 
-        let from_node = params.from_node.trim();
-        if !node_exists(from_node) {
+        let from_node = match resolve_prefix_or_error(
+            &self.db,
+            params.from_node.trim(),
+            Database::resolve_loop_node_id_by_prefix,
+            "node",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        if !node_exists(&from_node) {
             return Ok(error_result(&format!(
                 "Loop node '{from_node}' not found in the target graph."
             )));
         }
-        if let Err(e) = validate_node_not_ensemble_owned(&self.db, from_node) {
+        if let Err(e) = validate_node_not_ensemble_owned(&self.db, &from_node) {
             return Ok(error_result(&format!(
                 "Cannot wire an ensemble's entry from an ensemble-owned node (nested ensembles are not supported): {e}"
             )));
         }
 
-        let on_pass_to = params.on_pass_to.trim();
-        if let Err(e) = validate_non_empty(on_pass_to, "on_pass_to") {
+        let on_pass_to = match resolve_prefix_or_error(
+            &self.db,
+            params.on_pass_to.trim(),
+            Database::resolve_loop_node_id_by_prefix,
+            "node",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        if let Err(e) = validate_non_empty(&on_pass_to, "on_pass_to") {
             return Ok(error_result(&e));
         }
-        if !node_exists(on_pass_to) {
+        if !node_exists(&on_pass_to) {
             return Ok(error_result(&format!(
                 "Loop node '{on_pass_to}' not found in the target graph."
             )));
         }
-        if let Err(e) = validate_node_not_ensemble_owned(&self.db, on_pass_to) {
+        if let Err(e) = validate_node_not_ensemble_owned(&self.db, &on_pass_to) {
             return Ok(error_result(&format!(
                 "Cannot wire an ensemble's exit into another ensemble's members/quorum (nested ensembles are not supported): {e}"
             )));
         }
 
-        let on_fail_to = params
-            .on_fail_to
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        if let Some(on_fail_to) = on_fail_to {
+        let on_fail_to = match &params.on_fail_to {
+            Some(raw) => {
+                match resolve_prefix_or_error(
+                    &self.db,
+                    raw.trim(),
+                    Database::resolve_loop_node_id_by_prefix,
+                    "node",
+                ) {
+                    Ok(id) => Some(id),
+                    Err(e) => return Ok(e),
+                }
+            }
+            None => None,
+        };
+        if let Some(ref on_fail_to) = on_fail_to {
             if !node_exists(on_fail_to) {
                 return Ok(error_result(&format!(
                     "Loop node '{on_fail_to}' not found in the target graph."
@@ -4834,10 +5049,10 @@ impl TaskTriggerHandler {
             name,
             prompt_template,
             members: &members,
-            entry_from_node: from_node,
+            entry_from_node: &from_node,
             entry_condition: condition,
-            on_pass_to,
-            on_fail_to,
+            on_pass_to: &on_pass_to,
+            on_fail_to: on_fail_to.as_deref(),
             min_pass,
             timeout_minutes,
             straggler_timeout_minutes: params.straggler_timeout_minutes,
@@ -4970,10 +5185,18 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<LoopUpdateEnsembleParams>,
     ) -> Result<CallToolResult, McpError> {
-        let ensemble_id = params.ensemble_id.trim();
+        let ensemble_id = match resolve_prefix_or_error(
+            &self.db,
+            params.ensemble_id.trim(),
+            Database::resolve_ensemble_id_by_prefix,
+            "ensemble",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
         let Some(mut details) = self
             .db
-            .get_ensemble_details(ensemble_id)
+            .get_ensemble_details(&ensemble_id)
             .map_err(internal_error)?
         else {
             return Ok(error_result(&format!(
@@ -5035,7 +5258,7 @@ impl TaskTriggerHandler {
                 let existing = &old_members[index];
                 self.db
                     .update_ensemble_member(
-                        ensemble_id,
+                        &ensemble_id,
                         &existing.node_id,
                         platform,
                         model.as_deref(),
@@ -5121,7 +5344,7 @@ impl TaskTriggerHandler {
 
             details = self
                 .db
-                .get_ensemble_details(ensemble_id)
+                .get_ensemble_details(&ensemble_id)
                 .map_err(internal_error)?
                 .ok_or_else(|| {
                     internal_error(format!("Ensemble '{ensemble_id}' vanished mid-update."))
@@ -5155,7 +5378,7 @@ impl TaskTriggerHandler {
 
         if let Some(prompt_template) = params.prompt_template.as_deref() {
             self.db
-                .update_ensemble_prompt(ensemble_id, prompt_template.trim())
+                .update_ensemble_prompt(&ensemble_id, prompt_template.trim())
                 .map_err(internal_error)?;
         }
 
@@ -5186,7 +5409,7 @@ impl TaskTriggerHandler {
             }
             self.db
                 .update_ensemble_join_config(
-                    ensemble_id,
+                    &ensemble_id,
                     params.min_pass,
                     params.straggler_timeout_minutes,
                     params.timeout_minutes,
@@ -5277,7 +5500,7 @@ impl TaskTriggerHandler {
 
             self.db
                 .update_ensemble_exit_wiring(
-                    ensemble_id,
+                    &ensemble_id,
                     params.on_pass_to.as_deref(),
                     params.on_fail_to.as_ref().map(|value| value.as_deref()),
                 )
@@ -5349,7 +5572,11 @@ impl TaskTriggerHandler {
         )))
     }
 
-    async fn do_queue_list(&self, queue_id: Option<&str>) -> Result<CallToolResult, McpError> {
+    async fn do_queue_list(
+        &self,
+        queue_id: Option<&str>,
+        include_descriptions: bool,
+    ) -> Result<CallToolResult, McpError> {
         let queue_id = queue_id.map(str::trim).filter(|s| !s.is_empty());
 
         let body = match queue_id {
@@ -5359,7 +5586,29 @@ impl TaskTriggerHandler {
                     Ok(None) => return Ok(error_result(&format!("Queue '{queue_id}' not found."))),
                     Err(e) => return Err(internal_error(e.to_string())),
                 };
-                serde_json::json!({ "queue": queue_details_json(&details) })
+                let total = details.members.len();
+                let cap = 200usize;
+                let truncated = total > cap;
+                let omitted = total.saturating_sub(cap);
+                let visible_members = &details.members[..details.members.len().min(cap)];
+                let visible_groups: std::collections::HashMap<_, _> = details
+                    .member_groups
+                    .iter()
+                    .filter(|(id, _)| visible_members.iter().any(|m| &m.id == *id))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                let trimmed_details = QueueDetails {
+                    queue: details.queue,
+                    members: visible_members.to_vec(),
+                    member_groups: visible_groups,
+                };
+                let mut qobj = queue_details_json(&trimmed_details, include_descriptions);
+                qobj["total_members"] = serde_json::json!(total);
+                if truncated {
+                    qobj["truncated"] = serde_json::json!(true);
+                    qobj["omitted"] = serde_json::json!(omitted);
+                }
+                serde_json::json!({ "queue": qobj })
             }
             None => {
                 let queues = self.db.list_queues().map_err(internal_error)?;
@@ -5454,7 +5703,25 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<QueueAddSpecParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.do_queue_add_spec(&params.queue_id, &params.spec_id, params.group.as_deref())
+        let queue_id = match resolve_prefix_or_error(
+            &self.db,
+            params.queue_id.trim(),
+            Database::resolve_queue_id_by_prefix,
+            "queue",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        let spec_id = match resolve_prefix_or_error(
+            &self.db,
+            params.spec_id.trim(),
+            Database::resolve_spec_id_by_prefix,
+            "spec",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        self.do_queue_add_spec(&queue_id, &spec_id, params.group.as_deref())
             .await
     }
 
@@ -5466,7 +5733,25 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<QueueListParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.do_queue_list(params.queue_id.as_deref()).await
+        let resolved_queue_id = match &params.queue_id {
+            Some(qid) => {
+                match resolve_prefix_or_error(
+                    &self.db,
+                    qid.trim(),
+                    Database::resolve_queue_id_by_prefix,
+                    "queue",
+                ) {
+                    Ok(id) => Some(id),
+                    Err(e) => return Ok(e),
+                }
+            }
+            None => None,
+        };
+        self.do_queue_list(
+            resolved_queue_id.as_deref(),
+            params.include_descriptions.unwrap_or(false),
+        )
+        .await
     }
 
     #[tool(
@@ -5477,8 +5762,25 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<QueueRemoveSpecParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.do_queue_remove_spec(&params.queue_id, &params.spec_id)
-            .await
+        let queue_id = match resolve_prefix_or_error(
+            &self.db,
+            params.queue_id.trim(),
+            Database::resolve_queue_id_by_prefix,
+            "queue",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        let spec_id = match resolve_prefix_or_error(
+            &self.db,
+            params.spec_id.trim(),
+            Database::resolve_spec_id_by_prefix,
+            "spec",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        self.do_queue_remove_spec(&queue_id, &spec_id).await
     }
 
     #[tool(
@@ -5489,8 +5791,28 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<QueueReorderParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.do_queue_reorder(&params.queue_id, &params.spec_ids)
-            .await
+        let queue_id = match resolve_prefix_or_error(
+            &self.db,
+            params.queue_id.trim(),
+            Database::resolve_queue_id_by_prefix,
+            "queue",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        let mut resolved_spec_ids = Vec::with_capacity(params.spec_ids.len());
+        for sid in &params.spec_ids {
+            match resolve_prefix_or_error(
+                &self.db,
+                sid.trim(),
+                Database::resolve_spec_id_by_prefix,
+                "spec",
+            ) {
+                Ok(id) => resolved_spec_ids.push(id),
+                Err(e) => return Ok(e),
+            }
+        }
+        self.do_queue_reorder(&queue_id, &resolved_spec_ids).await
     }
 
     #[tool(
@@ -5501,14 +5823,18 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<LoopGetParams>,
     ) -> Result<CallToolResult, McpError> {
-        let lp = match self.db.get_loop_details(&params.loop_id) {
+        let loop_id = match resolve_prefix_or_error(
+            &self.db,
+            params.loop_id.trim(),
+            Database::resolve_loop_id_by_prefix,
+            "loop",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        let lp = match self.db.get_loop_details(&loop_id) {
             Ok(Some(w)) => w,
-            Ok(None) => {
-                return Ok(error_result(&format!(
-                    "Loop '{}' not found.",
-                    params.loop_id
-                )))
-            }
+            Ok(None) => return Ok(error_result(&format!("Loop '{}' not found.", loop_id))),
             Err(e) => return Err(internal_error(e.to_string())),
         };
 
@@ -5528,23 +5854,31 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<LoopExportParams>,
     ) -> Result<CallToolResult, McpError> {
-        let loop_id = params.loop_id.trim();
-        let Some(lp) = self.db.get_loop(loop_id).map_err(internal_error)? else {
+        let loop_id = match resolve_prefix_or_error(
+            &self.db,
+            params.loop_id.trim(),
+            Database::resolve_loop_id_by_prefix,
+            "loop",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        let Some(lp) = self.db.get_loop(&loop_id).map_err(internal_error)? else {
             return Ok(error_result(&format!("Loop '{loop_id}' not found.")));
         };
         let with_models = params.with_models.unwrap_or(false);
 
         let graph_nodes = self
             .db
-            .list_loop_nodes_for_loop(loop_id)
+            .list_loop_nodes_for_loop(&loop_id)
             .map_err(internal_error)?;
         let graph_edges = self
             .db
-            .list_loop_edges_for_loop(loop_id)
+            .list_loop_edges_for_loop(&loop_id)
             .map_err(internal_error)?;
         let ensembles = self
             .db
-            .list_ensembles_for_loop(loop_id)
+            .list_ensembles_for_loop(&loop_id)
             .map_err(internal_error)?;
 
         let document = match crate::domain::loop_transfer::build_export_document(
@@ -5728,45 +6062,101 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<LoopNodeRunsListParams>,
     ) -> Result<CallToolResult, McpError> {
+        let loop_id = match resolve_prefix_or_error(
+            &self.db,
+            params.loop_id.trim(),
+            Database::resolve_loop_id_by_prefix,
+            "loop",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        let resolved_spec_id = match &params.spec_id {
+            Some(sid) => {
+                match resolve_prefix_or_error(
+                    &self.db,
+                    sid.trim(),
+                    Database::resolve_spec_id_by_prefix,
+                    "spec",
+                ) {
+                    Ok(id) => Some(id),
+                    Err(e) => return Ok(e),
+                }
+            }
+            None => None,
+        };
+        let resolved_node_id = match &params.node_id {
+            Some(nid) => {
+                match resolve_prefix_or_error(
+                    &self.db,
+                    nid.trim(),
+                    Database::resolve_loop_node_id_by_prefix,
+                    "node",
+                ) {
+                    Ok(id) => Some(id),
+                    Err(e) => return Ok(e),
+                }
+            }
+            None => None,
+        };
+
         if self
             .db
-            .get_loop(&params.loop_id)
+            .get_loop(&loop_id)
             .map_err(internal_error)?
             .is_none()
         {
-            return Ok(error_result(&format!(
-                "Loop '{}' not found.",
-                params.loop_id
-            )));
+            return Ok(error_result(&format!("Loop '{}' not found.", loop_id)));
         }
 
         let limit = params.limit.unwrap_or(20).clamp(1, 200) as i64;
         let offset = params.offset.unwrap_or(0) as i64;
 
+        let compact = params.compact.unwrap_or(false);
+
         let runs = self
             .db
             .list_loop_node_runs(
-                &params.loop_id,
-                params.spec_id.as_deref(),
-                params.node_id.as_deref(),
+                &loop_id,
+                resolved_spec_id.as_deref(),
+                resolved_node_id.as_deref(),
                 limit,
                 offset,
             )
             .map_err(internal_error)?;
 
+        let total = self
+            .db
+            .count_loop_node_runs_filtered(
+                &loop_id,
+                resolved_spec_id.as_deref(),
+                resolved_node_id.as_deref(),
+            )
+            .map_err(internal_error)?;
+
         let out = runs
             .iter()
-            .map(|run| loop_node_run_summary_json(&self.db, run))
+            .map(|run| loop_node_run_summary_json(&self.db, run, compact))
             .collect::<Vec<_>>();
 
+        let returned = out.len() as i64;
+        let remaining = (total - offset).saturating_sub(returned);
+        let truncated = remaining > 0;
+
+        let mut body = serde_json::json!({
+            "loop_id": loop_id,
+            "limit": limit,
+            "offset": offset,
+            "runs": out,
+            "total": total,
+        });
+        if truncated {
+            body["truncated"] = serde_json::json!(true);
+            body["omitted"] = serde_json::json!(remaining);
+        }
+
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&serde_json::json!({
-                "loop_id": params.loop_id,
-                "limit": limit,
-                "offset": offset,
-                "runs": out,
-            }))
-            .unwrap_or_default(),
+            serde_json::to_string_pretty(&body).unwrap_or_default(),
         )]))
     }
 
@@ -5778,15 +6168,17 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<LoopNodeRunGetParams>,
     ) -> Result<CallToolResult, McpError> {
-        let Some(run) = self
-            .db
-            .get_loop_run(&params.run_id)
-            .map_err(internal_error)?
-        else {
-            return Ok(error_result(&format!(
-                "Node run '{}' not found.",
-                params.run_id
-            )));
+        let run_id = match resolve_prefix_or_error(
+            &self.db,
+            params.run_id.trim(),
+            Database::resolve_run_id_by_prefix,
+            "run",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        let Some(run) = self.db.get_loop_run(&run_id).map_err(internal_error)? else {
+            return Ok(error_result(&format!("Node run '{}' not found.", run_id)));
         };
         let node_name = self
             .db
@@ -6002,18 +6394,22 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<LoopRunParams>,
     ) -> Result<CallToolResult, McpError> {
-        let lp = match self.db.get_loop(&params.loop_id) {
+        let loop_id = match resolve_prefix_or_error(
+            &self.db,
+            params.loop_id.trim(),
+            Database::resolve_loop_id_by_prefix,
+            "loop",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        let lp = match self.db.get_loop(&loop_id) {
             Ok(Some(w)) => w,
-            Ok(None) => {
-                return Ok(error_result(&format!(
-                    "Loop '{}' not found.",
-                    params.loop_id
-                )))
-            }
+            Ok(None) => return Ok(error_result(&format!("Loop '{}' not found.", loop_id))),
             Err(e) => return Err(internal_error(e.to_string())),
         };
 
-        if let Err(message) = loop_run_status_guard(&params.loop_id, lp.status) {
+        if let Err(message) = loop_run_status_guard(&loop_id, lp.status) {
             return Ok(error_result(&message));
         }
 
@@ -6033,21 +6429,15 @@ impl TaskTriggerHandler {
                     "Loop '{}' is blocked and cannot be relaunched via loop_run: {blocker}. \
                      Resolve it, then loop_reset the affected spec (naming it explicitly \
                      clears its cross-run attempt count) before relaunching.",
-                    params.loop_id
+                    loop_id
                 )));
             }
         }
 
-        // A dispatch is refused while any run of this loop is still
-        // `running`, whatever the loop's own status says — see
-        // `find_in_flight_run`. This is what a `paused`-but-still-executing
-        // loop (a sibling node's blocker report flipped status without
-        // terminating this run) must hit instead of launching a second,
-        // racing dispatch.
-        if let Some(run) = find_in_flight_run(&self.db, &params.loop_id).map_err(internal_error)? {
+        if let Some(run) = find_in_flight_run(&self.db, &loop_id).map_err(internal_error)? {
             let node_name = node_name_for_error(&self.db, &run.node_id).map_err(internal_error)?;
             return Ok(error_result(&in_flight_run_error(
-                &params.loop_id,
+                &loop_id,
                 &run.id,
                 &node_name,
                 run.started_at,
@@ -6063,7 +6453,7 @@ impl TaskTriggerHandler {
             if let Err(e) = validate_queue_exists(&self.db, queue_id) {
                 return Ok(error_result(&e));
             }
-            if let Err(e) = validate_queue_not_consumed(&self.db, queue_id, &params.loop_id) {
+            if let Err(e) = validate_queue_not_consumed(&self.db, queue_id, &loop_id) {
                 return Ok(error_result(&e));
             }
         }
@@ -6079,34 +6469,24 @@ impl TaskTriggerHandler {
             }
         }
 
-        if let Err(e) = validate_loop_ensembles_for_run(&self.db, &params.loop_id, queue_id) {
+        if let Err(e) = validate_loop_ensembles_for_run(&self.db, &loop_id, queue_id) {
             return Ok(error_result(&e));
         }
 
-        // (B17) An empty effective spec set is a launch error, not a
-        // successful no-op run — check it here, synchronously, so the caller
-        // (human or an LLM recovery agent) gets the actionable message back
-        // directly instead of only via a log line once the fire-and-forget
-        // background dispatch below refuses to launch. `run_loop_dispatch`
-        // re-runs this identical check right before flipping the loop to
-        // `Running`, so every other launch path inherits it too.
-        match self
-            .loop_engine
-            .empty_launch_check(&params.loop_id, queue_id)
-        {
+        match self.loop_engine.empty_launch_check(&loop_id, queue_id) {
             Ok(Some(message)) => return Ok(error_result(&message)),
             Ok(None) => {}
             Err(e) => return Err(internal_error(e.to_string())),
         }
 
         Arc::clone(&self.loop_engine).start_background_run(
-            params.loop_id.clone(),
+            loop_id.clone(),
             queue_id.map(str::to_string),
             workdir.map(str::to_string),
         );
         Ok(success_result(&format!(
             "Loop '{}' launched in background.",
-            params.loop_id
+            loop_id
         )))
     }
 
@@ -6127,7 +6507,16 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<LoopResetParams>,
     ) -> Result<CallToolResult, McpError> {
-        perform_loop_reset(&self.db, &params.loop_id, params.specs.as_deref())
+        let loop_id = match resolve_prefix_or_error(
+            &self.db,
+            params.loop_id.trim(),
+            Database::resolve_loop_id_by_prefix,
+            "loop",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        perform_loop_reset(&self.db, &loop_id, params.specs.as_deref())
     }
 
     /// Schedule a one-shot future resume for a loop (e.g. a loop that failed
@@ -6148,11 +6537,20 @@ impl TaskTriggerHandler {
     async fn loop_schedule_autorun(
         &self,
         Parameters(LoopScheduleAutorunParams {
-            loop_id,
+            loop_id: raw_loop_id,
             at,
             quota_reset_message,
         }): Parameters<LoopScheduleAutorunParams>,
     ) -> Result<CallToolResult, McpError> {
+        let loop_id = match resolve_prefix_or_error(
+            &self.db,
+            raw_loop_id.trim(),
+            Database::resolve_loop_id_by_prefix,
+            "loop",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
         let Some(existing) = self
             .db
             .get_loop(&loop_id)
@@ -6258,11 +6656,20 @@ impl TaskTriggerHandler {
     async fn loop_schedule_continue(
         &self,
         Parameters(LoopScheduleContinueParams {
-            loop_id,
+            loop_id: raw_loop_id,
             at,
             action,
         }): Parameters<LoopScheduleContinueParams>,
     ) -> Result<CallToolResult, McpError> {
+        let loop_id = match resolve_prefix_or_error(
+            &self.db,
+            raw_loop_id.trim(),
+            Database::resolve_loop_id_by_prefix,
+            "loop",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
         let Some(existing) = self
             .db
             .get_loop(&loop_id)
@@ -6328,19 +6735,28 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<LoopPauseParams>,
     ) -> Result<CallToolResult, McpError> {
+        let loop_id = match resolve_prefix_or_error(
+            &self.db,
+            params.loop_id.trim(),
+            Database::resolve_loop_id_by_prefix,
+            "loop",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
         let paused = self
             .loop_engine
-            .request_pause(&params.loop_id)
+            .request_pause(&loop_id)
             .map_err(internal_error)?;
         if paused {
             Ok(success_result(&format!(
                 "Loop '{}' marked to pause.",
-                params.loop_id
+                loop_id
             )))
         } else {
             Ok(error_result(&format!(
                 "Loop '{}' is not running or does not exist.",
-                params.loop_id
+                loop_id
             )))
         }
     }
@@ -6353,22 +6769,31 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<LoopArchiveParams>,
     ) -> Result<CallToolResult, McpError> {
-        match self.db.archive_loop(&params.loop_id).map_err(internal_error)? {
+        let loop_id = match resolve_prefix_or_error(
+            &self.db,
+            params.loop_id.trim(),
+            Database::resolve_loop_id_by_prefix,
+            "loop",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        match self.db.archive_loop(&loop_id).map_err(internal_error)? {
             ArchiveLoopOutcome::Archived => Ok(success_result(&format!(
                 "Loop '{}' archived. Its specs and run history are intact; restore it with loop_restore.",
-                params.loop_id
+                loop_id
             ))),
             ArchiveLoopOutcome::AlreadyArchived => Ok(error_result(&format!(
                 "Loop '{}' is already archived.",
-                params.loop_id
+                loop_id
             ))),
             ArchiveLoopOutcome::Running => Ok(error_result(&format!(
                 "Loop '{}' is running — pause it before archiving.",
-                params.loop_id
+                loop_id
             ))),
             ArchiveLoopOutcome::NotFound => Ok(error_result(&format!(
                 "Loop '{}' not found.",
-                params.loop_id
+                loop_id
             ))),
         }
     }
@@ -6381,19 +6806,25 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<LoopRestoreParams>,
     ) -> Result<CallToolResult, McpError> {
-        let restored = self
-            .db
-            .restore_loop(&params.loop_id)
-            .map_err(internal_error)?;
+        let loop_id = match resolve_prefix_or_error(
+            &self.db,
+            params.loop_id.trim(),
+            Database::resolve_loop_id_by_prefix,
+            "loop",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        let restored = self.db.restore_loop(&loop_id).map_err(internal_error)?;
         if restored {
             Ok(success_result(&format!(
                 "Loop '{}' restored to the main list.",
-                params.loop_id
+                loop_id
             )))
         } else {
             Ok(error_result(&format!(
                 "Loop '{}' not found or not archived.",
-                params.loop_id
+                loop_id
             )))
         }
     }
@@ -6406,28 +6837,29 @@ impl TaskTriggerHandler {
         &self,
         Parameters(params): Parameters<LoopContinueParams>,
     ) -> Result<CallToolResult, McpError> {
-        let lp = match self.db.get_loop(&params.loop_id) {
+        let loop_id = match resolve_prefix_or_error(
+            &self.db,
+            params.loop_id.trim(),
+            Database::resolve_loop_id_by_prefix,
+            "loop",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        let lp = match self.db.get_loop(&loop_id) {
             Ok(Some(w)) => w,
-            Ok(None) => {
-                return Ok(error_result(&format!(
-                    "Loop '{}' not found.",
-                    params.loop_id
-                )))
-            }
+            Ok(None) => return Ok(error_result(&format!("Loop '{}' not found.", loop_id))),
             Err(e) => return Err(internal_error(e.to_string())),
         };
         if lp.status != LoopStatus::Paused {
-            return Ok(error_result(&format!(
-                "Loop '{}' is not paused.",
-                params.loop_id
-            )));
+            return Ok(error_result(&format!("Loop '{}' is not paused.", loop_id)));
         }
 
         match params.action.trim() {
             "retry_current_node" => {
-                handle_retry_current_node(&self.db, &params.loop_id)?;
+                handle_retry_current_node(&self.db, &loop_id)?;
             }
-            "skip_next_spec" => handle_skip_next_spec(&self.db, &params.loop_id)?,
+            "skip_next_spec" => handle_skip_next_spec(&self.db, &loop_id)?,
             _ => {
                 return Ok(error_result(
                     "loop_continue action must be retry_current_node or skip_next_spec.",
@@ -6435,17 +6867,11 @@ impl TaskTriggerHandler {
             }
         }
 
-        // Resume with the loop's persisted run context — a paused queue run
-        // must pick the same queue back up, not the loop's own bound specs.
-        // The flip to `Running` is NOT done here: the dispatch's own atomic
-        // loop claim (B42) owns that transition, so this resume and any other
-        // launch racing it converge on one guarded entry point instead of each
-        // pre-flipping the status and then both dispatching.
-        Arc::clone(&self.loop_engine).resume_background(params.loop_id.clone());
+        Arc::clone(&self.loop_engine).resume_background(loop_id.clone());
 
         Ok(success_result(&format!(
             "Loop '{}' resumed with action '{}'.",
-            params.loop_id, params.action
+            loop_id, params.action
         )))
     }
 
@@ -7399,23 +7825,43 @@ fn loop_run_blocker(run: &crate::domain::loops::LoopNodeRun) -> Option<String> {
 /// (can be large; a caller wanting them calls `loop_node_run_get` with this
 /// row's `id`) but resolves `node_name` so a caller isn't left matching a
 /// bare node id back to the graph by hand.
-fn loop_node_run_summary_json(db: &Database, run: &LoopNodeRun) -> serde_json::Value {
+fn loop_node_run_summary_json(
+    db: &Database,
+    run: &LoopNodeRun,
+    compact: bool,
+) -> serde_json::Value {
     let node_name = db
         .get_loop_node(&run.node_id)
         .ok()
         .flatten()
         .map(|node| node.name);
-    serde_json::json!({
-        "id": run.id,
-        "spec_id": run.spec_id,
-        "node_id": run.node_id,
-        "node_name": node_name,
-        "status": run.status.as_str(),
-        "iteration": run.iteration,
-        "started_at": run.started_at.to_rfc3339(),
-        "completed_at": run.completed_at.map(|value| value.to_rfc3339()),
-        "session_id": run.session_id,
-    })
+    if compact {
+        let spec_name = db
+            .get_loop_spec(&run.spec_id)
+            .ok()
+            .flatten()
+            .map(|s| s.name);
+        serde_json::json!({
+            "node_name": node_name,
+            "status": run.status.as_str(),
+            "iteration": run.iteration,
+            "spec_name": spec_name,
+            "started_at": run.started_at.to_rfc3339(),
+            "completed_at": run.completed_at.map(|value| value.to_rfc3339()),
+        })
+    } else {
+        serde_json::json!({
+            "id": run.id,
+            "spec_id": run.spec_id,
+            "node_id": run.node_id,
+            "node_name": node_name,
+            "status": run.status.as_str(),
+            "iteration": run.iteration,
+            "started_at": run.started_at.to_rfc3339(),
+            "completed_at": run.completed_at.map(|value| value.to_rfc3339()),
+            "session_id": run.session_id,
+        })
+    }
 }
 
 /// The `loop_node_run_get` response: everything `loop_node_run_summary_json`
@@ -11077,7 +11523,7 @@ mod tests {
             completed_via_reason: None,
             completed_via_at: None,
         };
-        let json = spec_summary_json(&spec);
+        let json = spec_summary_json(&spec, true);
         assert_eq!(json["id"], "spec-1");
         assert_eq!(json["loop_id"], "loop-1");
         assert_eq!(json["name"], "My Spec");
@@ -11108,7 +11554,7 @@ mod tests {
             completed_via_reason: None,
             completed_via_at: None,
         };
-        let json = spec_summary_json(&spec);
+        let json = spec_summary_json(&spec, true);
         assert_eq!(json["completed_via"], "loop_reset");
     }
 
@@ -12221,7 +12667,7 @@ mod additional_tests {
             completed_via_reason: None,
             completed_via_at: None,
         };
-        let json = spec_summary_json(&spec);
+        let json = spec_summary_json(&spec, true);
         assert!(json["loop_id"].is_null());
         assert!(json["description"].is_null());
         assert!(json["workdir"].is_null());
@@ -12654,7 +13100,7 @@ mod additional_tests {
     #[test]
     fn spec_summary_json_basic() {
         let spec = standalone_spec("spec-1");
-        let json = spec_summary_json(&spec);
+        let json = spec_summary_json(&spec, true);
         assert_eq!(json["id"], "spec-1");
         assert_eq!(json["name"], "spec-1");
         assert_eq!(json["status"], "pending");
@@ -12665,7 +13111,7 @@ mod additional_tests {
     fn spec_summary_json_with_completed_via() {
         let mut spec = standalone_spec("spec-1");
         spec.completed_via = Some("test".to_string());
-        let json = spec_summary_json(&spec);
+        let json = spec_summary_json(&spec, true);
         assert_eq!(json["completed_via"], "test");
     }
 
@@ -12673,7 +13119,7 @@ mod additional_tests {
     fn spec_summary_json_with_workdir() {
         let mut spec = standalone_spec("spec-1");
         spec.workdir = Some("/tmp/project".to_string());
-        let json = spec_summary_json(&spec);
+        let json = spec_summary_json(&spec, true);
         assert_eq!(json["workdir"], "/tmp/project");
     }
 
@@ -14040,7 +14486,7 @@ mod coverage_tests {
         ] {
             let mut spec = standalone_spec("s");
             spec.status = status;
-            let json = spec_summary_json(&spec);
+            let json = spec_summary_json(&spec, true);
             assert_eq!(json["status"], status.as_str());
         }
     }
@@ -14162,6 +14608,83 @@ mod coverage_tests {
     fn copy_note_unwired() {
         let n = node_copy_note("src", "dst", false);
         assert!(n.contains("Unwired") && n.contains("loop_add_edge"));
+    }
+
+    #[test]
+    fn spec_summary_json_compact_omits_description() {
+        let mut spec = standalone_spec("spec-1");
+        spec.description = Some("A long description".to_string());
+        let json = spec_summary_json(&spec, false);
+        assert!(
+            json.get("description").is_none(),
+            "compact mode must omit description"
+        );
+        assert_eq!(json["id"], "spec-1");
+        assert_eq!(json["name"], "spec-1");
+        assert_eq!(json["status"], "pending");
+    }
+
+    #[test]
+    fn queue_details_json_compact_members_have_position_and_group() {
+        let spec = standalone_spec("spec-1");
+        let queue = Queue {
+            id: "q-1".to_string(),
+            name: "test-queue".to_string(),
+            created_at: chrono::Utc::now(),
+        };
+        let mut member_groups = std::collections::HashMap::new();
+        member_groups.insert("spec-1".to_string(), Some("group-a".to_string()));
+        let details = QueueDetails {
+            queue,
+            members: vec![spec],
+            member_groups,
+        };
+        let json = queue_details_json(&details, false);
+        let members = json["members"].as_array().unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0]["queue_position"], 1);
+        assert_eq!(members[0]["group"], "group-a");
+        assert!(
+            members[0].get("description").is_none(),
+            "compact mode must omit description"
+        );
+    }
+
+    #[test]
+    fn loop_node_run_summary_json_compact_mode_omits_ids() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        db.insert_loop_spec(&standalone_spec("spec-1")).unwrap();
+        insert_test_node(&db, "node-1", "spec-1");
+        let run = loop_run_row("run-1", "loop-1", "spec-1", LoopRunStatus::Pass);
+
+        let compact = loop_node_run_summary_json(&db, &run, true);
+        assert!(compact.get("id").is_none(), "compact must omit id");
+        assert!(
+            compact.get("spec_id").is_none(),
+            "compact must omit spec_id"
+        );
+        assert!(
+            compact.get("node_id").is_none(),
+            "compact must omit node_id"
+        );
+        assert!(
+            compact.get("session_id").is_none(),
+            "compact must omit session_id"
+        );
+        assert_eq!(compact["spec_name"], "spec-1");
+        assert_eq!(compact["node_name"], "node-1");
+        assert_eq!(compact["status"], "pass");
+        assert_eq!(compact["iteration"], 1);
+
+        let full = loop_node_run_summary_json(&db, &run, false);
+        assert_eq!(full["id"], "run-1");
+        assert_eq!(full["spec_id"], "spec-1");
+        assert_eq!(full["node_id"], "node-1");
+        assert!(
+            full.get("spec_name").is_none(),
+            "full mode does not carry spec_name"
+        );
     }
 }
 
@@ -15971,6 +16494,7 @@ mod endpoint_tests {
                 workdir: None,
                 status: None,
                 unassigned_only: Some(true),
+                include_descriptions: None,
             }))
             .await
             .unwrap();
@@ -15981,6 +16505,7 @@ mod endpoint_tests {
                 workdir: None,
                 status: Some("sideways".to_string()),
                 unassigned_only: None,
+                include_descriptions: None,
             }))
             .await
             .unwrap();
@@ -17078,7 +17603,7 @@ mod endpoint_tests {
             .await
             .unwrap();
         assert!(is_err(&unknown_entry));
-        assert!(text(&unknown_entry).contains("not found in the target graph"));
+        assert!(text(&unknown_entry).contains("not found"));
 
         let too_few_members = handler
             .loop_add_ensemble(Parameters(LoopAddEnsembleParams {
@@ -17358,6 +17883,7 @@ mod endpoint_tests {
                 node_id: None,
                 limit: None,
                 offset: None,
+                compact: None,
             }))
             .await
             .unwrap();
@@ -17385,6 +17911,7 @@ mod endpoint_tests {
                 node_id: None,
                 limit: None,
                 offset: None,
+                compact: None,
             }))
             .await
             .unwrap();
@@ -17435,6 +17962,7 @@ mod endpoint_tests {
                 node_id: None,
                 limit: None,
                 offset: None,
+                compact: None,
             }))
             .await
             .unwrap();
@@ -17453,6 +17981,7 @@ mod endpoint_tests {
                 node_id: None,
                 limit: Some(1),
                 offset: None,
+                compact: None,
             }))
             .await
             .unwrap();
@@ -19284,5 +19813,311 @@ mod endpoint_tests {
             "node should be gone after prefix delete: {}",
             text(&walked)
         );
+    }
+
+    #[tokio::test]
+    async fn spec_list_default_compact_omits_description() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let created = handler
+            .spec_create(Parameters(SpecCreateParams {
+                name: "Compact test".to_string(),
+                description: valid_spec_description(),
+                workdir: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&created), "{}", text(&created));
+
+        let listed = handler
+            .spec_list(Parameters(SpecListParams {
+                workdir: None,
+                status: None,
+                unassigned_only: None,
+                include_descriptions: None,
+            }))
+            .await
+            .unwrap();
+        let body = raw_text(&listed);
+        assert!(
+            !body.contains("Objective"),
+            "compact mode must omit description content"
+        );
+        assert!(body.contains("Compact test"));
+    }
+
+    #[tokio::test]
+    async fn spec_list_with_include_descriptions_returns_description() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let desc = valid_spec_description();
+        let created = handler
+            .spec_create(Parameters(SpecCreateParams {
+                name: "Verbose test".to_string(),
+                description: desc.clone(),
+                workdir: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&created), "{}", text(&created));
+
+        let listed = handler
+            .spec_list(Parameters(SpecListParams {
+                workdir: None,
+                status: None,
+                unassigned_only: None,
+                include_descriptions: Some(true),
+            }))
+            .await
+            .unwrap();
+        let body = raw_text(&listed);
+        assert!(
+            body.contains("Objective"),
+            "include_descriptions must include description content"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_node_runs_list_compact_mode() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let node = insert_named_node(&db, &spec.id, "builder", 1);
+        let now = chrono::Utc::now();
+        insert_finalized_node_run(
+            &db,
+            &lp.id,
+            &spec.id,
+            &node.id,
+            LoopRunStatus::Pass,
+            None,
+            now,
+        );
+
+        let listed = handler
+            .loop_node_runs_list(Parameters(LoopNodeRunsListParams {
+                loop_id: lp.id.clone(),
+                spec_id: None,
+                node_id: None,
+                limit: None,
+                offset: None,
+                compact: Some(true),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&listed), "{}", text(&listed));
+        let body = raw_text(&listed);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let runs = parsed["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].get("id").is_none(), "compact mode must omit id");
+        assert!(
+            runs[0].get("spec_id").is_none(),
+            "compact mode must omit spec_id"
+        );
+        assert_eq!(runs[0]["spec_name"], "Test Spec");
+        assert_eq!(runs[0]["node_name"], "builder");
+    }
+
+    #[tokio::test]
+    async fn loop_node_runs_list_reports_truncation() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let node = insert_named_node(&db, &spec.id, "builder", 1);
+        let now = chrono::Utc::now();
+        for i in 0..3 {
+            insert_finalized_node_run(
+                &db,
+                &lp.id,
+                &spec.id,
+                &node.id,
+                LoopRunStatus::Pass,
+                None,
+                now - chrono::Duration::minutes(i),
+            );
+        }
+
+        let capped = handler
+            .loop_node_runs_list(Parameters(LoopNodeRunsListParams {
+                loop_id: lp.id.clone(),
+                spec_id: None,
+                node_id: None,
+                limit: Some(1),
+                offset: None,
+                compact: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&capped), "{}", text(&capped));
+        let parsed: serde_json::Value = serde_json::from_str(&raw_text(&capped)).unwrap();
+        assert_eq!(parsed["runs"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["total"], 3);
+        assert_eq!(parsed["truncated"], true);
+        assert_eq!(parsed["omitted"], 2);
+
+        let full = handler
+            .loop_node_runs_list(Parameters(LoopNodeRunsListParams {
+                loop_id: lp.id.clone(),
+                spec_id: None,
+                node_id: None,
+                limit: Some(50),
+                offset: None,
+                compact: None,
+            }))
+            .await
+            .unwrap();
+        let parsed_full: serde_json::Value = serde_json::from_str(&raw_text(&full)).unwrap();
+        assert_eq!(parsed_full["total"], 3);
+        assert!(
+            parsed_full.get("truncated").is_none(),
+            "a complete result must not claim truncation"
+        );
+        assert!(parsed_full.get("omitted").is_none());
+    }
+
+    #[tokio::test]
+    async fn spec_update_with_prefix_resolves() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        let created = handler
+            .spec_create(Parameters(SpecCreateParams {
+                name: "Prefix test".to_string(),
+                description: valid_spec_description(),
+                workdir: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&created), "{}", text(&created));
+
+        let all_specs = db.list_specs(None, None, false).unwrap();
+        let full_id = all_specs[0].id.clone();
+        let prefix = &full_id[..8];
+
+        let updated = handler
+            .spec_update(Parameters(SpecUpdateParams {
+                spec_id: prefix.to_string(),
+                name: Some("Renamed via prefix".to_string()),
+                description: None,
+                workdir: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&updated), "{}", text(&updated));
+        assert_eq!(
+            db.get_loop_spec(&full_id).unwrap().unwrap().name,
+            "Renamed via prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_spec_id_by_prefix_tests() {
+        let (_dir, db, _handler) = endpoint_test_handler();
+        let spec1 = LoopSpec {
+            id: "aaaaaaaa-1111-1111-1111-111111111111".to_string(),
+            loop_id: None,
+            name: "Spec A".to_string(),
+            description: Some("First".to_string()),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        db.insert_loop_spec(&spec1).unwrap();
+        let spec2 = LoopSpec {
+            id: "aaaaaaaa-2222-2222-2222-222222222222".to_string(),
+            loop_id: None,
+            name: "Spec B".to_string(),
+            description: Some("Second".to_string()),
+            position: 2,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        db.insert_loop_spec(&spec2).unwrap();
+
+        let exact = db.resolve_spec_id_by_prefix(&spec1.id).unwrap();
+        assert_eq!(exact, Some(spec1.id.clone()));
+
+        let prefix_match = db.resolve_spec_id_by_prefix("aaaaaaaa-1111").unwrap();
+        assert_eq!(prefix_match, Some(spec1.id));
+
+        let ambiguous = db.resolve_spec_id_by_prefix("aaaaaaaa");
+        assert!(ambiguous.is_err(), "ambiguous prefix should error");
+        assert!(ambiguous.unwrap_err().to_string().contains("Ambiguous"));
+
+        let not_found = db.resolve_spec_id_by_prefix("zzzzzzzz").unwrap();
+        assert_eq!(not_found, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_queue_id_by_prefix_tests() {
+        let (_dir, db, _handler) = endpoint_test_handler();
+        let q1 = Queue {
+            id: "q-aaaaaaaa-1111".to_string(),
+            name: "Q1".to_string(),
+            created_at: chrono::Utc::now(),
+        };
+        let q2 = Queue {
+            id: "q-aaaaaaaa-2222".to_string(),
+            name: "Q2".to_string(),
+            created_at: chrono::Utc::now(),
+        };
+        db.insert_queue(&q1).unwrap();
+        db.insert_queue(&q2).unwrap();
+
+        let exact = db.resolve_queue_id_by_prefix("q-aaaaaaaa-1111").unwrap();
+        assert_eq!(exact, Some("q-aaaaaaaa-1111".to_string()));
+
+        let prefix_match = db.resolve_queue_id_by_prefix("q-aaaaaaaa-111").unwrap();
+        assert_eq!(prefix_match, Some("q-aaaaaaaa-1111".to_string()));
+
+        let ambiguous = db.resolve_queue_id_by_prefix("q-aaaaaaaa");
+        assert!(ambiguous.is_err());
+
+        let not_found = db.resolve_queue_id_by_prefix("q-zzzz").unwrap();
+        assert_eq!(not_found, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_loop_id_by_prefix_tests() {
+        let (dir, db, _handler) = endpoint_test_handler();
+        let lp1 = insert_test_loop(&db, dir.path());
+        let lp2 = Loop {
+            id: "loop-bbbbbbbb-2222".to_string(),
+            name: "Loop B".to_string(),
+            description: None,
+            workdir: dir.path().to_string_lossy().to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            active_run_queue_id: None,
+            on_completed: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            archived: false,
+            paused_by_reconciliation: false,
+        };
+        db.insert_loop(&lp2).unwrap();
+
+        let exact = db.resolve_loop_id_by_prefix(&lp1.id).unwrap();
+        assert_eq!(exact, Some(lp1.id));
+
+        let not_found = db.resolve_loop_id_by_prefix("loop-zzzz").unwrap();
+        assert_eq!(not_found, None);
     }
 }

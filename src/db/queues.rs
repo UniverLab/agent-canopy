@@ -433,6 +433,47 @@ impl Database {
             member_groups,
         }))
     }
+
+    pub fn resolve_queue_id_by_prefix(&self, prefix: &str) -> Result<Option<String>> {
+        if prefix.is_empty() {
+            return Ok(None);
+        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let exists: bool = conn
+            .query_row(
+                "SELECT id FROM queues WHERE id = ?1",
+                params![prefix],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(|e| anyhow!("{}", e))?
+            .unwrap_or(false);
+        if exists {
+            return Ok(Some(prefix.to_string()));
+        }
+        let escaped_prefix = prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let mut stmt = conn.prepare("SELECT id FROM queues WHERE id LIKE ?1 || '%' ESCAPE '\\'")?;
+        let ids: Vec<String> = stmt
+            .query_map(rusqlite::params![escaped_prefix], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        match ids.len() {
+            0 => Ok(None),
+            1 => Ok(Some(ids.into_iter().next().unwrap())),
+            _ => Err(anyhow!(
+                "Ambiguous queue id prefix '{}' matches {} ids: {}",
+                prefix,
+                ids.len(),
+                ids.join(", ")
+            )),
+        }
+    }
 }
 
 fn map_queue_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Queue> {
