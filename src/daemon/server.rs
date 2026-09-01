@@ -108,6 +108,16 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
     let health_routine = Arc::new(HealthRoutine::new(Arc::clone(&db), data_dir.clone()));
     let health_routine_cancel = health_routine.start();
 
+    let announcements_cancel = if canopy_config.announcements_enabled {
+        let client = Arc::new(crate::daemon::announcements::AnnouncementsClient::new(
+            Arc::clone(&db),
+            Arc::clone(&notification_service),
+        ));
+        Some(client.start())
+    } else {
+        None
+    };
+
     let handler_db = Arc::clone(&db);
     let handler_executor = Arc::clone(&executor);
     let handler_watcher_engine = Arc::clone(&watcher_engine);
@@ -175,6 +185,9 @@ pub(crate) async fn run_http_server(port_override: Option<u16>) -> Result<()> {
 
     scheduler_cancel.cancel();
     health_routine_cancel.cancel();
+    if let Some(cancel) = announcements_cancel {
+        cancel.cancel();
+    }
     watcher_engine.stop_all().await;
     terminate_all_running_node_processes_at_shutdown(&db).await;
     remove_pid_file(&data_dir);
@@ -356,6 +369,8 @@ async fn stdio_server_startup(db: Arc<Database>, data_dir: &std::path::Path) -> 
     // perform daemon-lifecycle graph recovery — see the doc comment on
     // `Database::reconcile_orphaned_loops` for the incident this guards
     // against.
+    // No announcements client here: this is a stdio MCP server, not the
+    // daemon, and the announcements WebSocket is a daemon-only background task.
     startup_personal_rag(Arc::clone(&ingestion), data_dir).await;
 
     if let Err(e) = watcher_engine.reload_from_db().await {

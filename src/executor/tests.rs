@@ -126,6 +126,7 @@ impl NotificationService for RecordingNotifier {
     ) {
     }
     fn notify_loop_completion_hook_failed(&self, _loop_name: &str, _error: &str) {}
+    fn notify_announcement(&self, _title: &str, _body: &str) {}
 }
 
 fn cron_agent(id: &str) -> Agent {

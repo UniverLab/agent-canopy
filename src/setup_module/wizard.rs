@@ -325,6 +325,31 @@ pub fn run_setup(force_skills: bool) -> Result<()> {
     };
     wiz.add(service_msg.to_string());
 
+    // ── Step 7: Announcements opt-in ─────────────────────────────
+    wiz.render()?;
+    println!();
+    println!("  \x1b[1mAnnouncements\x1b[0m");
+    println!();
+    println!("  Canopy can show you important announcements from the Mission Log");
+    println!("  (e.g. new releases, breaking changes, community events) as desktop");
+    println!("  notifications.");
+    println!();
+    println!("  This requires a \x1b[1mpersistent outbound WebSocket connection\x1b[0m to");
+    println!("  announcements.univerlab.org. While idle, this connection costs near");
+    println!("  zero — but it does reveal when this canopy installation is running.");
+    println!();
+
+    let announcements = Confirm::new("  Enable announcements?")
+        .with_default(false)
+        .prompt()
+        .unwrap_or(false);
+
+    if announcements {
+        wiz.add("Announcements enabled".to_string());
+    } else {
+        wiz.add("Announcements disabled (default)".to_string());
+    }
+
     // ── Save unified config ──────────────────────────────────────
     let mut config = crate::domain::canopy_config::CanopyConfig::load(&canopy_dir);
     config.mark_configured();
@@ -335,6 +360,7 @@ pub fn run_setup(force_skills: bool) -> Result<()> {
     config.similarity_threshold = similarity_threshold;
     config.rag_personal_dirs = rag_personal_dirs;
     config.rag_max_file_mb = rag_max_file_mb;
+    config.announcements_enabled = announcements;
     let config_step = match config.save(&canopy_dir) {
         Ok(_) => format!(
             "\x1b[32m✓\x1b[0m Config: {} CLI(s) saved to config.toml",

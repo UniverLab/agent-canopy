@@ -4848,6 +4848,8 @@ mod tests {
                     error: error.to_string(),
                 });
         }
+
+        fn notify_announcement(&self, _title: &str, _body: &str) {}
     }
 
     type MockLoopFixture = (

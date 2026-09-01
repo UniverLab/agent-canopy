@@ -126,6 +126,8 @@ arrow-array = "57.3.1"
 arrow-schema = "57.3.1"
 futures = "0.3"
 
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+
 # PDF text extraction
 pdf-extract = "0.10.0"
 

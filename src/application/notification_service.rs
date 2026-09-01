@@ -74,6 +74,8 @@ pub trait NotificationService: Send + Sync {
     /// for the loop run itself (that already finished successfully by the
     /// time the hook runs); this is purely about the hook's own outcome.
     fn notify_loop_completion_hook_failed(&self, loop_name: &str, error: &str);
+
+    fn notify_announcement(&self, title: &str, body: &str);
 }
 
 use crate::domain::notification::{send_notification, NotificationLevel};
@@ -194,5 +196,9 @@ impl NotificationService for DefaultNotificationService {
             &format!("Post-completion hook failed · {error}"),
             NotificationLevel::Warning,
         );
+    }
+
+    fn notify_announcement(&self, title: &str, body: &str) {
+        send_notification(title, body, NotificationLevel::Info);
     }
 }

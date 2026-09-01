@@ -118,6 +118,9 @@ pub struct CanopyConfig {
     /// different ceilings.
     #[serde(default = "default_rag_vector_cache_entries")]
     pub rag_vector_cache_entries: u32,
+
+    #[serde(default)]
+    pub announcements_enabled: bool,
 }
 
 /// Highest per-file indexing cap a user may configure, in MB. Text/PDF
@@ -410,6 +413,7 @@ impl Default for CanopyConfig {
             theme: default_theme(),
             rag_max_file_mb: default_rag_max_file_mb(),
             rag_vector_cache_entries: default_rag_vector_cache_entries(),
+            announcements_enabled: false,
         }
     }
 }
@@ -792,6 +796,40 @@ mod tests {
 
         assert!(config.get_cli("opencode").is_some());
         assert!(config.get_cli("nonexistent").is_none());
+    }
+
+    #[test]
+    fn announcements_enabled_defaults_to_false() {
+        let config = CanopyConfig::default();
+        assert!(!config.announcements_enabled);
+    }
+
+    #[test]
+    fn announcements_enabled_round_trips_via_config_toml() {
+        let dir = TempDir::new().unwrap();
+        let canopy_dir = dir.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+
+        let config = CanopyConfig {
+            announcements_enabled: true,
+            ..CanopyConfig::default()
+        };
+        config.save(&canopy_dir).unwrap();
+
+        let loaded = CanopyConfig::load(&canopy_dir);
+        assert!(loaded.announcements_enabled);
+    }
+
+    #[test]
+    fn config_without_announcements_field_defaults_to_false() {
+        let dir = TempDir::new().unwrap();
+        let canopy_dir = dir.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        let toml = r#"embeddings_model = "intfloat/multilingual-e5-base""#;
+        std::fs::write(canopy_dir.join("config.toml"), toml).unwrap();
+
+        let loaded = CanopyConfig::load(&canopy_dir);
+        assert!(!loaded.announcements_enabled);
     }
 
     #[test]
