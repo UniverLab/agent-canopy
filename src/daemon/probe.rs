@@ -182,6 +182,39 @@ fn detect_model_substitution(stdout: &str, stderr: &str) -> Option<String> {
     None
 }
 
+/// Substrings that indicate the requested model was rejected outright — the
+/// 2026-08-13 `gpt-5.6` case where Codex returned `400 invalid_request_error
+/// — "The 'gpt-5.6' model is not supported when using Codex with a ChatGPT
+/// account."` Matched case-insensitively and per-line so the returned error
+/// is the exact harness line, like [`detect_model_substitution`]. Only checked
+/// when a specific `model` was requested; otherwise a platform mention of
+/// "model" in help text would false-positive.
+fn detect_model_rejection(stdout: &str, stderr: &str) -> Option<String> {
+    const MARKERS: &[&str] = &[
+        "model is not supported",
+        "not supported when using",
+        "model not available",
+    ];
+    for text in [stderr, stdout] {
+        for line in text.lines() {
+            let lower = line.to_lowercase();
+            if MARKERS.iter().any(|m| lower.contains(m)) {
+                return Some(line.to_string());
+            }
+            // `invalid_request_error` + `model` in the same line covers the raw
+            // JSON body variant: `{"error":{"type":"invalid_request_error","message":"The 'gpt-5.6' model ..."}}`
+            // without pinning the full JSON shape. Anchored on `invalid_request`
+            // rather than a bare `invalid` so an unrelated line that merely
+            // mentions "invalid" and "model" on a healthy probe can't be
+            // misread as a rejection.
+            if lower.contains("invalid_request") && lower.contains("model") {
+                return Some(line.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Probe one platform+model pair by actually invoking it: build the
 /// platform's real headless command from its registry config
 /// (`headless_mode`/`model_flag`/etc, via [`CliStrategy::from_cli_config`] —
@@ -312,6 +345,15 @@ pub(crate) async fn probe_target(
                         outcome: ProbeOutcome::Substituted,
                         duration_ms,
                         error: Some(redact_secrets(&warning)),
+                    };
+                }
+                if let Some(rejection) = detect_model_rejection(&stdout, &stderr) {
+                    return ProbeReport {
+                        platform: target.platform.clone(),
+                        model: target.model.clone(),
+                        outcome: ProbeOutcome::Broken,
+                        duration_ms,
+                        error: Some(redact_secrets(&rejection)),
                     };
                 }
             }
@@ -625,6 +667,80 @@ mod tests {
         assert_eq!(report.outcome, ProbeOutcome::Broken);
         assert!(!report.outcome.reachable());
         assert!(report.error.unwrap().contains("not supported"));
+    }
+
+    /// The gap the `detect_model_rejection` fix closes: the harness echoes the
+    /// prompt (which contains the probe token) inside its error output *and*
+    /// also carries a "model is not supported" rejection. A naive token check
+    /// would report `Reachable` because the token is present; rejection must
+    /// override token presence and report `Broken`.
+    #[tokio::test]
+    async fn probe_target_reports_broken_for_model_rejection_even_with_token_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_script(
+            &dir,
+            "reject-with-token-cli",
+            "echo \"The 'gpt-5.6' model is not supported when using Codex with a ChatGPT account.\"\necho \"$1\"\n",
+        );
+        let config = config_with_cli_and_model_flag("reject-with-token", &script);
+        let target = ProbeTarget {
+            platform: "reject-with-token".to_string(),
+            model: Some("gpt-5.6".to_string()),
+        };
+        let report = probe_target(&config, &target, None, Duration::from_secs(5)).await;
+        assert_eq!(report.outcome, ProbeOutcome::Broken);
+        assert!(!report.outcome.reachable());
+        assert!(report
+            .error
+            .unwrap()
+            .to_lowercase()
+            .contains("not supported"));
+    }
+
+    /// The `invalid_request` + `model` branch of `detect_model_rejection`:
+    /// a rejection whose wording ("Unknown model") none of the fixed
+    /// markers match, but which the CLI still tags as an
+    /// `invalid_request_error`. Token is echoed too, so this also pins that
+    /// the rejection wins over token presence.
+    #[tokio::test]
+    async fn probe_target_reports_broken_for_invalid_request_model_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = r#"{"error":{"type":"invalid_request_error","message":"Unknown model gpt-5.6 requested"}}"#;
+        let script = write_script(
+            &dir,
+            "invalid-request-cli",
+            &format!("echo '{body}'\necho \"$1\"\n"),
+        );
+        let config = config_with_cli_and_model_flag("invalid-request", &script);
+        let target = ProbeTarget {
+            platform: "invalid-request".to_string(),
+            model: Some("gpt-5.6".to_string()),
+        };
+        let report = probe_target(&config, &target, None, Duration::from_secs(5)).await;
+        assert_eq!(report.outcome, ProbeOutcome::Broken);
+        assert!(!report.outcome.reachable());
+        assert!(report.error.unwrap().contains("invalid_request_error"));
+    }
+
+    /// A healthy probe whose output happens to contain both "invalid" and
+    /// "model" on one line (but not `invalid_request`) must NOT be misread
+    /// as a rejection — guards the anchoring of the catch-all branch.
+    #[tokio::test]
+    async fn probe_target_reachable_despite_incidental_invalid_and_model_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_script(
+            &dir,
+            "noisy-healthy-cli",
+            "echo 'note: pruned invalid cache entries for model gpt-5'\necho \"$1\"\n",
+        );
+        let config = config_with_cli_and_model_flag("noisy-healthy", &script);
+        let target = ProbeTarget {
+            platform: "noisy-healthy".to_string(),
+            model: Some("gpt-5".to_string()),
+        };
+        let report = probe_target(&config, &target, None, Duration::from_secs(5)).await;
+        assert_eq!(report.outcome, ProbeOutcome::Reachable);
+        assert!(report.error.is_none());
     }
 
     /// The other half of the 2026-08-13 incident: the harness answers with

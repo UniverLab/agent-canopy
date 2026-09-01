@@ -2773,13 +2773,14 @@ impl TaskTriggerHandler {
                     )));
                 }
                 let (formatted, trunc) = format_platform_models(&catalog, providers, full);
-                (
-                    format!(
-                        "Models available to platform '{platform}' (providers: {}):\n{formatted}",
-                        providers.join(", ")
-                    ),
-                    trunc,
-                )
+                let mut listing = format!(
+                    "Models available to platform '{platform}' (providers: {}):\n{formatted}",
+                    providers.join(", ")
+                );
+                if let Some(warning) = platform_model_selection_warning(platform) {
+                    listing = format!("{warning}\n\n{listing}");
+                }
+                (listing, trunc)
             }
             None => {
                 let (formatted, trunc) = format_catalog_models(&catalog, full);
@@ -6756,6 +6757,23 @@ fn validate_platform_configured(platform: &str) -> Option<String> {
     ))
 }
 
+fn platform_model_selection_warning(platform: &str) -> Option<String> {
+    let home = dirs::home_dir()?;
+    let config = crate::domain::canopy_config::CanopyConfig::load(&home.join(".canopy"));
+    let cli = config.get_cli(platform)?;
+    if cli.model_flag.is_some() {
+        return None;
+    }
+    Some(format!(
+        "Platform '{}' does not support model selection (no model_flag configured).\n\
+         This platform addresses named agents, not models.\n\
+         Omit the `model` field when using this platform — the CLI will use its own default.\n\
+         \n\
+         The ids listed below are NOT valid input for the `model` field.",
+        platform
+    ))
+}
+
 /// The `(binary, enumeration args)` for a platform that can list its own
 /// models, read straight from its registry-driven `CliConfig` — `None` when the
 /// platform has no such command configured (so nothing is inferred from the CLI
@@ -6806,10 +6824,18 @@ async fn native_models_result(
     let crate::domain::models_db::NativeLoad { catalog, source } = load;
 
     let (listing, truncation) = format_native_models(&catalog.ids, full);
-    let listing = format!(
+    let mut listing = format!(
         "Models available to platform '{platform}' (enumerated from the CLI — ids are \
          passable verbatim):\n{listing}"
     );
+    // FR4: a platform can expose a `models_list_cmd` while still addressing
+    // named agents rather than models (no `model_flag`) — the 2026-08-13
+    // `mistral` shape. In that case the ids above are not valid `model`
+    // input regardless of where they were enumerated from, so the same
+    // warning the models.dev path prints must lead here too.
+    if let Some(warning) = platform_model_selection_warning(platform) {
+        listing = format!("{warning}\n\n{listing}");
+    }
     CallToolResult::success(vec![Content::text(model_result_footer(
         &listing,
         source,
@@ -6865,8 +6891,10 @@ fn model_result_footer(
         "{listing}\n\n\
          Source: {}{provenance_note} · age: {age_str} (refresh interval {ttl_str}) · \
          fetched_at: {}\n\
-         Note: model availability also depends on the CLI's configured API keys. \
-         If model is omitted, the CLI uses its own default.{truncation_notice}",
+         WARNING: This lists the PROVIDER'S CATALOG, not what your account can use.\n\
+         Actual availability depends on your API key tier, account type, and region.\n\
+         A model listed here may still fail at runtime — use `agent_probe` or `loop_preflight`\n\
+         to validate a specific platform+model pair before relying on it.{truncation_notice}",
         source.as_str(),
         format_system_time(fetched_at),
     )
@@ -14691,6 +14719,103 @@ mod endpoint_tests {
         assert!(out.contains("model-a"));
         assert!(out.contains("model-b"));
         assert!(out.contains("Source:"));
+        assert!(
+            out.contains("PROVIDER'S CATALOG") || out.contains("WARNING"),
+            "footer must warn that this is the provider catalog, not account availability: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_models_warns_for_platform_without_model_flag() {
+        let home = tempdir().unwrap();
+        let canopy_dir = home.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        let config = crate::domain::canopy_config::CanopyConfig {
+            clis: vec![crate::domain::cli_config::CliConfig {
+                name: "mistral".to_string(),
+                binary: "/bin/echo".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        config.save(&canopy_dir).unwrap();
+        // Seed a minimal models.dev catalog so the models.dev path succeeds
+        // without a network fetch — `load_catalog_with_source` serves a fresh
+        // cache with no network when the file exists and is within TTL.
+        let cache_dir = canopy_dir.join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let catalog_json = format!(
+            r#"{{"models":[{{"id":"mistral-medium-latest","name":"Mistral Medium","provider":"mistral"}}],"fetched_at":{now_secs}}}"#
+        );
+        std::fs::write(cache_dir.join("models_catalog.json"), catalog_json).unwrap();
+        let _home_guard = HomeVar::set(home.path());
+
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let result = handler
+            .task_models(Parameters(TaskModelsParams {
+                platform: Some("mistral".to_string()),
+                refresh: None,
+                full: None,
+            }))
+            .await
+            .unwrap();
+
+        assert!(!is_err(&result), "{}", text(&result));
+        let out = text(&result);
+        assert!(
+            out.contains("does not support model selection") || out.contains("NOT valid input"),
+            "must warn that this platform does not support model selection: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_models_warns_for_native_enumeration_without_model_flag() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // FR4: a platform can have a `models_list_cmd` (so `agent_models`
+        // takes the native-enumeration path) while still having no
+        // `model_flag` — the enumerated ids are not valid `model` input and
+        // the output must say so, exactly as the models.dev path does.
+        let home = tempdir().unwrap();
+        let canopy_dir = home.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        let script = home.path().join("list-agents.sh");
+        std::fs::write(&script, "#!/bin/sh\necho agent-one\necho agent-two\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config = crate::domain::canopy_config::CanopyConfig {
+            clis: vec![crate::domain::cli_config::CliConfig {
+                name: "named-agent-cli".to_string(),
+                binary: script.to_string_lossy().to_string(),
+                models_list_cmd: Some("--list".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        config.save(&canopy_dir).unwrap();
+        let _home_guard = HomeVar::set(home.path());
+
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let result = handler
+            .task_models(Parameters(TaskModelsParams {
+                platform: Some("named-agent-cli".to_string()),
+                refresh: Some(true),
+                full: None,
+            }))
+            .await
+            .unwrap();
+
+        assert!(!is_err(&result), "{}", text(&result));
+        let out = text(&result);
+        assert!(out.contains("agent-one"), "enumeration still shown: {out}");
+        assert!(
+            out.contains("does not support model selection") || out.contains("NOT valid input"),
+            "native-enumeration output must also warn when there is no model_flag: {out}"
+        );
     }
 
     // ── task_logs / agent_logs ───────────────────────────────────
