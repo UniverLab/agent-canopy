@@ -94,8 +94,7 @@ fn recent_project_session_summaries(
 ) -> Vec<(String, String)> {
     let Ok(nodes) = app
         .db
-        .search_intelligence_nodes(&project.path, Some("session"), limit.saturating_mul(4))
-        .map(|r| r.results)
+        .search_operational_sessions(&project.path, limit.saturating_mul(4))
     else {
         return Vec::new();
     };

@@ -453,10 +453,12 @@ impl App {
 
         let launchpad_node_id = format!("launchpad:{}", uuid::Uuid::new_v4());
         let dialog_workdir = dialog.working_dir.clone();
+        // `continues` edge to previous node is dropped — operational
+        // sessions have no edges (CM8, out of scope schema).
+        let _ = previous_node_id;
         self.db
-            .upsert_intelligence_node(crate::db::intelligence::IntelligenceNodeInput {
+            .upsert_operational_session(crate::db::intelligence::OperationalSessionInput {
                 id: Some(launchpad_node_id.clone()),
-                kind: "session".to_string(),
                 title: mission_title.clone(),
                 body: mission_context
                     .clone()
@@ -469,13 +471,6 @@ impl App {
                 })),
                 project_hash: None,
                 session_id: Some(launchpad_node_id),
-                relations: previous_node_id.map(|node_id| {
-                    vec![crate::db::intelligence::IntelligenceRelationInput {
-                        to_node_id: node_id,
-                        relation: "continues".to_string(),
-                        weight: Some(1.0),
-                    }]
-                }),
             })?;
 
         let is_nursery = dialog.is_planting_new_seed();

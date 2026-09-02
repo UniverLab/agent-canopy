@@ -75,6 +75,7 @@ pub struct HardCascadeCounts {
     pub sync_messages: i64,
     pub sync_locks: i64,
     pub intelligence_nodes: i64,
+    pub operational_sessions: i64,
     // Auto-cascade targets (rows removed by FK ON DELETE CASCADE once the
     // direct target above is deleted; counted up front for the prompt).
     pub loop_specs: i64,
@@ -100,6 +101,7 @@ impl HardCascadeCounts {
             && self.sync_messages == 0
             && self.sync_locks == 0
             && self.intelligence_nodes == 0
+            && self.operational_sessions == 0
             && self.loop_specs == 0
             && self.loop_nodes == 0
             && self.loop_edges == 0
@@ -856,6 +858,7 @@ mod tests {
             sync_messages: 0,
             sync_locks: 0,
             intelligence_nodes: 0,
+            operational_sessions: 0,
             loop_specs: 0,
             loop_nodes: 0,
             loop_edges: 0,

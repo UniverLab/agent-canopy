@@ -356,6 +356,22 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_intelligence_edges_to
                 ON intelligence_edges(to_node_id);
 
+            CREATE TABLE IF NOT EXISTS operational_sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                metadata TEXT,
+                project_hash TEXT,
+                session_id TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_operational_sessions_project_hash
+                ON operational_sessions(project_hash);
+            CREATE INDEX IF NOT EXISTS idx_operational_sessions_updated
+                ON operational_sessions(updated_at DESC);
+
             CREATE TABLE IF NOT EXISTS loops (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -634,6 +650,28 @@ impl Database {
                 status TEXT NOT NULL DEFAULT 'active'
             );",
         )?;
+
+        // CM8: separate operational telemetry from knowledge. The three
+        // writers (run, sync, launchpad) used to write `kind='session'`
+        // rows into `intelligence_nodes` with ids `run:`, `sync:`,
+        // `launchpad:` — they now write to `operational_sessions` instead.
+        // Migrate any remaining rows so the TUI panels keep showing the same
+        // thing. Idempotent: second run finds nothing in `intelligence_nodes`
+        // to copy.
+        // Reversible as long as `operational_sessions` isn't dropped:
+        //   INSERT OR REPLACE INTO intelligence_nodes
+        //     (id, kind, title, body, metadata, project_hash, session_id, created_at, updated_at)
+        //   SELECT id, 'session', title, body, metadata, project_hash, session_id, created_at, updated_at
+        //   FROM operational_sessions;
+        conn.execute_batch(
+            "INSERT OR REPLACE INTO operational_sessions (id, title, body, metadata, project_hash, session_id, created_at, updated_at)
+                SELECT id, title, body, metadata, project_hash, session_id, created_at, updated_at
+                FROM intelligence_nodes
+                WHERE id LIKE 'run:%' OR id LIKE 'sync:%' OR id LIKE 'launchpad:%';
+             DELETE FROM intelligence_nodes
+                WHERE id LIKE 'run:%' OR id LIKE 'sync:%' OR id LIKE 'launchpad:%';",
+        )
+        .map_err(|e| anyhow::anyhow!("operational_sessions migration failed: {e}"))?;
 
         // `workdir` records which project a scheduled send targeted so a
         // dead-target failure can be preserved per-project for U8's recall.

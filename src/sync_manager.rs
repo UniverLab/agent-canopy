@@ -62,9 +62,8 @@ impl SyncManager {
                 Some(&payload),
             )
             .await?;
-        self.upsert_sync_intelligence_node(crate::db::intelligence::IntelligenceNodeInput {
+        self.upsert_sync_operational_session(crate::db::intelligence::OperationalSessionInput {
             id: Some(format!("sync:{workdir}:{agent_id}")),
-            kind: "session".to_owned(),
             title: mission.to_owned(),
             body: description.to_owned(),
             metadata: Some(serde_json::json!({
@@ -77,7 +76,6 @@ impl SyncManager {
             })),
             project_hash: None,
             session_id: Some(format!("sync:{workdir}:{agent_id}")),
-            relations: None,
         })?;
         Ok(message)
     }
@@ -106,9 +104,8 @@ impl SyncManager {
                 Some(&payload),
             )
             .await?;
-        self.upsert_sync_intelligence_node(crate::db::intelligence::IntelligenceNodeInput {
+        self.upsert_sync_operational_session(crate::db::intelligence::OperationalSessionInput {
             id: Some(format!("sync:{workdir}:{agent_id}")),
-            kind: "session".to_owned(),
             title: message.to_owned(),
             body: message.to_owned(),
             metadata: Some(serde_json::json!({
@@ -121,7 +118,6 @@ impl SyncManager {
             })),
             project_hash: None,
             session_id: Some(format!("sync:{workdir}:{agent_id}")),
-            relations: None,
         })?;
         Ok(sync_message)
     }
@@ -195,11 +191,11 @@ impl SyncManager {
         })
     }
 
-    fn upsert_sync_intelligence_node(
+    fn upsert_sync_operational_session(
         &self,
-        node: crate::db::intelligence::IntelligenceNodeInput,
+        node: crate::db::intelligence::OperationalSessionInput,
     ) -> anyhow::Result<()> {
-        self.db.upsert_intelligence_node(node)?;
+        self.db.upsert_operational_session(node)?;
         Ok(())
     }
 

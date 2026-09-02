@@ -89,8 +89,27 @@ impl HealthRoutine {
                 _ = tokio::time::sleep(POLL_INTERVAL) => {
                     self.maybe_run().await;
                     self.expire_subagent_runs().await;
+                    self.prune_operational_sessions().await;
                 }
             }
+        }
+    }
+
+    async fn prune_operational_sessions(&self) {
+        let db = Arc::clone(&self.db);
+        match tokio::task::spawn_blocking(move || db.prune_operational_sessions(30)).await {
+            Ok(Ok(count)) if count > 0 => {
+                tracing::info!(
+                    "operational sessions cleanup: pruned {count} session(s) older than 30 days"
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("operational sessions cleanup: {e}");
+            }
+            Err(e) => {
+                tracing::warn!("operational sessions cleanup: task panicked: {e}");
+            }
+            _ => {}
         }
     }
 

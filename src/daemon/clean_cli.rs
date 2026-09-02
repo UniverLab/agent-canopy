@@ -312,6 +312,7 @@ fn direct_count(c: &clean::HardCascadeCounts) -> i64 {
         + c.sync_messages
         + c.sync_locks
         + c.intelligence_nodes
+        + c.operational_sessions
 }
 
 fn cascade_count(c: &clean::HardCascadeCounts) -> i64 {
@@ -359,7 +360,7 @@ fn print_hard_cascade_plan(plan: &HardCascadePlan, dry_run: bool) {
         for t in &plan.targets {
             let c = &t.counts;
             println!(
-                "   {} ({})  missing: {}\n     [{} loop(s), {} interactive session(s), {} terminal session(s),\n      {} last prompt(s), {} scheduled send(s), {} failed send(s),\n      {} sync message(s), {} sync lock(s), {} intelligence node(s)]\n     + cascade: [{} loop_spec(s), {} loop_node(s), {} loop_edge(s),\n                 {} loop_run(s), {} completion_hook_run(s),\n                 {} ensemble(s), {} ensemble_member(s), {} queue_member(s),\n                 {} seed_session(s), {} intelligence_edge(s)]",
+                "   {} ({})  missing: {}\n     [{} loop(s), {} interactive session(s), {} terminal session(s),\n      {} last prompt(s), {} scheduled send(s), {} failed send(s),\n      {} sync message(s), {} sync lock(s), {} intelligence node(s), {} operational session(s)]\n     + cascade: [{} loop_spec(s), {} loop_node(s), {} loop_edge(s),\n                 {} loop_run(s), {} completion_hook_run(s),\n                 {} ensemble(s), {} ensemble_member(s), {} queue_member(s),\n                 {} seed_session(s), {} intelligence_edge(s)]",
                 t.name,
                 t.hash,
                 t.missing_path,
@@ -372,6 +373,7 @@ fn print_hard_cascade_plan(plan: &HardCascadePlan, dry_run: bool) {
                 c.sync_messages,
                 c.sync_locks,
                 c.intelligence_nodes,
+                c.operational_sessions,
                 c.loop_specs,
                 c.loop_nodes,
                 c.loop_edges,

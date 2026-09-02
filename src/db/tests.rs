@@ -3581,10 +3581,9 @@ fn test_update_run_status() {
     assert!(updated.finished_at.is_some());
 
     let snapshot = db
-        .get_intelligence_node(&format!("run:{run_id}"))
+        .get_operational_session(&format!("run:{run_id}"))
         .unwrap()
         .unwrap();
-    assert_eq!(snapshot.kind, "session");
     assert!(snapshot.body.contains("Done"));
     assert!(snapshot
         .metadata

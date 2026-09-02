@@ -220,6 +220,10 @@ impl Database {
             "DELETE FROM intelligence_nodes WHERE project_hash = ?1",
             params![hash],
         )?;
+        tx.execute(
+            "DELETE FROM operational_sessions WHERE project_hash = ?1",
+            params![hash],
+        )?;
         tx.execute("DELETE FROM projects WHERE hash = ?1", params![hash])?;
 
         tx.commit()?;
@@ -410,6 +414,11 @@ fn count_hard_cascade(
         params![hash],
         |row| row.get(0),
     )?;
+    let operational_sessions: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM operational_sessions WHERE project_hash = ?1",
+        params![hash],
+        |row| row.get(0),
+    )?;
 
     // Follow-on (FK CASCADE) targets: only count rows attached to *this*
     // project's loops / interactive_sessions / intelligence_nodes.
@@ -516,6 +525,7 @@ fn count_hard_cascade(
         sync_messages,
         sync_locks,
         intelligence_nodes,
+        operational_sessions,
         loop_specs,
         loop_nodes,
         loop_edges,

@@ -22,6 +22,44 @@ pub struct IntelligenceNodeRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationalSessionRecord {
+    pub id: String,
+    pub title: String,
+    pub body: String,
+    pub metadata: Option<String>,
+    pub project_hash: Option<String>,
+    pub session_id: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl OperationalSessionRecord {
+    pub fn into_intelligence_node_record(self) -> IntelligenceNodeRecord {
+        IntelligenceNodeRecord {
+            id: self.id,
+            kind: "session".to_string(),
+            title: self.title,
+            body: self.body,
+            metadata: self.metadata,
+            project_hash: self.project_hash,
+            session_id: self.session_id,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OperationalSessionInput {
+    pub id: Option<String>,
+    pub title: String,
+    pub body: String,
+    pub metadata: Option<serde_json::Value>,
+    pub project_hash: Option<String>,
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntelligenceEdgeRecord {
     pub id: i64,
     pub from_node_id: String,
@@ -852,6 +890,211 @@ impl Database {
         )?;
         Ok(rows.filter_map(|row| row.ok()).collect())
     }
+
+    // ── Operational sessions (CM8) ──
+
+    pub fn upsert_operational_session(
+        &self,
+        input: OperationalSessionInput,
+    ) -> Result<(OperationalSessionRecord, bool)> {
+        let node_id = input.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let now = Utc::now().timestamp();
+        let metadata = input.metadata.map(|value| value.to_string());
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let was_created: bool = {
+            let mut stmt =
+                conn.prepare("SELECT 1 FROM operational_sessions WHERE id = ?1 LIMIT 1")?;
+            let mut rows = stmt.query(rusqlite::params![&node_id])?;
+            rows.next()?.is_none()
+        };
+
+        conn.execute(
+            "INSERT INTO operational_sessions (
+                id, title, body, metadata, project_hash, session_id, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title,
+                body = excluded.body,
+                metadata = excluded.metadata,
+                project_hash = excluded.project_hash,
+                session_id = excluded.session_id,
+                updated_at = excluded.updated_at",
+            rusqlite::params![
+                node_id,
+                input.title,
+                input.body,
+                metadata,
+                input.project_hash,
+                input.session_id,
+                now,
+                now
+            ],
+        )?;
+
+        drop(conn);
+        let record = self
+            .get_operational_session(&node_id)?
+            .ok_or_else(|| anyhow!("Failed to load operational session '{}'", node_id))?;
+        Ok((record, was_created))
+    }
+
+    pub fn get_operational_session(&self, id: &str) -> Result<Option<OperationalSessionRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, title, body, metadata, project_hash, session_id, created_at, updated_at
+             FROM operational_sessions WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(Self::read_operational_session(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn list_operational_sessions(&self, limit: usize) -> Result<Vec<OperationalSessionRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, title, body, metadata, project_hash, session_id, created_at, updated_at
+             FROM operational_sessions
+             ORDER BY updated_at DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![limit as i64],
+            Self::read_operational_session,
+        )?;
+        Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+
+    #[allow(dead_code)]
+    pub fn list_operational_sessions_by_project(
+        &self,
+        workdir: &str,
+        limit: usize,
+    ) -> Result<Vec<OperationalSessionRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, title, body, metadata, project_hash, session_id, created_at, updated_at
+             FROM operational_sessions
+             WHERE project_hash = ?1 OR json_extract(metadata, '$.workdir') = ?1
+             ORDER BY updated_at DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![workdir, limit as i64],
+            Self::read_operational_session,
+        )?;
+        Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+
+    pub fn search_operational_sessions(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<OperationalSessionRecord>> {
+        let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+
+        let mut match_count_parts: Vec<String> = Vec::with_capacity(terms.len());
+        let mut score_parts: Vec<String> = Vec::with_capacity(terms.len() * 4);
+        let mut or_clauses: Vec<String> = Vec::with_capacity(terms.len() * 4);
+        for i in 0..terms.len() {
+            let p = i + 1;
+            score_parts.push(format!(
+                "(CASE WHEN instr(lower(title), ?{p}) > 0 THEN 3 ELSE 0 END)"
+            ));
+            score_parts.push(format!(
+                "(CASE WHEN instr(lower(body), ?{p}) > 0 THEN 1 ELSE 0 END)"
+            ));
+            score_parts.push(format!(
+                "(CASE WHEN instr(lower(coalesce(metadata, '')), ?{p}) > 0 THEN 1 ELSE 0 END)"
+            ));
+            score_parts.push(format!(
+                "(CASE WHEN instr(lower(id), ?{p}) > 0 THEN 1 ELSE 0 END)"
+            ));
+
+            let term_fields: Vec<String> = ["id", "title", "body", "coalesce(metadata, '')"]
+                .into_iter()
+                .map(|field| format!("instr(lower({field}), ?{p}) > 0"))
+                .collect();
+            match_count_parts.push(format!(
+                "(CASE WHEN {} THEN 1 ELSE 0 END)",
+                term_fields.join(" OR ")
+            ));
+            or_clauses.extend(term_fields);
+        }
+
+        let match_count_expr = match_count_parts.join(" + ");
+        let score_expr = score_parts.join(" + ");
+        let or_clause = or_clauses.join(" OR ");
+        let limit_placeholder = terms.len() + 1;
+        let sql = format!(
+            "SELECT id, title, body, metadata, project_hash, session_id, created_at, updated_at, \
+             ({match_count_expr}) AS match_count, ({score_expr}) AS score \
+             FROM operational_sessions \
+             WHERE ({or_clause}) \
+             ORDER BY match_count DESC, score DESC, updated_at DESC \
+             LIMIT ?{limit_placeholder}"
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(terms.len() + 1);
+        for term in &terms {
+            params.push(Box::new(term.clone()));
+        }
+        params.push(Box::new(limit as i64));
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(Box::as_ref).collect();
+
+        let rows = stmt.query_map(param_refs.as_slice(), Self::read_operational_session)?;
+        Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+
+    pub fn prune_operational_sessions(&self, max_age_days: i64) -> Result<u64> {
+        let cutoff = Utc::now().timestamp() - (max_age_days * 86400);
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let count = conn.execute(
+            "DELETE FROM operational_sessions WHERE updated_at < ?1",
+            [cutoff],
+        )?;
+        Ok(count as u64)
+    }
+
+    fn read_operational_session(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<OperationalSessionRecord> {
+        Ok(OperationalSessionRecord {
+            id: row.get(0)?,
+            title: row.get(1)?,
+            body: row.get(2)?,
+            metadata: row.get(3)?,
+            project_hash: row.get(4)?,
+            session_id: row.get(5)?,
+            created_at: row.get(6)?,
+            updated_at: row.get(7)?,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1323,5 +1566,220 @@ mod tests {
         let removed = db.delete_intelligence_node(&resolved).unwrap();
         assert_eq!(removed, Some(0));
         assert!(db.get_intelligence_node(full).unwrap().is_none());
+    }
+
+    #[test]
+    fn operational_migration_moves_session_nodes_to_dedicated_table() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.db");
+
+        // Seed pre-migration state directly in `intelligence_nodes`: 3
+        // operational ids (the id prefixes the three writers use) plus 2
+        // knowledge nodes. Before CM8 the writers wrote them this way.
+        {
+            let db = Database::new(&path).unwrap();
+            for id in ["run:abc", "sync:/tmp:agent1", "launchpad:uuid-1"] {
+                db.upsert_intelligence_node(IntelligenceNodeInput {
+                    id: Some(id.to_string()),
+                    kind: "session".to_string(),
+                    title: format!("Op {id}"),
+                    body: "op body".to_string(),
+                    metadata: None,
+                    project_hash: None,
+                    session_id: None,
+                    relations: None,
+                })
+                .unwrap();
+            }
+            for (id, kind) in [("fact1", "fact"), ("pattern1", "pattern")] {
+                db.upsert_intelligence_node(IntelligenceNodeInput {
+                    id: Some(id.to_string()),
+                    kind: kind.to_string(),
+                    title: format!("Knowledge {id}"),
+                    body: "knowledge body".to_string(),
+                    metadata: None,
+                    project_hash: None,
+                    session_id: None,
+                    relations: None,
+                })
+                .unwrap();
+            }
+        }
+
+        // Reopening runs `init()`, which runs the CM8 migration. This test
+        // guards the production migration in `db/mod.rs` — inlining the SQL
+        // here would let a deleted migration still pass.
+        let db = Database::new(&path).unwrap();
+
+        let ops = db.list_operational_sessions(10).unwrap();
+        assert_eq!(ops.len(), 3, "operational_sessions should have 3 rows");
+        let ids: std::collections::HashSet<_> = ops.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains("run:abc"));
+        assert!(ids.contains("sync:/tmp:agent1"));
+        assert!(ids.contains("launchpad:uuid-1"));
+        // Row content is carried across unchanged.
+        let run_row = db.get_operational_session("run:abc").unwrap().unwrap();
+        assert_eq!(run_row.title, "Op run:abc");
+        assert_eq!(run_row.body, "op body");
+
+        let knowledge = db.list_intelligence_nodes(None, 10).unwrap();
+        assert_eq!(
+            knowledge.len(),
+            2,
+            "intelligence_nodes should have 2 rows after migration"
+        );
+        let k_ids: std::collections::HashSet<_> = knowledge.iter().map(|r| r.id.as_str()).collect();
+        assert!(k_ids.contains("fact1"));
+        assert!(k_ids.contains("pattern1"));
+
+        // Idempotent: reopening again (migration re-runs) is a no-op.
+        drop(db);
+        let db = Database::new(&path).unwrap();
+        assert_eq!(db.list_operational_sessions(10).unwrap().len(), 3);
+        assert_eq!(db.list_intelligence_nodes(None, 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn run_upsert_writes_to_operational_sessions_not_intelligence_nodes() {
+        let db = test_db();
+        let (rec, _) = db
+            .upsert_operational_session(OperationalSessionInput {
+                id: Some("run:test-run-1".to_string()),
+                title: "Run title".to_string(),
+                body: "Run body".to_string(),
+                metadata: Some(serde_json::json!({"source":"run"})),
+                project_hash: None,
+                session_id: Some("run:test-run-1".to_string()),
+            })
+            .unwrap();
+        assert_eq!(rec.id, "run:test-run-1");
+        assert!(db
+            .get_operational_session("run:test-run-1")
+            .unwrap()
+            .is_some());
+        assert!(db
+            .get_intelligence_node("run:test-run-1")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn search_operational_sessions_returns_operational_records() {
+        let db = test_db();
+        db.upsert_operational_session(OperationalSessionInput {
+            id: Some("run:search-me".to_string()),
+            title: "Searchable Mission Title".to_string(),
+            body: "body".to_string(),
+            metadata: None,
+            project_hash: None,
+            session_id: None,
+        })
+        .unwrap();
+        db.upsert_operational_session(OperationalSessionInput {
+            id: Some("run:other".to_string()),
+            title: "Unrelated".to_string(),
+            body: "other body".to_string(),
+            metadata: None,
+            project_hash: None,
+            session_id: None,
+        })
+        .unwrap();
+
+        let results = db
+            .search_operational_sessions("Searchable Mission", 10)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "run:search-me");
+    }
+
+    #[test]
+    fn prune_operational_sessions_removes_old_records() {
+        let db = test_db();
+        let old_ts = chrono::Utc::now().timestamp() - (31 * 86400);
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO operational_sessions (id, title, body, metadata, project_hash, session_id, created_at, updated_at) VALUES (?1, ?2, ?3, NULL, NULL, NULL, ?4, ?4)",
+                rusqlite::params!["run:old", "Old", "old body", old_ts],
+            )
+            .unwrap();
+        }
+        db.upsert_operational_session(OperationalSessionInput {
+            id: Some("run:recent".to_string()),
+            title: "Recent".to_string(),
+            body: "recent".to_string(),
+            metadata: None,
+            project_hash: None,
+            session_id: None,
+        })
+        .unwrap();
+
+        let pruned = db.prune_operational_sessions(30).unwrap();
+        assert_eq!(pruned, 1);
+        assert!(db.get_operational_session("run:old").unwrap().is_none());
+        assert!(db.get_operational_session("run:recent").unwrap().is_some());
+    }
+
+    #[test]
+    fn intelligence_search_excludes_operational_records() {
+        let db = test_db();
+        db.upsert_intelligence_node(IntelligenceNodeInput {
+            id: Some("fact-search".to_string()),
+            kind: "fact".to_string(),
+            title: "UniqueSearchTerm Fact Title".to_string(),
+            body: "body".to_string(),
+            metadata: None,
+            project_hash: None,
+            session_id: None,
+            relations: None,
+        })
+        .unwrap();
+        db.upsert_operational_session(OperationalSessionInput {
+            id: Some("run:op-search".to_string()),
+            title: "UniqueSearchTerm Operational Title".to_string(),
+            body: "op body".to_string(),
+            metadata: None,
+            project_hash: None,
+            session_id: None,
+        })
+        .unwrap();
+
+        let result = db
+            .search_intelligence_nodes("UniqueSearchTerm", None, 10)
+            .unwrap();
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].id, "fact-search");
+    }
+
+    #[test]
+    fn launchpad_operational_sessions_are_searchable_by_workdir() {
+        let db = test_db();
+        let workdir = "/tmp/launchpad-test";
+        db.upsert_operational_session(OperationalSessionInput {
+            id: Some("launchpad:test-uuid".to_string()),
+            title: "Test Launchpad Mission".to_string(),
+            body: "Launchpad body".to_string(),
+            metadata: Some(serde_json::json!({
+                "source": "launchpad",
+                "workdir": workdir,
+                "mode": "new",
+                "summary": "summary text"
+            })),
+            project_hash: None,
+            session_id: Some("launchpad:test-uuid".to_string()),
+        })
+        .unwrap();
+
+        // LaunchpadDialog::for_workdir searches operational_sessions by workdir;
+        // verify the underlying search returns the record.
+        let results = db.search_operational_sessions(workdir, 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Test Launchpad Mission");
+        let meta: serde_json::Value =
+            serde_json::from_str(results[0].metadata.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            meta.get("source").and_then(|v| v.as_str()),
+            Some("launchpad")
+        );
     }
 }

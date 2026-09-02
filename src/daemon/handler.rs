@@ -2357,10 +2357,13 @@ impl TaskTriggerHandler {
                 .db
                 .list_project_knowledge(ph, None, pk_limit)
                 .map_err(|e| e.to_string())?;
-            let generic = self
+            let generic: Vec<crate::db::intelligence::IntelligenceNodeRecord> = self
                 .db
-                .list_intelligence_nodes(Some("session"), knowledge_limit)
-                .map_err(|e| e.to_string())?;
+                .list_operational_sessions(knowledge_limit)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|r| r.into_intelligence_node_record())
+                .collect();
             Ok((generic, pk))
         } else {
             let generic = self
@@ -3238,10 +3241,13 @@ impl TaskTriggerHandler {
             resolve_effective_project_hash(&self.db, params.project_hash.as_deref(), agent_id)
         });
 
-        let sessions = self
+        let sessions: Vec<crate::db::intelligence::IntelligenceNodeRecord> = self
             .db
-            .list_intelligence_nodes(Some("session"), session_limit)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .list_operational_sessions(session_limit)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            .into_iter()
+            .map(|r| r.into_intelligence_node_record())
+            .collect();
 
         let (knowledge, project_knowledge) = self
             .fetch_context_knowledge(effective_project_hash.as_deref(), &scope)

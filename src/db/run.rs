@@ -15,7 +15,7 @@ impl RunRepository for Database {
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
         insert_run_row(&conn, run)?;
         drop(conn);
-        self.upsert_run_intelligence_node(run)?;
+        self.upsert_run_operational_session(run)?;
         Ok(())
     }
 
@@ -58,7 +58,7 @@ impl RunRepository for Database {
 
         insert_run_row(&conn, run)?;
         drop(conn);
-        self.upsert_run_intelligence_node(run)?;
+        self.upsert_run_operational_session(run)?;
         Ok(StartRunOutcome::Started)
     }
 
@@ -179,7 +179,7 @@ impl RunRepository for Database {
         if rows > 0 {
             drop(conn);
             if let Some(run) = self.get_run(run_id)? {
-                self.upsert_run_intelligence_node(&run)?;
+                self.upsert_run_operational_session(&run)?;
             }
         }
         Ok(rows > 0)
@@ -231,7 +231,7 @@ impl RunRepository for Database {
 }
 
 impl Database {
-    fn upsert_run_intelligence_node(&self, run: &RunLog) -> Result<()> {
+    fn upsert_run_operational_session(&self, run: &RunLog) -> Result<()> {
         let agent = self.get_agent(&run.background_agent_id)?;
         let working_dir = agent.as_ref().and_then(|item| item.working_dir.clone());
         let title = agent
@@ -258,9 +258,8 @@ impl Database {
             None => format!("Run status: {}", run.status.as_str()),
         };
 
-        self.upsert_intelligence_node(crate::db::intelligence::IntelligenceNodeInput {
+        self.upsert_operational_session(crate::db::intelligence::OperationalSessionInput {
             id: Some(format!("run:{}", run.id)),
-            kind: "session".to_string(),
             title,
             body,
             metadata: Some(serde_json::json!({
@@ -276,7 +275,6 @@ impl Database {
             })),
             project_hash: None,
             session_id: Some(run.id.clone()),
-            relations: None,
         })?;
 
         Ok(())
