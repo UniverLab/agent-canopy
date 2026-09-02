@@ -328,9 +328,11 @@ pub fn validate_loop_graph(
             let has_pass = conds
                 .iter()
                 .any(|c| **c == LoopEdgeCondition::Pass || **c == LoopEdgeCondition::Always);
-            let has_fail = conds
-                .iter()
-                .any(|c| **c == LoopEdgeCondition::Fail || **c == LoopEdgeCondition::Always);
+            let has_fail = conds.iter().any(|c| {
+                **c == LoopEdgeCondition::Fail
+                    || **c == LoopEdgeCondition::Always
+                    || **c == LoopEdgeCondition::Break
+            });
             if !has_pass {
                 return Err(format!(
                     "Node '{}' has no outgoing edge for state 'pass' (expected a 'pass' or 'always' edge).",

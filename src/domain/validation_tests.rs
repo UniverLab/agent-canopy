@@ -423,4 +423,29 @@ mod graph_validation {
         let edges = vec![edge("A", "join", &always)];
         assert!(validate_loop_graph(&nodes, &edges).is_ok());
     }
+
+    /// CM2: `Break` edge counts toward fail coverage — a node with `Pass` +
+    /// `Break` edges is valid (Break covers fail).
+    #[test]
+    fn accepts_agent_node_with_pass_and_break_edges() {
+        let pass = LoopEdgeCondition::Pass;
+        let brk = LoopEdgeCondition::Break;
+        let nodes = vec![agent_node("A"), agent_node("B"), agent_node("C")];
+        let edges = vec![edge("A", "B", &pass), edge("A", "C", &brk)];
+        assert!(validate_loop_graph(&nodes, &edges).is_ok());
+    }
+
+    /// CM2: `Break` alone (without `Pass`) still fails validation — pass
+    /// coverage is separate from fail coverage.
+    #[test]
+    fn rejects_agent_node_with_only_break_edge() {
+        let brk = LoopEdgeCondition::Break;
+        let nodes = vec![agent_node("A"), agent_node("B")];
+        let edges = vec![edge("A", "B", &brk)];
+        let err = validate_loop_graph(&nodes, &edges).unwrap_err();
+        assert!(
+            err.to_lowercase().contains("pass"),
+            "err should mention missing pass: {err}"
+        );
+    }
 }

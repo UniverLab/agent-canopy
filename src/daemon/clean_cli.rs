@@ -1440,6 +1440,7 @@ mod tests {
         crate::domain::loops::Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: id.to_string(),
             name: format!("loop-{id}"),
             description: None,

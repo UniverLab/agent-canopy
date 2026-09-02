@@ -1142,7 +1142,7 @@ impl LoopEngine {
             }
             let iteration_value = *iteration;
 
-            let (final_execution, from_node_id, run_id) = match &cursor {
+            let (final_execution, from_node_id, run_id, had_infra_crash) = match &cursor {
                 SpecCursor::Node(node_id) => {
                     let node = nodes_by_id
                         .get(node_id.as_str())
@@ -1249,7 +1249,7 @@ impl LoopEngine {
                         None
                     };
 
-                    let (final_execution, run) = loop {
+                    let (final_execution, run, had_infra_crash) = loop {
                         let execution = self
                             .execute_node(
                                 lp,
@@ -1312,7 +1312,15 @@ impl LoopEngine {
                             continue;
                         }
 
-                        break (execution, run);
+                        // CM2: the loop is settling on this attempt (no more
+                        // retries). Route `Break` only if this final attempt is
+                        // itself a no-verdict infra crash — a retry that
+                        // recovered (Pass) or a genuine negative verdict (Fail)
+                        // must NOT take the `Break` edge.
+                        let had_infra_crash =
+                            is_infra_crash_shape(node, &execution, &run, crash_max_secs);
+
+                        break (execution, run, had_infra_crash);
                     };
 
                     tracing::info!(
@@ -1436,7 +1444,12 @@ impl LoopEngine {
                         });
                     }
 
-                    (final_execution, node.id.clone(), Some(run_id))
+                    (
+                        final_execution,
+                        node.id.clone(),
+                        Some(run_id),
+                        had_infra_crash,
+                    )
                 }
                 SpecCursor::Ensemble(ensemble_id) => {
                     let details = ensembles
@@ -1462,7 +1475,12 @@ impl LoopEngine {
                         return Ok(SpecExecutionOutcome::Paused);
                     }
 
-                    (final_execution, details.ensemble.join_node_id.clone(), None)
+                    (
+                        final_execution,
+                        details.ensemble.join_node_id.clone(),
+                        None,
+                        false,
+                    )
                 }
             };
 
@@ -1483,6 +1501,21 @@ impl LoopEngine {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 select_router_step(edges, &from_node_id, route_label)?
+            } else if had_infra_crash {
+                // CM2: infra failures try `Break` edges first, falling back
+                // to `Fail`/`Always` when no `Break` edge exists — additive,
+                // no existing graph changes behavior.
+                let break_selection = select_next_step_with_condition(
+                    edges,
+                    &ensembles,
+                    &from_node_id,
+                    &LoopEdgeCondition::Break,
+                )?;
+                if break_selection.is_some() {
+                    break_selection
+                } else {
+                    select_next_step(edges, &ensembles, &from_node_id, final_execution.status)?
+                }
             } else {
                 select_next_step(edges, &ensembles, &from_node_id, final_execution.status)?
             };
@@ -2418,6 +2451,21 @@ fn is_infra_crash(
     retry_limit: u32,
     crash_max_secs: u64,
 ) -> bool {
+    is_infra_crash_shape(node, execution, run, crash_max_secs) && attempt < retry_limit
+}
+
+/// The infra-crash *shape*: every condition [`is_infra_crash`] tests except
+/// the `attempt < retry_limit` retry gate — the agent died fast without
+/// filing any verdict. Checked again after the retry loop settles so that a
+/// retry-exhausted infra crash (CM2: route `Break`) is told apart from a
+/// genuine negative verdict or an attempt that recovered on retry (route
+/// `Fail`/`Pass`), neither of which has this shape.
+fn is_infra_crash_shape(
+    node: &LoopNode,
+    execution: &NodeExecution,
+    run: &LoopNodeRun,
+    crash_max_secs: u64,
+) -> bool {
     let self_reported = run.status != LoopRunStatus::Running;
     let permanent = execution
         .output
@@ -2438,7 +2486,6 @@ fn is_infra_crash(
         && node.kind == LoopNodeKind::Agent
         && execution.status == LoopRunStatus::Fail
         && (chrono::Utc::now() - run.started_at).num_seconds() < crash_max_secs as i64
-        && attempt < retry_limit
 }
 
 /// C19: whether `output` reflects an infrastructure failure — a crash,
@@ -4021,6 +4068,62 @@ fn select_next_step(
     }
 }
 
+/// CM2: like [`select_next_step`], but matches edges by an explicit condition
+/// rather than by run status. Used to find `Break` edges after an
+/// infrastructure failure — the engine knows there was an infra crash, but
+/// the agent declared nothing, so only the engine can resolve this edge.
+fn select_next_step_with_condition(
+    edges: &[LoopEdge],
+    ensembles: &[EnsembleDetails],
+    from_node: &str,
+    condition: &LoopEdgeCondition,
+) -> Result<Option<StepSelection>> {
+    let matching = edges
+        .iter()
+        .filter(|edge| edge.from_node == from_node)
+        .filter(|edge| edge.condition == *condition)
+        .collect::<Vec<_>>();
+
+    match matching.as_slice() {
+        [] => Ok(None),
+        [edge] => Ok(Some(StepSelection {
+            cursor: SpecCursor::Node(edge.to_node.clone()),
+            edge_condition: edge.condition.clone(),
+        })),
+        _ => {
+            let distinct_targets = matching
+                .iter()
+                .map(|edge| edge.to_node.as_str())
+                .collect::<HashSet<_>>();
+            if distinct_targets.len() == 1 {
+                let to_node = *distinct_targets.iter().next().expect("len == 1");
+                return Ok(Some(StepSelection {
+                    cursor: SpecCursor::Node(to_node.to_string()),
+                    edge_condition: matching[0].condition.clone(),
+                }));
+            }
+            for details in ensembles {
+                let member_ids: HashSet<&str> = details
+                    .members
+                    .iter()
+                    .map(|member| member.node_id.as_str())
+                    .collect();
+                if member_ids == distinct_targets {
+                    return Ok(Some(StepSelection {
+                        cursor: SpecCursor::Ensemble(details.ensemble.id.clone()),
+                        edge_condition: matching[0].condition.clone(),
+                    }));
+                }
+            }
+            bail!(
+                "Node '{}' has ambiguous outgoing '{}' edges.",
+                from_node,
+                condition.as_str()
+            )
+        }
+    }
+}
+
 /// Resolve a router node's next graph step: the edge out of `from_node`
 /// whose declared route matches `route_label` exactly (see
 /// [`LoopEdgeCondition::Route`]). Used instead of [`select_next_step`] only
@@ -4916,6 +5019,7 @@ mod tests {
         let lp = crate::domain::loops::Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: "wf-test".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -5111,6 +5215,7 @@ mod tests {
         let lp = crate::domain::loops::Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: "wf-test".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -6387,6 +6492,7 @@ mod tests {
         let lp = crate::domain::loops::Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: "wf".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -6461,6 +6567,7 @@ mod tests {
         let lp = crate::domain::loops::Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: "wf".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -6650,6 +6757,7 @@ mod tests {
         let lp = crate::domain::loops::Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: "wf".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -9275,6 +9383,7 @@ echo done
         let lp = crate::domain::loops::Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: "wf-test".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -9539,6 +9648,7 @@ echo done
         let lp = crate::domain::loops::Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: "wf-workdir".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -10030,6 +10140,7 @@ echo done
         let lp = crate::domain::loops::Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: "wf".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -12268,6 +12379,7 @@ echo done
         let lp = crate::domain::loops::Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: "wf".to_string(),
             name: "MyLoop".to_string(),
             description: None,
@@ -12308,6 +12420,7 @@ echo done
         let lp = crate::domain::loops::Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: "wf".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -13707,6 +13820,7 @@ echo done
         let lp = crate::domain::loops::Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: "wf-queue-ensemble".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -13985,9 +14099,10 @@ echo done
         );
     }
 
-    /// B19: infra crash retry exhausted routes to fail edge.
+    /// CM2 (renamed from B19): infra crash retry exhausted falls back to fail
+    /// edge when no `Break` edge exists — the additive, non-breaking path.
     #[tokio::test]
-    async fn infra_crash_retry_exhausted_routes_to_fail_edge() {
+    async fn infra_crash_retry_exhausted_falls_back_to_fail_when_no_break() {
         let fake_home = setup_test_cli_home();
         let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
 
@@ -14069,6 +14184,187 @@ echo done
         );
         assert_eq!(fix_runs.len(), 1, "fix should run once");
         assert_eq!(fix_runs[0].status, LoopRunStatus::Pass);
+    }
+
+    /// CM2: infra crash routes to `Break` edge when present, not `Fail`.
+    #[tokio::test]
+    async fn infra_crash_routes_to_break_edge_when_present() {
+        let fake_home = setup_test_cli_home();
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-implement".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "implement".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({
+                "platform": "test-cli",
+                "prompt_template": "exit 1",
+                "infra_retry_limit": 1,
+                "infra_crash_max_seconds": 60,
+                "infra_backoff_seconds": 0,
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-resilience".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "resilience".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf RESILIENCE",
+                "success_condition": "exit_code_0"
+            }),
+            position: 2,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        // Break edge to resilience node (should be taken on infra crash).
+        db.insert_loop_edge(&LoopEdge {
+            id: "edge-break".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "node-implement".to_string(),
+            to_node: "node-resilience".to_string(),
+            condition: LoopEdgeCondition::Break,
+        })
+        .unwrap();
+
+        let _home = HomeGuard::set(fake_home.path());
+        let result = engine.run_loop(loop_id.clone(), None, None).await;
+        drop(_home);
+        result.unwrap();
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+
+        let implement_runs: Vec<_> = runs
+            .iter()
+            .filter(|r| r.node_id == "node-implement")
+            .collect();
+        let resilience_runs: Vec<_> = runs
+            .iter()
+            .filter(|r| r.node_id == "node-resilience")
+            .collect();
+
+        assert!(!implement_runs.is_empty(), "implement node should have run");
+        assert!(
+            implement_runs.iter().any(|r| {
+                r.output
+                    .as_ref()
+                    .and_then(|o| o.get("infra_crash"))
+                    .and_then(|v| v.as_bool())
+                    == Some(true)
+            }),
+            "implement should have infra_crash marker"
+        );
+        assert_eq!(
+            resilience_runs.len(),
+            1,
+            "resilience node should run (Break edge taken)"
+        );
+    }
+
+    /// CM2: `Break` edge does not fire on a genuine fail (agent said no).
+    #[tokio::test]
+    async fn break_edge_does_not_fire_on_genuine_fail() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        // An agent that reports fail (not an infra crash).
+        db.insert_loop_node(&LoopNode {
+            id: "node-reviewer".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "reviewer".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "exit 1",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-resilience".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "resilience".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf RESILIENCE",
+                "success_condition": "exit_code_0"
+            }),
+            position: 2,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-fail-target".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "fail-target".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf FAIL_TARGET",
+                "success_condition": "exit_code_0"
+            }),
+            position: 3,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        // Break edge to resilience (should NOT be taken on genuine fail).
+        db.insert_loop_edge(&LoopEdge {
+            id: "edge-break".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "node-reviewer".to_string(),
+            to_node: "node-resilience".to_string(),
+            condition: LoopEdgeCondition::Break,
+        })
+        .unwrap();
+
+        // Fail edge to fail-target (SHOULD be taken on genuine fail).
+        db.insert_loop_edge(&LoopEdge {
+            id: "edge-fail".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "node-reviewer".to_string(),
+            to_node: "node-fail-target".to_string(),
+            condition: LoopEdgeCondition::Fail,
+        })
+        .unwrap();
+
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+
+        let resilience_runs: Vec<_> = runs
+            .iter()
+            .filter(|r| r.node_id == "node-resilience")
+            .collect();
+        let fail_target_runs: Vec<_> = runs
+            .iter()
+            .filter(|r| r.node_id == "node-fail-target")
+            .collect();
+
+        assert_eq!(
+            resilience_runs.len(),
+            0,
+            "resilience should NOT run (Break edge not taken on genuine fail)"
+        );
+        assert!(
+            !fail_target_runs.is_empty(),
+            "fail-target should run (Fail edge taken on genuine fail)"
+        );
     }
 
     /// B19: an agent that crashes once (fast, no self-report) and succeeds on
@@ -14180,6 +14476,155 @@ echo done
         assert!(
             flaky_runs.iter().any(|r| r.status == LoopRunStatus::Pass),
             "the retry should pass"
+        );
+    }
+
+    /// CM2 regression: an agent that infra-crashes once and then *recovers*
+    /// on the in-place retry must follow its `Pass` edge — the `Break` edge
+    /// (present here, as default pre-wiring would add it) must NOT fire just
+    /// because an earlier attempt crashed. Routing keys off the settled
+    /// attempt, not "did any attempt crash".
+    #[tokio::test]
+    async fn recovered_infra_retry_takes_pass_edge_not_break_edge() {
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        // Fails fast on the first invocation, succeeds on the second.
+        let marker = dir.path().join("recover-marker");
+        let script = dir.path().join("flaky-cli");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nif [ -f \"{m}\" ]; then printf ok; exit 0; else touch \"{m}\"; exit 1; fi\n",
+                m = marker.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let fake_home = tempfile::tempdir().unwrap();
+        let canopy_dir = fake_home.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        let config = crate::domain::canopy_config::CanopyConfig {
+            configured_at: Some(chrono::Utc::now().to_rfc3339()),
+            clis: vec![crate::domain::cli_config::CliConfig {
+                name: "flaky-cli".to_string(),
+                binary: script.to_string_lossy().to_string(),
+                headless_mode: "-c".to_string(),
+                model_flag: None,
+                supports_working_dir: false,
+                working_dir_flag: None,
+                env_vars: std::collections::HashMap::new(),
+                interactive_args: None,
+                fallback_interactive_args: None,
+                resume_args: None,
+                session_list_cmd: None,
+                session_resume_cmd: None,
+                accent_color: None,
+                yolo_flag: None,
+                prompt_via_stdin: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        config.save(&canopy_dir).unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-flaky".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "flaky".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({
+                "platform": "flaky-cli",
+                "prompt_template": "ignored",
+                "infra_retry_limit": 2,
+                "infra_crash_max_seconds": 60,
+                "infra_backoff_seconds": 0,
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-after".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "after".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf AFTER",
+                "success_condition": "exit_code_0"
+            }),
+            position: 2,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-infra".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "infra".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf INFRA",
+                "success_condition": "exit_code_0"
+            }),
+            position: 3,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        db.insert_loop_edge(&LoopEdge {
+            id: "edge-pass".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "node-flaky".to_string(),
+            to_node: "node-after".to_string(),
+            condition: LoopEdgeCondition::Pass,
+        })
+        .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "edge-break".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "node-flaky".to_string(),
+            to_node: "node-infra".to_string(),
+            condition: LoopEdgeCondition::Break,
+        })
+        .unwrap();
+
+        let _home = HomeGuard::set(fake_home.path());
+        let result = engine.run_loop(loop_id.clone(), None, None).await;
+        drop(_home);
+        result.unwrap();
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        let flaky_runs: Vec<_> = runs.iter().filter(|r| r.node_id == "node-flaky").collect();
+        let after_runs: Vec<_> = runs.iter().filter(|r| r.node_id == "node-after").collect();
+        let infra_runs: Vec<_> = runs.iter().filter(|r| r.node_id == "node-infra").collect();
+
+        assert_eq!(
+            flaky_runs.len(),
+            2,
+            "crash + successful retry should leave two run rows"
+        );
+        assert!(
+            flaky_runs.iter().any(|r| r.status == LoopRunStatus::Pass),
+            "the retry should pass"
+        );
+        assert_eq!(
+            after_runs.len(),
+            1,
+            "recovered node must follow its Pass edge to `after`"
+        );
+        assert_eq!(
+            infra_runs.len(),
+            0,
+            "Break edge must NOT fire when the node recovered on retry"
         );
     }
 
@@ -14697,6 +15142,7 @@ echo done
         let loop_a = crate::domain::loops::Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: "wf-graph-a".to_string(),
             name: "Graph A".to_string(),
             description: None,
@@ -14773,6 +15219,7 @@ echo done
         let loop_b = crate::domain::loops::Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: "wf-graph-b".to_string(),
             name: "Graph B".to_string(),
             description: None,
@@ -14914,6 +15361,7 @@ echo done
         let loop_a = crate::domain::loops::Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: "wf-signal-a".to_string(),
             name: "Graph A".to_string(),
             description: None,
@@ -14985,6 +15433,7 @@ echo done
         let loop_b = crate::domain::loops::Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: "wf-signal-b".to_string(),
             name: "Graph B".to_string(),
             description: None,
@@ -15290,6 +15739,7 @@ echo done
         let lp = crate::domain::loops::Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: "wf".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -15417,6 +15867,7 @@ echo done
         let lp = crate::domain::loops::Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: "wf-test".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -15496,6 +15947,7 @@ echo done
         let lp = crate::domain::loops::Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: "wf-test".to_string(),
             name: "Loop".to_string(),
             description: None,
@@ -15565,6 +16017,7 @@ echo done
         let lp = crate::domain::loops::Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: "wf-test".to_string(),
             name: "Loop".to_string(),
             description: None,

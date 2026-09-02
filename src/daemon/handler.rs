@@ -570,7 +570,7 @@ fn validate_node_position_conflict(
 
 fn validate_edge_condition(condition: &str) -> Result<LoopEdgeCondition, String> {
     LoopEdgeCondition::from_str(condition.trim())
-        .ok_or_else(|| "Loop edge condition must be one of: pass, fail, always.".to_string())
+        .ok_or_else(|| "Loop edge condition must be one of: pass, fail, always, break.".to_string())
 }
 
 /// [`validate_edge_condition`] plus `route` support for
@@ -590,8 +590,9 @@ fn validate_edge_condition_with_route(
             })?;
         return Ok(LoopEdgeCondition::Route(label.to_string()));
     }
-    validate_edge_condition(condition)
-        .map_err(|_| "Loop edge condition must be one of: pass, fail, always, route.".to_string())
+    validate_edge_condition(condition).map_err(|_| {
+        "Loop edge condition must be one of: pass, fail, always, route, break.".to_string()
+    })
 }
 
 /// If `condition` is a `Route`, validate that its label names a route
@@ -3832,6 +3833,9 @@ impl TaskTriggerHandler {
         let lp = Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: params
+                .infra_node_id
+                .filter(|value| !value.trim().is_empty()),
             id: uuid::Uuid::new_v4().to_string(),
             name: name.to_string(),
             description: params.description.filter(|value| !value.trim().is_empty()),
@@ -3924,6 +3928,19 @@ impl TaskTriggerHandler {
             },
         };
 
+        let new_infra_node_id = match &params.infra_node_id {
+            None => None,
+            Some(None) => Some(None),
+            Some(Some(value)) => {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    Some(None)
+                } else {
+                    Some(Some(trimmed.to_string()))
+                }
+            }
+        };
+
         if let Err(e) = validate_at_least_one_bool(
             &[
                 name.is_some(),
@@ -3931,6 +3948,7 @@ impl TaskTriggerHandler {
                 workdir.is_some(),
                 new_trigger.is_some(),
                 new_completion_hook.is_some(),
+                new_infra_node_id.is_some(),
             ],
             "loop_update",
         ) {
@@ -3954,6 +3972,12 @@ impl TaskTriggerHandler {
         if let Some(hook) = new_completion_hook {
             self.db
                 .update_loop_completion_hook(&loop_id, hook.as_ref())
+                .map_err(internal_error)?;
+        }
+
+        if let Some(infra_node_id) = new_infra_node_id {
+            self.db
+                .update_loop_infra_node_id(&loop_id, infra_node_id.as_deref())
                 .map_err(internal_error)?;
         }
 
@@ -4517,7 +4541,7 @@ impl TaskTriggerHandler {
         let node = LoopNode {
             id: uuid::Uuid::new_v4().to_string(),
             spec_id,
-            loop_id,
+            loop_id: loop_id.clone(),
             name: name.to_string(),
             kind,
             config,
@@ -4525,6 +4549,23 @@ impl TaskTriggerHandler {
             created_at: chrono::Utc::now(),
         };
         self.db.insert_loop_node(&node).map_err(internal_error)?;
+
+        // CM2: auto-wire a `Break` edge to the loop's infra node if set.
+        if let Some(ref lid) = loop_id {
+            if let Ok(Some(lp)) = self.db.get_loop(lid) {
+                if let Some(ref infra_node_id) = lp.infra_node_id {
+                    let edge = LoopEdge {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        spec_id: node.spec_id.clone(),
+                        loop_id: Some(lid.clone()),
+                        from_node: node.id.clone(),
+                        to_node: infra_node_id.clone(),
+                        condition: LoopEdgeCondition::Break,
+                    };
+                    let _ = self.db.insert_loop_edge(&edge);
+                }
+            }
+        }
 
         Ok(build_id_result(&node.id, "node_id"))
     }
@@ -5088,6 +5129,28 @@ impl TaskTriggerHandler {
         self.db
             .insert_node_with_edges(&plan.node, &plan.edges)
             .map_err(internal_error)?;
+
+        // CM2: auto-wire a `Break` edge to the loop's infra node if set.
+        if let Some(ref lid) = plan.node.loop_id {
+            if let Ok(Some(lp)) = self.db.get_loop(lid) {
+                if let Some(ref infra_node_id) = lp.infra_node_id {
+                    let already_has_break = plan.edges.iter().any(|e| {
+                        e.from_node == plan.node.id && e.condition == LoopEdgeCondition::Break
+                    });
+                    if !already_has_break {
+                        let edge = LoopEdge {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            spec_id: plan.node.spec_id.clone(),
+                            loop_id: Some(lid.clone()),
+                            from_node: plan.node.id.clone(),
+                            to_node: infra_node_id.clone(),
+                            condition: LoopEdgeCondition::Break,
+                        };
+                        let _ = self.db.insert_loop_edge(&edge);
+                    }
+                }
+            }
+        }
 
         let wired = !plan.edges.is_empty();
         let mut mapping = serde_json::Map::new();
@@ -5949,6 +6012,7 @@ impl TaskTriggerHandler {
         let lp = Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: plan.infra_node_id.clone(),
             id: loop_id.clone(),
             name: final_name.clone(),
             description: document
@@ -8519,6 +8583,7 @@ mod tests {
         db.insert_loop(&Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: loop_id.clone(),
             name: "Loop".to_string(),
             description: None,
@@ -8630,6 +8695,7 @@ mod tests {
         db.insert_loop(&Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: loop_id.clone(),
             name: "Loop".to_string(),
             description: None,
@@ -9477,6 +9543,7 @@ mod tests {
         db.insert_loop(&Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: id.to_string(),
             name: id.to_string(),
             description: None,
@@ -9924,6 +9991,7 @@ mod tests {
         db.insert_loop(&Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: loop_id.clone(),
             name: "Loop".to_string(),
             description: None,
@@ -9972,6 +10040,7 @@ mod tests {
         db.insert_loop(&Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: loop_id.clone(),
             name: "Loop".to_string(),
             description: None,
@@ -10024,6 +10093,7 @@ mod tests {
         db.insert_loop(&Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: loop_id.clone(),
             name: "Loop".to_string(),
             description: None,
@@ -10066,6 +10136,7 @@ mod tests {
         Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: loop_id.to_string(),
             name: loop_id.to_string(),
             description: None,
@@ -10563,6 +10634,86 @@ mod tests {
         .unwrap();
         let err = plan_node_copy(&db, &params).unwrap_err();
         assert!(err.contains("loop_copy_ensemble"), "{err}");
+    }
+
+    /// CM2: copying a node into a loop with `infra_node_id` set must
+    /// auto-wire a `Break` edge to the infra node, preserving the
+    /// pre-wiring invariant.
+    #[test]
+    fn loop_copy_node_auto_wires_break_edge_when_loop_has_infra_node() {
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("t.db")).unwrap();
+        db.insert_loop(&Loop {
+            archived: false,
+            paused_by_reconciliation: false,
+            infra_node_id: Some("infra".to_string()),
+            id: "loop-1".to_string(),
+            name: "loop-1".to_string(),
+            description: None,
+            workdir: "/tmp".to_string(),
+            status: LoopStatus::Running,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        })
+        .unwrap();
+        db.insert_loop_node(&u10_agent(
+            "src",
+            None,
+            Some("loop-1"),
+            1,
+            serde_json::json!({"platform":"claude","prompt_template":"do it"}),
+        ))
+        .unwrap();
+        db.insert_loop_node(&u10_check("infra", None, Some("loop-1"), 2))
+            .unwrap();
+
+        let params: LoopCopyNodeParams = serde_json::from_value(serde_json::json!({
+            "source_node_id": "src"
+        }))
+        .unwrap();
+        let plan = plan_node_copy(&db, &params).unwrap();
+        db.insert_node_with_edges(&plan.node, &plan.edges).unwrap();
+
+        // Simulate the handler's auto-wiring block.
+        if let Some(ref lid) = plan.node.loop_id {
+            if let Ok(Some(lp)) = db.get_loop(lid) {
+                if let Some(ref infra_node_id) = lp.infra_node_id {
+                    let already_has_break = plan.edges.iter().any(|e| {
+                        e.from_node == plan.node.id && e.condition == LoopEdgeCondition::Break
+                    });
+                    if !already_has_break {
+                        let edge = LoopEdge {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            spec_id: plan.node.spec_id.clone(),
+                            loop_id: Some(lid.clone()),
+                            from_node: plan.node.id.clone(),
+                            to_node: infra_node_id.clone(),
+                            condition: LoopEdgeCondition::Break,
+                        };
+                        let _ = db.insert_loop_edge(&edge);
+                    }
+                }
+            }
+        }
+
+        let edges = db.list_loop_edges_for_loop("loop-1").unwrap();
+        let break_edges: Vec<_> = edges
+            .iter()
+            .filter(|e| e.from_node == plan.node.id && e.condition == LoopEdgeCondition::Break)
+            .collect();
+        assert_eq!(
+            break_edges.len(),
+            1,
+            "copied node must have exactly one Break edge to infra node"
+        );
+        assert_eq!(break_edges[0].to_node, "infra");
     }
 
     #[test]
@@ -11647,6 +11798,7 @@ mod tests {
         Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: "loop-1".to_string(),
             name: "Test Loop".to_string(),
             description: None,
@@ -12006,6 +12158,7 @@ mod additional_tests {
         db.insert_loop(&Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: id.to_string(),
             name: id.to_string(),
             description: None,
@@ -13220,6 +13373,7 @@ mod additional_tests {
         let lp = Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: "l1".to_string(),
             name: "l1".to_string(),
             description: None,
@@ -13245,6 +13399,7 @@ mod additional_tests {
         let lp = Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: "l1".to_string(),
             name: "l1".to_string(),
             description: None,
@@ -13400,6 +13555,7 @@ mod coverage_tests {
         Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: loop_id.to_string(),
             name: loop_id.to_string(),
             description: None,
@@ -15713,6 +15869,7 @@ mod endpoint_tests {
                 description: None,
                 workdir: workdir.clone(),
                 trigger: None,
+                infra_node_id: None,
             }))
             .await
             .unwrap();
@@ -15728,6 +15885,7 @@ mod endpoint_tests {
                 workdir: None,
                 trigger: None,
                 on_completed: None,
+                infra_node_id: None,
             }))
             .await
             .unwrap();
@@ -15745,6 +15903,7 @@ mod endpoint_tests {
                 description: None,
                 workdir: "/tmp".to_string(),
                 trigger: None,
+                infra_node_id: None,
             }))
             .await
             .unwrap();
@@ -15756,6 +15915,7 @@ mod endpoint_tests {
                 description: None,
                 workdir: "relative/dir".to_string(),
                 trigger: None,
+                infra_node_id: None,
             }))
             .await
             .unwrap();
@@ -15785,6 +15945,7 @@ mod endpoint_tests {
                 description: Some("A shareable design".to_string()),
                 workdir: workdir.to_string(),
                 trigger: None,
+                infra_node_id: None,
             }))
             .await
             .unwrap();
@@ -15918,6 +16079,7 @@ mod endpoint_tests {
                 description: None,
                 workdir,
                 trigger: None,
+                infra_node_id: None,
             }))
             .await
             .unwrap();
@@ -16134,6 +16296,7 @@ mod endpoint_tests {
                 description: Some("Has an ensemble".to_string()),
                 workdir: workdir.clone(),
                 trigger: None,
+                infra_node_id: None,
             }))
             .await
             .unwrap();
@@ -16257,6 +16420,7 @@ mod endpoint_tests {
                 description: None,
                 workdir,
                 trigger: None,
+                infra_node_id: None,
             }))
             .await
             .unwrap();
@@ -16338,6 +16502,7 @@ mod endpoint_tests {
                 description: None,
                 workdir,
                 trigger: None,
+                infra_node_id: None,
             }))
             .await
             .unwrap();
@@ -16402,6 +16567,7 @@ mod endpoint_tests {
                 workdir: None,
                 trigger: None,
                 on_completed: None,
+                infra_node_id: None,
             }))
             .await
             .unwrap();
@@ -16416,6 +16582,7 @@ mod endpoint_tests {
                 workdir: None,
                 trigger: None,
                 on_completed: None,
+                infra_node_id: None,
             }))
             .await
             .unwrap();
@@ -16427,6 +16594,7 @@ mod endpoint_tests {
         let lp = Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: uuid::Uuid::new_v4().to_string(),
             name: "Test Loop".to_string(),
             description: None,
@@ -20221,6 +20389,7 @@ mod endpoint_tests {
             auto_continue_action: None,
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
         };
         db.insert_loop(&lp2).unwrap();
 

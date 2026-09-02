@@ -55,6 +55,10 @@ pub struct LoopExportDocument {
     pub edges: Vec<LoopExportEdge>,
     #[serde(default)]
     pub ensembles: Vec<LoopExportEnsemble>,
+    /// CM2: optional pre-wired target for infrastructure failures, referenced
+    /// by node name (not id) — `None` when the loop has no infra node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub infra_node: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -241,6 +245,8 @@ pub fn build_export_document(
         });
     }
 
+    let infra_node = lp.infra_node_id.as_deref().map(resolve_name).transpose()?;
+
     Ok(LoopExportDocument {
         format_version: LOOP_EXPORT_FORMAT_VERSION,
         name: lp.name.clone(),
@@ -248,6 +254,7 @@ pub fn build_export_document(
         nodes: export_nodes,
         edges: export_edges,
         ensembles: export_ensembles,
+        infra_node,
     })
 }
 
@@ -342,6 +349,9 @@ pub struct LoopImportPlan {
     pub nodes: Vec<LoopNode>,
     pub edges: Vec<LoopEdge>,
     pub ensembles: Vec<LoopImportEnsemblePlan>,
+    /// CM2: resolved infra node id (from the document's `infra_node` name),
+    /// or `None` when the document has no infra node.
+    pub infra_node_id: Option<String>,
 }
 
 /// Build a validated [`LoopImportPlan`] for `loop_id` from a parsed
@@ -702,10 +712,13 @@ pub fn build_import_plan(
         }
     }
 
+    let infra_node_id = document.infra_node.as_deref().map(resolve).transpose()?;
+
     Ok(LoopImportPlan {
         nodes,
         edges,
         ensembles,
+        infra_node_id,
     })
 }
 
@@ -766,6 +779,7 @@ mod tests {
         Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: "loop-1".to_string(),
             name: name.to_string(),
             description: Some("A test loop".to_string()),
@@ -920,6 +934,7 @@ mod tests {
                 condition: LoopEdgeCondition::Always,
             }],
             ensembles: vec![],
+            infra_node: None,
         };
         let err = build_import_plan(&doc, "new-loop").unwrap_err();
         assert!(err.contains("ghost"));
@@ -939,6 +954,7 @@ mod tests {
             }],
             edges: vec![],
             ensembles: vec![],
+            infra_node: None,
         };
         let err = build_import_plan(&doc, "new-loop").unwrap_err();
         assert!(err.contains("join"));
@@ -1259,6 +1275,7 @@ mod tests {
                     prompt_override: None,
                 }],
             }],
+            infra_node: None,
         };
         let err = build_import_plan(&doc, "new-loop").unwrap_err();
         assert!(err.contains("2-8 members"));
@@ -1304,6 +1321,7 @@ mod tests {
                 },
             ],
             ensembles: vec![],
+            infra_node: None,
         };
         let err = build_import_plan(&doc, "new-loop").unwrap_err();
         assert!(err.contains('C'), "err should name C: {err}");
@@ -1346,6 +1364,7 @@ mod tests {
                 condition: LoopEdgeCondition::Always,
             }],
             ensembles: vec![],
+            infra_node: None,
         };
         let err = build_import_plan(&doc, "new-loop").unwrap_err();
         assert!(err.to_lowercase().contains("entry"), "err: {err}");
@@ -1380,6 +1399,7 @@ mod tests {
                 condition: LoopEdgeCondition::Pass,
             }],
             ensembles: vec![],
+            infra_node: None,
         };
         let err = build_import_plan(&doc, "new-loop").unwrap_err();
         assert!(err.contains("resilience"), "err: {err}");
@@ -1403,6 +1423,7 @@ mod tests {
             }],
             edges: vec![],
             ensembles: vec![],
+            infra_node: None,
         };
         let err = build_import_plan(&doc, "new-loop").unwrap_err();
         assert!(
@@ -1463,6 +1484,7 @@ mod tests {
                 },
             ],
             ensembles: vec![],
+            infra_node: None,
         };
         let result = build_import_plan(&doc, "new-loop");
         assert!(

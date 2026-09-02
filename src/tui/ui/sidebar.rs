@@ -1925,6 +1925,7 @@ mod tests {
         db.insert_loop(&Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: "wf-probe".to_string(),
             name: "Probe Loop".to_string(),
             description: None,
@@ -2096,6 +2097,7 @@ mod tests {
         Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: id.to_string(),
             name: format!("Loop {id}"),
             description: None,

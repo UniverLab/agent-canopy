@@ -31,8 +31,8 @@ impl Database {
         let (trigger_type, trigger_config) = encode_loop_trigger(lp.trigger.as_ref())?;
         let on_completed = encode_loop_completion_hook(lp.on_completed.as_ref())?;
         conn.execute(
-            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation, infra_node_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 &lp.id,
                 &lp.name,
@@ -51,6 +51,7 @@ impl Database {
                 &lp.auto_continue_action,
                 lp.archived,
                 lp.paused_by_reconciliation,
+                &lp.infra_node_id,
             ],
         )?;
         Ok(())
@@ -91,7 +92,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation, infra_node_id
              FROM loops WHERE autorun_at IS NOT NULL",
         )?;
         let rows = stmt.query_map([], map_loop_row)?;
@@ -146,7 +147,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation, infra_node_id
              FROM loops WHERE auto_continue_at IS NOT NULL",
         )?;
         let rows = stmt.query_map([], map_loop_row)?;
@@ -205,7 +206,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation, infra_node_id
              FROM loops WHERE trigger_type = ?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![trigger_type], map_loop_row)?;
@@ -244,13 +245,29 @@ impl Database {
         Ok(rows > 0)
     }
 
+    pub fn update_loop_infra_node_id(
+        &self,
+        loop_id: &str,
+        infra_node_id: Option<&str>,
+    ) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE loops SET infra_node_id = ?1 WHERE id = ?2",
+            params![infra_node_id, loop_id],
+        )?;
+        Ok(rows > 0)
+    }
+
     pub fn get_loop(&self, loop_id: &str) -> Result<Option<Loop>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation, infra_node_id
              FROM loops WHERE id = ?1",
         )?;
 
@@ -279,12 +296,12 @@ impl Database {
         };
         let sql = if workdir.is_some() {
             format!(
-                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation
+                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation, infra_node_id
                  FROM loops WHERE workdir = ?1{archived_clause} ORDER BY created_at DESC"
             )
         } else {
             format!(
-                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation
+                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation, infra_node_id
                  FROM loops WHERE 1=1{archived_clause} ORDER BY created_at DESC"
             )
         };
@@ -1666,7 +1683,7 @@ impl Database {
 
         let orphaned: Vec<Loop> = {
             let mut stmt = tx.prepare(
-                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation
+                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation, infra_node_id
                  FROM loops WHERE status = ?1",
             )?;
             let rows = stmt.query_map(params![LoopStatus::Running.as_str()], map_loop_row)?;
@@ -2088,6 +2105,7 @@ fn map_loop_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Loop> {
         auto_continue_action: row.get(13)?,
         archived: row.get(14)?,
         paused_by_reconciliation: row.get(15)?,
+        infra_node_id: row.get(16)?,
     })
 }
 
@@ -2309,6 +2327,7 @@ mod tests {
         Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: id.to_string(),
             name: format!("Loop {id}"),
             description: None,

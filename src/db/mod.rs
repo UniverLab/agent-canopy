@@ -1151,6 +1151,21 @@ impl Database {
             .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
         }
 
+        // CM2: optional pre-wired target for infrastructure failures. When
+        // set, new agent/check/gate nodes auto-create a `Break` edge to
+        // this node. `NULL` on every pre-existing row (no auto-wiring).
+        let has_infra_node_id: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loops') WHERE name = 'infra_node_id'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_infra_node_id {
+            conn.execute("ALTER TABLE loops ADD COLUMN infra_node_id TEXT", [])
+                .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
         // `spec_committed_head` (C15): the workdir's git HEAD immediately
         // after a `commit_rights: true` node's own execution actually moved
         // it — as opposed to `spec_start_head`, which only proves *some*

@@ -855,6 +855,7 @@ mod hang_repro {
         db.insert_loop(&Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: loop_id.clone(),
             name: "Repro Loop".to_string(),
             description: None,
@@ -1374,6 +1375,7 @@ mod stdio_startup_reconciliation_tests {
         let lp = Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: format!("wf-stdio-startup-{suffix}"),
             name: format!("Stdio startup test loop {suffix}"),
             description: None,

@@ -324,6 +324,7 @@ mod tests {
         Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: id.to_string(),
             name: "Nightly review".to_string(),
             description: Some("Review the queue".to_string()),

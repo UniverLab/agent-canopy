@@ -955,6 +955,7 @@ mod tests {
         crate::domain::loops::Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: id.to_string(),
             name: "Autorun test loop".to_string(),
             description: None,
@@ -1097,6 +1098,7 @@ mod tests {
         db.insert_loop(&Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: loop_id.clone(),
             name: "Autorun test loop".to_string(),
             description: None,
@@ -1374,6 +1376,7 @@ mod tests {
         db.insert_loop(&Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: loop_id.clone(),
             name: "C19 blocked autorun test".to_string(),
             description: None,
@@ -1477,6 +1480,7 @@ mod tests {
         db.insert_loop(&Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: loop_id.clone(),
             name: "Autorun queue test loop".to_string(),
             description: None,
@@ -1738,6 +1742,7 @@ mod tests {
         db.insert_loop(&Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: loop_id.clone(),
             name: "Auto-continue test loop".to_string(),
             description: None,
@@ -1850,6 +1855,7 @@ mod tests {
         db.insert_loop(&Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: loop_id.clone(),
             name: "Auto-continue skip test loop".to_string(),
             description: None,

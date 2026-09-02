@@ -817,6 +817,7 @@ mod tests {
         crate::domain::loops::Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: "lp1".to_string(),
             name: "Nightly review".to_string(),
             description: None,

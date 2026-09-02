@@ -379,6 +379,10 @@ pub struct LoopCreateParams {
     pub workdir: String,
     /// Optional automatic trigger (cron/watch). Omit for a manual loop.
     pub trigger: Option<LoopTriggerParams>,
+    /// Optional pre-wired target for infrastructure failures (`Break` edges).
+    /// When set, every new agent/check/gate node auto-creates a `Break` edge
+    /// to this node.
+    pub infra_node_id: Option<String>,
 }
 
 /// Config for a loop's `on_completed` hook (N2) — an agent-node-style
@@ -419,6 +423,9 @@ pub struct LoopUpdateParams {
     /// exactly when the loop transitions to `completed` (never on
     /// failed/paused, never retroactively).
     pub on_completed: Option<Option<LoopCompletionHookParams>>,
+    /// New pre-wired target for infrastructure failures (`Break` edges), or
+    /// null to clear. Omit to leave unchanged.
+    pub infra_node_id: Option<Option<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

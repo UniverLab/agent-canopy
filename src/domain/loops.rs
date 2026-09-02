@@ -303,6 +303,11 @@ pub enum LoopEdgeCondition {
     /// `daemon::handler`'s `loop_add_edge`/`loop_update_edge`), never
     /// accepted free-form.
     Route(String),
+    /// The node produced no verdict (infrastructure failure — crash,
+    /// timeout, empty response). Emitted by the engine itself after retry
+    /// exhaustion, never by a router. Falls back to [`Self::Fail`] when no
+    /// `Break` edge exists, so graphs without one keep current behavior.
+    Break,
 }
 
 impl LoopEdgeCondition {
@@ -317,6 +322,7 @@ impl LoopEdgeCondition {
             Self::Fail => "fail",
             Self::Always => "always",
             Self::Route(_) => "route",
+            Self::Break => "break",
         }
     }
 
@@ -337,6 +343,7 @@ impl LoopEdgeCondition {
             "pass" => Some(Self::Pass),
             "fail" => Some(Self::Fail),
             "always" => Some(Self::Always),
+            "break" => Some(Self::Break),
             _ => None,
         }
     }
@@ -581,6 +588,13 @@ pub struct Loop {
     /// operator actually asked for.
     #[serde(default)]
     pub paused_by_reconciliation: bool,
+    /// Optional pre-wired target for infrastructure failures (`Break` edges).
+    /// When set, every new agent/check/gate node added to this loop
+    /// auto-creates a `Break` edge to this node, so a graph with no
+    /// explicit infrastructure edge still has fail coverage by construction.
+    /// `None` preserves pre-CM2 behavior — no auto-wiring, no `Break` edges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub infra_node_id: Option<String>,
 }
 
 /// Config for a loop's `on_completed` hook — deliberately shaped like an
@@ -1167,6 +1181,7 @@ Task:
         super::Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: "wf".to_string(),
             name: "Loop".to_string(),
             description: None,

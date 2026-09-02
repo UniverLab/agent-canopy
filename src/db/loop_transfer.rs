@@ -25,8 +25,8 @@ impl Database {
         let tx = conn.transaction()?;
 
         tx.execute(
-            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation, infra_node_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 &lp.id,
                 &lp.name,
@@ -45,6 +45,7 @@ impl Database {
                 &lp.auto_continue_action,
                 lp.archived,
                 lp.paused_by_reconciliation,
+                &lp.infra_node_id,
             ],
         )?;
 
@@ -157,6 +158,7 @@ mod tests {
         Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: id.to_string(),
             name: name.to_string(),
             description: Some("imported".to_string()),
@@ -200,6 +202,7 @@ mod tests {
                 condition: LoopEdgeCondition::Always,
             }],
             ensembles: vec![],
+            infra_node: None,
         }
     }
 
@@ -295,6 +298,7 @@ mod tests {
                     },
                 ],
             }],
+            infra_node: None,
         };
         let lp = draft_loop("loop-1", "ensemble-loop", "/tmp/project");
         let plan = build_import_plan(&document, &lp.id).unwrap();
@@ -318,5 +322,55 @@ mod tests {
             build_export_document(&lp_row, &graph_nodes, &graph_edges, &ensembles, true).unwrap();
         assert_eq!(redone.ensembles.len(), 1);
         assert_eq!(redone.nodes.len(), 2);
+    }
+
+    /// CM2: importing a document with `infra_node` set must persist the
+    /// resolved node id on the loop row — not silently drop it.
+    #[test]
+    fn import_loop_graph_persists_infra_node_id() {
+        use crate::domain::loop_transfer::{LoopExportEdge, LoopExportNode};
+        let db = test_db();
+        let document = LoopExportDocument {
+            format_version: 1,
+            name: "infra-loop".to_string(),
+            description: None,
+            nodes: vec![
+                LoopExportNode {
+                    name: "A".to_string(),
+                    kind: LoopNodeKind::Agent,
+                    position: 1,
+                    config: serde_json::json!({"prompt_template": "do it"}),
+                },
+                LoopExportNode {
+                    name: "B".to_string(),
+                    kind: LoopNodeKind::Check,
+                    position: 2,
+                    config: serde_json::json!({"command": "true"}),
+                },
+            ],
+            edges: vec![LoopExportEdge {
+                from_node: "A".to_string(),
+                to_node: "B".to_string(),
+                condition: LoopEdgeCondition::Always,
+            }],
+            ensembles: vec![],
+            infra_node: Some("B".to_string()),
+        };
+        let mut lp = draft_loop("loop-1", "infra-loop", "/tmp/project");
+        let plan = build_import_plan(&document, &lp.id).unwrap();
+        let expected_infra_id = plan
+            .infra_node_id
+            .clone()
+            .expect("plan resolved infra node");
+        lp.infra_node_id = Some(expected_infra_id.clone());
+
+        db.import_loop_graph(&lp, &plan).unwrap();
+
+        let stored = db.get_loop("loop-1").unwrap().expect("loop exists");
+        assert_eq!(
+            stored.infra_node_id,
+            Some(expected_infra_id),
+            "imported loop must persist infra_node_id"
+        );
     }
 }

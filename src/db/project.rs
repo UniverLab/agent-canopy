@@ -1159,6 +1159,7 @@ mod tests {
         db.insert_loop(&crate::domain::loops::Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: "loop-1".to_string(),
             name: "loop-1".to_string(),
             description: None,
@@ -1368,6 +1369,7 @@ mod tests {
         db.insert_loop(&crate::domain::loops::Loop {
             archived: false,
             paused_by_reconciliation: false,
+            infra_node_id: None,
             id: "loop-b".to_string(),
             name: "loop-b".to_string(),
             description: None,
