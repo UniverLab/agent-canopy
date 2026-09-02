@@ -203,4 +203,37 @@ mod tests {
             "wrapping to the last item must show the last page"
         );
     }
+
+    #[test]
+    fn move_selection_cycles_and_keeps_cursor_visible_through_full_traversal() {
+        let len = 20;
+        let visible = 5;
+        let mut idx = 0;
+        let mut scroll = 0;
+
+        for _ in 0..20 {
+            let (new_idx, new_scroll) = move_selection(idx, scroll, len, visible, true);
+            idx = new_idx;
+            scroll = new_scroll;
+            assert!(
+                idx >= scroll && idx < scroll + visible,
+                "forward: cursor {idx} outside viewport [{scroll}, {})",
+                scroll + visible
+            );
+        }
+        assert_eq!(idx, 0, "20 forward steps from 0 must wrap back to 0");
+        assert_eq!(scroll, 0, "wrapping to 0 must show the first page");
+
+        for _ in 0..20 {
+            let (new_idx, new_scroll) = move_selection(idx, scroll, len, visible, false);
+            idx = new_idx;
+            scroll = new_scroll;
+            assert!(
+                idx >= scroll && idx < scroll + visible,
+                "backward: cursor {idx} outside viewport [{scroll}, {})",
+                scroll + visible
+            );
+        }
+        assert_eq!(idx, 0, "20 backward steps from 0 must wrap back to 0");
+    }
 }

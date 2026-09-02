@@ -451,21 +451,23 @@ impl SuggestionPicker {
     const MAX_VISIBLE: usize = 10;
 
     pub fn move_up(&mut self) {
-        if self.selected > 0 {
-            self.selected -= 1;
-            if self.selected < self.scroll_offset {
-                self.scroll_offset = self.selected;
-            }
-        }
+        self.move_pick(false);
     }
 
     pub fn move_down(&mut self) {
-        if !self.items.is_empty() && self.selected < self.items.len() - 1 {
-            self.selected += 1;
-            if self.selected >= self.scroll_offset + Self::MAX_VISIBLE {
-                self.scroll_offset = self.selected + 1 - Self::MAX_VISIBLE;
-            }
-        }
+        self.move_pick(true);
+    }
+
+    pub fn move_pick(&mut self, forward: bool) {
+        let (new_sel, new_scroll) = crate::tui::selection::move_selection(
+            self.selected,
+            self.scroll_offset,
+            self.items.len(),
+            Self::MAX_VISIBLE,
+            forward,
+        );
+        self.selected = new_sel;
+        self.scroll_offset = new_scroll;
     }
 
     /// Returns the slice of items currently visible in the scroll window.
@@ -935,23 +937,65 @@ mod tests {
     }
 
     #[test]
-    fn picker_move_up_stays_at_top() {
+    fn picker_single_item_never_moves() {
         let mut hist = SessionHistory::default();
         hist.record("cargo build", "/tmp");
         let mut picker = SuggestionPicker::from_history("cargo", &hist, "/tmp");
         picker.move_up();
-        picker.move_up();
+        assert_eq!(picker.selected, 0);
+        picker.move_down();
         assert_eq!(picker.selected, 0);
     }
 
     #[test]
-    fn picker_move_down_stays_at_bottom() {
+    fn picker_cycles_at_both_ends_and_keeps_selection_in_the_scroll_window() {
+        // Routed through the shared selection model: up from the first entry
+        // lands on the last, down from the last wraps to the first, and the
+        // scroll offset always keeps `selected` inside the MAX_VISIBLE window.
         let mut hist = SessionHistory::default();
-        hist.record("cargo build", "/tmp");
+        for i in 0..20 {
+            hist.record(&format!("cargo cmd-{i}"), "/tmp");
+        }
         let mut picker = SuggestionPicker::from_history("cargo", &hist, "/tmp");
+        assert_eq!(picker.items.len(), 20);
+        let last = picker.items.len() - 1;
+
+        picker.move_up();
+        assert_eq!(
+            picker.selected, last,
+            "up from the first entry wraps to last"
+        );
+        assert!(
+            picker.selected >= picker.scroll_offset
+                && picker.selected < picker.scroll_offset + SuggestionPicker::MAX_VISIBLE,
+            "wrapped selection must be inside the scroll window"
+        );
+
         picker.move_down();
-        picker.move_down();
-        assert_eq!(picker.selected, 0);
+        assert_eq!(
+            picker.selected, 0,
+            "down from the last entry wraps to first"
+        );
+        assert_eq!(
+            picker.scroll_offset, 0,
+            "wrapping to the first entry shows the first page"
+        );
+
+        // Walk the whole list forward; the cursor never leaves the viewport.
+        for _ in 0..picker.items.len() {
+            picker.move_down();
+            assert!(
+                picker.selected >= picker.scroll_offset
+                    && picker.selected < picker.scroll_offset + SuggestionPicker::MAX_VISIBLE,
+                "selected {} outside window starting at {}",
+                picker.selected,
+                picker.scroll_offset
+            );
+        }
+        assert_eq!(
+            picker.selected, 0,
+            "a full lap forward returns to the first entry"
+        );
     }
 
     #[test]

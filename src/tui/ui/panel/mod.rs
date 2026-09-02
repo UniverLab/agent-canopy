@@ -1406,13 +1406,9 @@ fn playground_empty_state(app: &App, theme: &Theme) -> Line<'static> {
     Line::from(Span::styled(message, Style::default().fg(color)))
 }
 
-fn visible_playground_window(area: Rect, selected: usize) -> (usize, usize) {
+fn visible_playground_window(area: Rect, selected: usize, total: usize) -> (usize, usize) {
     let max_visible = ((area.height.saturating_sub(4)) / 5).max(1) as usize;
-    let scroll_start = if selected >= max_visible {
-        selected.saturating_sub(max_visible - 1)
-    } else {
-        0
-    };
+    let scroll_start = crate::tui::selection::clamp_scroll(selected, 0, total, max_visible);
     (max_visible, scroll_start)
 }
 
@@ -1436,7 +1432,8 @@ fn draw_playground_list(frame: &mut Frame, area: Rect, app: &App, theme: &Theme)
     }
 
     let total = app.playground_results.len();
-    let (max_visible, scroll_start) = visible_playground_window(area, app.playground_selected);
+    let (max_visible, scroll_start) =
+        visible_playground_window(area, app.playground_selected, total);
     for (idx, chunk) in app
         .playground_results
         .iter()
@@ -2317,7 +2314,7 @@ mod tests {
     #[test]
     fn visible_playground_window_basic() {
         let area = Rect::new(0, 0, 80, 20);
-        let (max_visible, scroll_start) = visible_playground_window(area, 0);
+        let (max_visible, scroll_start) = visible_playground_window(area, 0, 20);
         assert!(max_visible > 0);
         assert_eq!(scroll_start, 0);
     }
@@ -2325,7 +2322,7 @@ mod tests {
     #[test]
     fn visible_playground_window_scrolled() {
         let area = Rect::new(0, 0, 80, 20);
-        let (max_visible, scroll_start) = visible_playground_window(area, 10);
+        let (max_visible, scroll_start) = visible_playground_window(area, 10, 20);
         assert!(scroll_start > 0 || max_visible >= 10);
     }
 

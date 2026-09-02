@@ -73,16 +73,15 @@ impl TerminalSearch {
 
     pub fn next_match(&mut self) {
         if !self.match_rows.is_empty() {
-            self.current_match = (self.current_match + 1) % self.match_rows.len();
+            self.current_match =
+                crate::tui::selection::move_index(self.current_match, self.match_rows.len(), true);
         }
     }
 
     pub fn prev_match(&mut self) {
         if !self.match_rows.is_empty() {
-            self.current_match = self
-                .current_match
-                .checked_sub(1)
-                .unwrap_or(self.match_rows.len() - 1);
+            self.current_match =
+                crate::tui::selection::move_index(self.current_match, self.match_rows.len(), false);
         }
     }
 }

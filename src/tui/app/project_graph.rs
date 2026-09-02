@@ -199,27 +199,23 @@ impl ProjectRelationDialog {
         if self.filtered.is_empty() {
             return;
         }
-        self.selected_idx = self
-            .selected_idx
-            .checked_sub(1)
-            .unwrap_or(self.filtered.len() - 1);
+        self.selected_idx =
+            crate::tui::selection::move_index(self.selected_idx, self.filtered.len(), false);
     }
 
     pub fn move_down(&mut self) {
         if self.filtered.is_empty() {
             return;
         }
-        self.selected_idx = (self.selected_idx + 1) % self.filtered.len();
+        self.selected_idx =
+            crate::tui::selection::move_index(self.selected_idx, self.filtered.len(), true);
     }
 
     pub fn cycle_relation(&mut self, forward: bool) {
-        if forward {
-            self.relation_idx = (self.relation_idx + 1) % self.relation_types.len();
-        } else {
-            self.relation_idx = self
-                .relation_idx
-                .checked_sub(1)
-                .unwrap_or(self.relation_types.len() - 1);
-        }
+        self.relation_idx = crate::tui::selection::move_index(
+            self.relation_idx,
+            self.relation_types.len(),
+            forward,
+        );
     }
 }

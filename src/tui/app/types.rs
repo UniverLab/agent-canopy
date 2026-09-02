@@ -368,11 +368,8 @@ impl LoopEditorDialog {
         if self.edge_rows.is_empty() {
             return;
         }
-        self.edge_row_index = if forward {
-            (self.edge_row_index + 1) % self.edge_rows.len()
-        } else {
-            (self.edge_row_index + self.edge_rows.len() - 1) % self.edge_rows.len()
-        };
+        self.edge_row_index =
+            crate::tui::selection::move_index(self.edge_row_index, self.edge_rows.len(), forward);
     }
 
     /// The edge currently focused in `Edges` mode's row list.
@@ -395,8 +392,7 @@ impl LoopEditorDialog {
             .position(|(id, _)| id == &edge.to_node);
         let len = self.edge_targets.len();
         let next_index = match current {
-            Some(index) if forward => (index + 1) % len,
-            Some(index) => (index + len - 1) % len,
+            Some(index) => crate::tui::selection::move_index(index, len, forward),
             None => 0,
         };
         Some(self.edge_targets[next_index].0.clone())
@@ -485,11 +481,7 @@ impl LoopEditorDialog {
         // Index space is `[None, targets[0], targets[1], ...]`.
         let len = self.router_targets.len() + 1;
         let current_index = current.map(|i| i + 1).unwrap_or(0);
-        let next_index = if forward {
-            (current_index + 1) % len
-        } else {
-            (current_index + len - 1) % len
-        };
+        let next_index = crate::tui::selection::move_index(current_index, len, forward);
         route.target_node_id = if next_index == 0 {
             None
         } else {
@@ -505,8 +497,11 @@ impl LoopEditorDialog {
             RouterField::Description => RouterField::Target,
             RouterField::Target => {
                 if !self.router_routes.is_empty() {
-                    self.router_route_index =
-                        (self.router_route_index + 1) % self.router_routes.len();
+                    self.router_route_index = crate::tui::selection::move_index(
+                        self.router_route_index,
+                        self.router_routes.len(),
+                        true,
+                    );
                 }
                 RouterField::Label
             }
@@ -519,10 +514,11 @@ impl LoopEditorDialog {
             RouterField::Description => RouterField::Label,
             RouterField::Label => {
                 if !self.router_routes.is_empty() {
-                    self.router_route_index = self
-                        .router_route_index
-                        .checked_sub(1)
-                        .unwrap_or(self.router_routes.len() - 1);
+                    self.router_route_index = crate::tui::selection::move_index(
+                        self.router_route_index,
+                        self.router_routes.len(),
+                        false,
+                    );
                 }
                 RouterField::Target
             }
@@ -535,13 +531,11 @@ impl LoopEditorDialog {
         if self.router_routes.is_empty() {
             return;
         }
-        self.router_route_index = if forward {
-            (self.router_route_index + 1) % self.router_routes.len()
-        } else {
-            self.router_route_index
-                .checked_sub(1)
-                .unwrap_or(self.router_routes.len() - 1)
-        };
+        self.router_route_index = crate::tui::selection::move_index(
+            self.router_route_index,
+            self.router_routes.len(),
+            forward,
+        );
     }
 
     /// Append a fresh, unwired route and focus it (Ctrl+N).

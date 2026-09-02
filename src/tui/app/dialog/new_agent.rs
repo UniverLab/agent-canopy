@@ -514,7 +514,8 @@ impl NewAgentDialog {
         if filtered.is_empty() {
             return;
         }
-        self.cli_picker_idx = (self.cli_picker_idx + 1) % filtered.len();
+        self.cli_picker_idx =
+            crate::tui::selection::move_index(self.cli_picker_idx, filtered.len(), true);
         self.set_cli_index(filtered[self.cli_picker_idx]);
     }
 
@@ -523,10 +524,8 @@ impl NewAgentDialog {
         if filtered.is_empty() {
             return;
         }
-        self.cli_picker_idx = self
-            .cli_picker_idx
-            .checked_sub(1)
-            .unwrap_or(filtered.len() - 1);
+        self.cli_picker_idx =
+            crate::tui::selection::move_index(self.cli_picker_idx, filtered.len(), false);
         self.set_cli_index(filtered[self.cli_picker_idx]);
     }
 

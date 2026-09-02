@@ -628,7 +628,12 @@ pub fn draw_legend(frame: &mut Frame, app: &mut App, theme: &Theme) {
     if !unlocked_missions.is_empty() {
         let visible_rows = sections[2].height as usize;
         let start = selected.saturating_sub(visible_rows.saturating_sub(1) / 2);
-        let start = start.min(unlocked_missions.len().saturating_sub(visible_rows));
+        let start = crate::tui::selection::clamp_scroll(
+            selected,
+            start,
+            unlocked_missions.len(),
+            visible_rows,
+        );
         let end = (start + visible_rows).min(unlocked_missions.len());
         for (i, def) in unlocked_missions[start..end].iter().enumerate() {
             let mission_index = start + i;

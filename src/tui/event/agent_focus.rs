@@ -140,11 +140,7 @@ fn cycle_split_picker(app: &mut App, forward: bool) {
         return;
     }
 
-    app.split_picker_idx = if forward {
-        (app.split_picker_idx + 1) % len
-    } else {
-        app.split_picker_idx.checked_sub(1).unwrap_or(len - 1)
-    };
+    app.split_picker_idx = crate::tui::selection::move_index(app.split_picker_idx, len, forward);
 }
 
 fn toggle_split_orientation(app: &mut App) {
@@ -558,11 +554,7 @@ fn advance_focusable_selection(app: &mut App, forward: bool, focusable: &[usize]
         .iter()
         .position(|&idx| idx == app.selected)
         .unwrap_or(0);
-    let next_pos = if forward {
-        (current_pos + 1) % focusable.len()
-    } else {
-        current_pos.checked_sub(1).unwrap_or(focusable.len() - 1)
-    };
+    let next_pos = crate::tui::selection::move_index(current_pos, focusable.len(), forward);
     app.selected = focusable[next_pos];
     app.focus = Focus::Agent;
     app.update_agent_section_focus_on_change(0);

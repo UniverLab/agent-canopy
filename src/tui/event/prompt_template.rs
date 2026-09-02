@@ -486,11 +486,7 @@ fn move_preset_picker(dialog: &mut SimplePromptDialog, forward: bool) {
     let SectionPickerMode::PresetPicker { selected, .. } = &mut dialog.picker_mode else {
         return;
     };
-    *selected = if forward {
-        (*selected + 1) % filtered_len
-    } else {
-        selected.checked_sub(1).unwrap_or(filtered_len - 1)
-    };
+    *selected = crate::tui::selection::move_index(*selected, filtered_len, forward);
 }
 
 fn push_preset_picker_filter(dialog: &mut SimplePromptDialog, c: char) {
@@ -668,8 +664,8 @@ fn handle_at_picker_key(
 
     match code {
         KeyCode::Esc => dialog.at_picker = None,
-        KeyCode::Up => move_at_picker_up(dialog),
-        KeyCode::Down => move_at_picker_down(dialog),
+        KeyCode::Up => move_at_picker(dialog, false),
+        KeyCode::Down => move_at_picker(dialog, true),
         KeyCode::Left => go_up_at_picker_dir(dialog),
         KeyCode::Right => enter_selected_at_picker_dir(dialog),
         KeyCode::Enter | KeyCode::Tab => {
@@ -685,28 +681,12 @@ fn handle_at_picker_key(
     true
 }
 
-fn move_at_picker_up(dialog: &mut SimplePromptDialog) {
+fn move_at_picker(dialog: &mut SimplePromptDialog, forward: bool) {
     let Some(picker) = dialog.at_picker.as_mut() else {
         return;
     };
-
-    if picker.selected > 0 {
-        picker.selected -= 1;
-    } else {
-        picker.selected = picker.entries.len().saturating_sub(1);
-    }
-}
-
-fn move_at_picker_down(dialog: &mut SimplePromptDialog) {
-    let Some(picker) = dialog.at_picker.as_mut() else {
-        return;
-    };
-
-    if picker.selected + 1 < picker.entries.len() {
-        picker.selected += 1;
-    } else {
-        picker.selected = 0;
-    }
+    picker.selected =
+        crate::tui::selection::move_index(picker.selected, picker.entries.len(), forward);
 }
 
 fn go_up_at_picker_dir(dialog: &mut SimplePromptDialog) {

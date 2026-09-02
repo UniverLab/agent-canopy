@@ -208,13 +208,11 @@ fn handle_session_picker_key(dialog: &mut NewAgentDialog, code: KeyCode) {
 }
 
 fn move_session_picker(dialog: &mut NewAgentDialog, forward: bool) {
-    let Some(next) = wrapped_index(
+    let next = crate::tui::selection::move_index(
         dialog.session_picker_idx,
         dialog.session_entries.len(),
         forward,
-    ) else {
-        return;
-    };
+    );
     dialog.session_picker_idx = next;
 }
 
@@ -420,9 +418,8 @@ fn handle_cli_field(dialog: &mut NewAgentDialog, code: KeyCode, fields: DialogFi
 }
 
 fn step_cli_selection(dialog: &mut NewAgentDialog, forward: bool) {
-    let Some(next) = wrapped_index(dialog.cli_index, dialog.available_clis.len(), forward) else {
-        return;
-    };
+    let next =
+        crate::tui::selection::move_index(dialog.cli_index, dialog.available_clis.len(), forward);
     dialog.set_cli_index(next);
 }
 
@@ -462,13 +459,11 @@ fn reopen_model_picker(dialog: &mut NewAgentDialog, open: bool) {
 }
 
 fn move_model_picker(dialog: &mut NewAgentDialog, forward: bool) {
-    let Some(next) = wrapped_index(
+    let next = crate::tui::selection::move_index(
         dialog.model_suggestion_idx,
         dialog.model_suggestions.len(),
         forward,
-    ) else {
-        return;
-    };
+    );
     dialog.model_suggestion_idx = next;
 }
 
@@ -826,21 +821,26 @@ fn handle_directory_field(
 }
 
 fn move_directory_up(dialog: &mut NewAgentDialog, fields: DialogFields, is_watch_dir: bool) {
-    if dialog.dir_selected > 0 {
-        dialog.dir_selected -= 1;
-        dialog.update_dir_preview();
+    if dialog.dir_selected == 0 {
+        dialog.field = fields.previous_dir_field(is_watch_dir);
         return;
     }
-
-    dialog.field = fields.previous_dir_field(is_watch_dir);
+    dialog.dir_selected = crate::tui::selection::move_index(
+        dialog.dir_selected,
+        dialog.filtered_dir_entries().len(),
+        false,
+    );
+    dialog.update_dir_preview();
 }
 
 fn move_directory_down(dialog: &mut NewAgentDialog) {
     let filtered_len = dialog.filtered_dir_entries().len();
-    if filtered_len > 0 && dialog.dir_selected + 1 < filtered_len {
-        dialog.dir_selected += 1;
-        dialog.update_dir_preview();
+    if filtered_len == 0 {
+        return;
     }
+    dialog.dir_selected =
+        crate::tui::selection::move_index(dialog.dir_selected, filtered_len, true);
+    dialog.update_dir_preview();
 }
 
 fn handle_shell_field(dialog: &mut NewAgentDialog, code: KeyCode, fields: DialogFields) {
@@ -854,10 +854,11 @@ fn handle_shell_field(dialog: &mut NewAgentDialog, code: KeyCode, fields: Dialog
 }
 
 fn step_shell_selection(dialog: &mut NewAgentDialog, forward: bool) {
-    let Some(next) = wrapped_index(dialog.shell_index, dialog.available_shells.len(), forward)
-    else {
-        return;
-    };
+    let next = crate::tui::selection::move_index(
+        dialog.shell_index,
+        dialog.available_shells.len(),
+        forward,
+    );
     dialog.shell_index = next;
 }
 
@@ -895,21 +896,9 @@ fn handle_identity_field(dialog: &mut NewAgentDialog, code: KeyCode, fields: Dia
 }
 
 fn step_seed_selection(dialog: &mut NewAgentDialog, forward: bool) {
-    let Some(next) = wrapped_index(dialog.seed_index, dialog.seed_options.len(), forward) else {
-        return;
-    };
+    let next =
+        crate::tui::selection::move_index(dialog.seed_index, dialog.seed_options.len(), forward);
     dialog.seed_index = next;
-}
-
-fn wrapped_index(current: usize, len: usize, forward: bool) -> Option<usize> {
-    if len == 0 {
-        return None;
-    }
-    Some(if forward {
-        (current + 1) % len
-    } else {
-        current.checked_sub(1).unwrap_or(len - 1)
-    })
 }
 
 #[cfg(test)]
@@ -1198,30 +1187,6 @@ mod tests {
         let d = dialog_with("caféxyz");
         // field_width=4: c(0) a(1) f(2) é(3) on line 0, x(4) y(5) z(6) on line 1
         assert_eq!(visual_line_of_char(&d, 4, 4), 1); // x is on line 1
-    }
-
-    #[test]
-    fn wrapped_index_empty_len() {
-        assert!(wrapped_index(0, 0, true).is_none());
-        assert!(wrapped_index(0, 0, false).is_none());
-    }
-
-    #[test]
-    fn wrapped_index_single_element() {
-        assert_eq!(wrapped_index(0, 1, true), Some(0));
-        assert_eq!(wrapped_index(0, 1, false), Some(0));
-    }
-
-    #[test]
-    fn wrapped_index_forward_wraps() {
-        assert_eq!(wrapped_index(2, 3, true), Some(0));
-        assert_eq!(wrapped_index(0, 3, true), Some(1));
-    }
-
-    #[test]
-    fn wrapped_index_backward_wraps() {
-        assert_eq!(wrapped_index(0, 3, false), Some(2));
-        assert_eq!(wrapped_index(2, 3, false), Some(1));
     }
 
     #[test]

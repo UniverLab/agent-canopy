@@ -52,19 +52,18 @@ pub fn handle_context_transfer_key(app: &mut App, code: KeyCode) -> Result<()> {
                     modal.step = ContextTransferStep::Preview;
                 }
             }
-            KeyCode::Up => {
-                if let Some(modal) = app.context_transfer_modal.as_mut() {
-                    if modal.picker_selected > 0 {
-                        modal.picker_selected -= 1;
-                    }
-                }
-            }
-            KeyCode::Down => {
+            KeyCode::Up | KeyCode::Down => {
                 let picker_len = app.picker_interactive_entries().len();
+                if picker_len == 0 {
+                    return Ok(());
+                }
+                let forward = matches!(code, KeyCode::Down);
                 if let Some(modal) = app.context_transfer_modal.as_mut() {
-                    if modal.picker_selected + 1 < picker_len {
-                        modal.picker_selected += 1;
-                    }
+                    modal.picker_selected = crate::tui::selection::move_index(
+                        modal.picker_selected,
+                        picker_len,
+                        forward,
+                    );
                 }
             }
             KeyCode::Enter => {

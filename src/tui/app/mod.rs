@@ -665,13 +665,11 @@ impl App {
                 if self.backlog_specs.is_empty() {
                     return;
                 }
-                self.selected_backlog = if forward {
-                    (self.selected_backlog + 1) % self.backlog_specs.len()
-                } else {
-                    self.selected_backlog
-                        .checked_sub(1)
-                        .unwrap_or(self.backlog_specs.len() - 1)
-                };
+                self.selected_backlog = crate::tui::selection::move_index(
+                    self.selected_backlog,
+                    self.backlog_specs.len(),
+                    forward,
+                );
             }
             Some(ProjectTab::Knowledge) => {
                 if forward {
@@ -685,13 +683,8 @@ impl App {
                 if len == 0 {
                     return;
                 }
-                self.selected_project_history = if forward {
-                    (self.selected_project_history + 1) % len
-                } else {
-                    self.selected_project_history
-                        .checked_sub(1)
-                        .unwrap_or(len - 1)
-                };
+                self.selected_project_history =
+                    crate::tui::selection::move_index(self.selected_project_history, len, forward);
             }
         }
     }
@@ -705,7 +698,8 @@ impl App {
             .iter()
             .position(|&idx| idx == self.selected_knowledge)
             .unwrap_or(0);
-        self.selected_knowledge = filtered[(current + 1) % filtered.len()];
+        let next = crate::tui::selection::move_index(current, filtered.len(), true);
+        self.selected_knowledge = filtered[next];
     }
 
     fn navigate_knowledge_prev(&mut self) {
@@ -717,7 +711,7 @@ impl App {
             .iter()
             .position(|&idx| idx == self.selected_knowledge)
             .unwrap_or(0);
-        let next = current.checked_sub(1).unwrap_or(filtered.len() - 1);
+        let next = crate::tui::selection::move_index(current, filtered.len(), false);
         self.selected_knowledge = filtered[next];
     }
 
@@ -1093,11 +1087,7 @@ impl App {
             .as_deref()
             .and_then(|id| ids.iter().position(|n| n == id))
             .unwrap_or(0);
-        let next_idx = if forward {
-            (idx + 1) % ids.len()
-        } else {
-            idx.checked_sub(1).unwrap_or(ids.len() - 1)
-        };
+        let next_idx = crate::tui::selection::move_index(idx, ids.len(), forward);
         self.loop_graph_selected_node = Some(ids[next_idx].clone());
         self.loop_graph_follow = false;
     }
@@ -1148,13 +1138,13 @@ impl App {
                     ids.len() - 1
                 }
             }
-            Some(idx) if forward => (idx + 1) % ids.len(),
-            Some(idx) => idx.checked_sub(1).unwrap_or(ids.len() - 1),
+            Some(idx) => crate::tui::selection::move_index(idx, ids.len(), forward),
         };
         self.loop_spec_strip_selected = Some(ids[next_idx].clone());
-        self.loop_spec_strip_scroll = scroll_into_view(
-            self.loop_spec_strip_scroll,
+        self.loop_spec_strip_scroll = crate::tui::selection::clamp_scroll(
             next_idx,
+            self.loop_spec_strip_scroll,
+            ids.len(),
             self.loop_spec_strip_capacity,
         );
     }
@@ -1512,7 +1502,7 @@ impl App {
     pub(crate) fn step_sidebar_tab(&mut self, forward: bool) {
         let ring = Self::SIDEBAR_TAB_RING;
         let idx = Self::sidebar_tab_index(self.sidebar_layer);
-        let next = step_ring_index(idx, ring.len(), forward);
+        let next = crate::tui::selection::move_index(idx, ring.len(), forward);
         self.remember_current_sidebar_selection();
         let target = ring[next];
         self.agents_rag_focused = false;
@@ -1630,7 +1620,7 @@ impl App {
             .iter()
             .position(|&t| t == current)
             .unwrap_or(0);
-        let next = step_ring_index(idx, ProjectTab::ALL.len(), forward);
+        let next = crate::tui::selection::move_index(idx, ProjectTab::ALL.len(), forward);
         self.enter_project_focus(ProjectTab::ALL[next]);
     }
 
@@ -1713,13 +1703,11 @@ impl App {
             return;
         }
 
-        self.loop_selected_spec = if forward {
-            (self.loop_selected_spec + 1) % details.specs.len()
-        } else {
-            self.loop_selected_spec
-                .checked_sub(1)
-                .unwrap_or(details.specs.len() - 1)
-        };
+        self.loop_selected_spec = crate::tui::selection::move_index(
+            self.loop_selected_spec,
+            details.specs.len(),
+            forward,
+        );
         self.loop_selected_node = 0;
         self.refresh_loop_runs_for_selected_spec();
         self.select_default_loop_node_if_needed(true);
@@ -3656,33 +3644,6 @@ fn load_cli_usage() -> crate::domain::usage_stats::CliUsage {
     usage
 }
 
-/// Shared ring-stepping helper for both tab strips (sidebar layers and
-/// project tabs): move one position in `forward`'s direction, wrapping at
-/// either end.
-fn step_ring_index(idx: usize, len: usize, forward: bool) -> usize {
-    if forward {
-        (idx + 1) % len
-    } else {
-        idx.checked_sub(1).unwrap_or(len - 1)
-    }
-}
-
-/// Shift a scroll offset by the minimum amount needed to bring `idx` into
-/// `[offset, offset + capacity)` — used to keep the spec marker strip's
-/// keyboard-driven selection visible without jumping further than needed.
-fn scroll_into_view(offset: usize, idx: usize, capacity: usize) -> usize {
-    if capacity == 0 {
-        return 0;
-    }
-    if idx < offset {
-        idx
-    } else if idx >= offset + capacity {
-        idx + 1 - capacity
-    } else {
-        offset
-    }
-}
-
 fn calculate_log_hash(raw_log: &str) -> u64 {
     raw_log.bytes().enumerate().fold(0u64, |acc, (idx, byte)| {
         acc.wrapping_add((byte as u64).wrapping_mul(idx as u64 + 1))
@@ -3744,8 +3705,7 @@ mod tests {
         adaptive_change_score, adaptive_poll_interval_ms, blend_optional_f32, blend_optional_f64,
         build_resumed_session_args, calculate_log_hash, lerp_f32, lerp_u64, log_contains_error,
         log_contains_spawn, log_contains_success, process_is_alive, process_outlives_grace,
-        resume_decision, sample_from, scroll_into_view, should_resume_session, step_ring_index,
-        ResumeDecision, SystemSample,
+        resume_decision, sample_from, should_resume_session, ResumeDecision, SystemSample,
     };
     use crate::db::session::InteractiveSession;
     use crate::db::Database;
@@ -4474,18 +4434,6 @@ mod tests {
     }
 
     // ── Pure helper tests ────────────────────────────────────────
-
-    #[test]
-    fn step_ring_index_forward_wraps() {
-        assert_eq!(step_ring_index(0, 3, true), 1);
-        assert_eq!(step_ring_index(2, 3, true), 0);
-    }
-
-    #[test]
-    fn step_ring_index_backward_wraps() {
-        assert_eq!(step_ring_index(1, 3, false), 0);
-        assert_eq!(step_ring_index(0, 3, false), 2);
-    }
 
     #[test]
     fn calculate_log_hash_empty_string() {
@@ -5741,18 +5689,6 @@ mod tests {
         assert_eq!(app.loop_live_focus, LoopLiveFocus::SpecStrip);
         app.loop_live_toggle_focus();
         assert_eq!(app.loop_live_focus, LoopLiveFocus::Graph);
-    }
-
-    #[test]
-    fn scroll_into_view_only_moves_when_index_leaves_the_window() {
-        // Already visible: offset unchanged.
-        assert_eq!(scroll_into_view(2, 3, 4), 2);
-        // Before the window: jump so idx becomes the first visible.
-        assert_eq!(scroll_into_view(5, 1, 4), 1);
-        // At/after the window's far edge: shift the minimum amount needed.
-        assert_eq!(scroll_into_view(0, 4, 4), 1);
-        // Zero capacity never scrolls.
-        assert_eq!(scroll_into_view(5, 9, 0), 0);
     }
 
     #[test]

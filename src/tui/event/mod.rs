@@ -150,18 +150,18 @@ fn dismiss_legend(app: &mut App, code: KeyCode) -> bool {
         return false;
     }
 
-    let unlocked_count = app.mission_manager.unlocked_count();
-    let max_selected = unlocked_count.saturating_sub(1);
-
     match code {
         KeyCode::Esc | KeyCode::F(1) | KeyCode::Enter => {
             app.show_legend = false;
         }
-        KeyCode::Up | KeyCode::Char('k') if app.legend_selected > 0 => {
-            app.legend_selected -= 1;
-        }
-        KeyCode::Down | KeyCode::Char('j') if app.legend_selected < max_selected => {
-            app.legend_selected += 1;
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j') => {
+            let unlocked_count = app.mission_manager.unlocked_count();
+            if unlocked_count == 0 {
+                return true;
+            }
+            let forward = matches!(code, KeyCode::Down | KeyCode::Char('j'));
+            app.legend_selected =
+                crate::tui::selection::move_index(app.legend_selected, unlocked_count, forward);
         }
         _ => {}
     }
@@ -758,15 +758,10 @@ fn handle_mouse_scroll(app: &mut App, mouse: &MouseEvent) {
 
     if app.show_legend {
         let unlocked_count = app.mission_manager.unlocked_count();
-        let max_selected = unlocked_count.saturating_sub(1);
-        if dir > 0 {
-            if app.legend_selected > 0 {
-                app.legend_selected -= 1;
-            }
-        } else {
-            if app.legend_selected < max_selected {
-                app.legend_selected += 1;
-            }
+        if unlocked_count != 0 {
+            let forward = dir < 0;
+            app.legend_selected =
+                crate::tui::selection::move_index(app.legend_selected, unlocked_count, forward);
         }
         return;
     }
@@ -910,10 +905,11 @@ fn handle_scroll(app: &mut App, dir: i32) {
         Focus::NewAgentDialog => {
             if let Some(dialog) = &mut app.new_agent_dialog {
                 let len = dialog.filtered_dir_entries().len();
-                if dir > 0 && dialog.dir_selected > 0 {
-                    dialog.dir_selected -= 1;
-                } else if dir < 0 && dialog.dir_selected + 1 < len {
-                    dialog.dir_selected += 1;
+                if len != 0 {
+                    let forward = dir < 0;
+                    dialog.dir_selected =
+                        crate::tui::selection::move_index(dialog.dir_selected, len, forward);
+                    dialog.update_dir_preview();
                 }
             }
         }

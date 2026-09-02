@@ -450,11 +450,12 @@ pub(super) fn handle_playground_key(app: &mut App, code: KeyCode, modifiers: Key
                 app.select_next();
             }
         }
-        KeyCode::Up if app.playground_selected > 0 => {
-            app.playground_selected -= 1;
-        }
-        KeyCode::Down if app.playground_selected + 1 < app.playground_results.len() => {
-            app.playground_selected += 1;
+        KeyCode::Up | KeyCode::Down if !app.playground_results.is_empty() => {
+            app.playground_selected = crate::tui::selection::move_index(
+                app.playground_selected,
+                app.playground_results.len(),
+                matches!(code, KeyCode::Down),
+            );
         }
         KeyCode::Enter | KeyCode::Char('l') => {
             if app.playground_last_executed_query != app.playground_query.trim() {

@@ -214,11 +214,7 @@ impl App {
             .position(|&idx| idx == self.selected)
             .unwrap_or(0);
 
-        let next_pos = if forward {
-            (current_pos + 1) % focusable.len()
-        } else {
-            current_pos.checked_sub(1).unwrap_or(focusable.len() - 1)
-        };
+        let next_pos = crate::tui::selection::move_index(current_pos, focusable.len(), forward);
 
         self.selected = focusable[next_pos];
         self.focus = Focus::Agent;

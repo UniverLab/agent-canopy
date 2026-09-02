@@ -81,7 +81,7 @@ struct PickerWindow {
 
 impl PickerWindow {
     fn new(selected: usize, total: usize, max_visible: usize) -> Self {
-        let scroll = selected.saturating_sub(max_visible.saturating_sub(1));
+        let scroll = crate::tui::selection::clamp_scroll(selected, 0, total, max_visible);
         Self {
             scroll,
             has_above: scroll > 0,

@@ -175,12 +175,8 @@ fn scroll_state_with_offset(
     max_visible: usize,
     manual_offset: usize,
 ) -> ScrollState {
-    let auto_start = selected.map_or(0, |selected| {
-        if selected >= max_visible {
-            selected.saturating_sub(max_visible - 1)
-        } else {
-            0
-        }
+    let auto_start = selected.map_or(0, |sel| {
+        crate::tui::selection::clamp_scroll(sel, 0, total_items, max_visible)
     });
     let max_start = total_items.saturating_sub(max_visible);
     let start = (auto_start + manual_offset).min(max_start);
