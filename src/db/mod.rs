@@ -617,6 +617,20 @@ impl Database {
                 expires_at TEXT NOT NULL,
                 pid INTEGER,
                 boot_id TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS sandbox_runs (
+                id TEXT PRIMARY KEY,
+                project_hash TEXT NOT NULL,
+                base_branch TEXT NOT NULL,
+                sandbox_branch TEXT NOT NULL,
+                worktree_path TEXT NOT NULL,
+                cli_name TEXT NOT NULL,
+                original_workdir TEXT NOT NULL,
+                owner_type TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active'
             );",
         )?;
 
@@ -1450,6 +1464,7 @@ pub mod loops;
 pub mod project;
 pub mod queues;
 pub mod run;
+pub mod sandbox;
 pub mod scheduled_sends;
 pub mod seeds;
 pub mod session;

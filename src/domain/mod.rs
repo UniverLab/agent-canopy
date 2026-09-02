@@ -22,6 +22,7 @@ pub mod prompts;
 pub mod queues;
 pub mod quota_reset;
 pub mod registry_baseline;
+pub mod sandbox;
 pub mod seeds;
 pub mod subagent_mcp;
 pub mod sync;

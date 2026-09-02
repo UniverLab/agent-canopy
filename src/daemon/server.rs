@@ -947,7 +947,7 @@ mod hang_repro {
         let dispatch_loop_id = loop_id.clone();
         let dispatch = tokio::spawn(async move {
             loop_engine
-                .run_loop(dispatch_loop_id, None, None, None)
+                .run_loop(dispatch_loop_id, None, None, None, None)
                 .await
         });
 

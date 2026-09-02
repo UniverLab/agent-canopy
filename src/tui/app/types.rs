@@ -965,6 +965,8 @@ pub struct App {
     /// delivery state.
     pub(crate) session_protocol_state: HashMap<String, SessionProtocolState>,
 
+    pub(crate) active_sandbox: Option<crate::domain::sandbox::Sandbox>,
+
     // Project relation graph
     pub(crate) project_relation_dialog: Option<ProjectRelationDialog>,
     pub(crate) project_graph_edges: Vec<ProjectGraphEdge>,

@@ -6645,11 +6645,57 @@ impl TaskTriggerHandler {
             Err(e) => return Err(internal_error(e.to_string())),
         }
 
+        let sandbox = if params.sandbox == Some(true) {
+            // The instruction file is per-worktree and the worktree is shared
+            // across the loop's nodes, so it must carry the *first* agent
+            // node's platform filename (CLAUDE.md / GEMINI.md / …) — a
+            // hardcoded "opencode" would write AGENTS.md and leave a
+            // claude/gemini node with no protocol file at all.
+            let cli_name = {
+                let details = self.db.get_loop_details(&loop_id).ok().flatten();
+                details
+                    .as_ref()
+                    .and_then(|d| {
+                        let mut agents: Vec<&LoopNode> = d
+                            .graph_nodes
+                            .iter()
+                            .chain(d.specs.iter().flat_map(|s| s.nodes.iter()))
+                            .filter(|n| n.kind == LoopNodeKind::Agent)
+                            .collect();
+                        agents.sort_by_key(|n| n.position);
+                        agents.iter().find_map(|n| {
+                            n.config
+                                .get("platform")
+                                .or_else(|| n.config.get("cli"))
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                        })
+                    })
+                    .unwrap_or_else(|| "opencode".to_string())
+            };
+            let protocol = crate::domain::sandbox::canopy_protocol_block();
+            let effective_workdir = workdir.unwrap_or(&lp.workdir);
+            match crate::domain::sandbox::create_sandbox(effective_workdir, &cli_name, protocol)
+                .await
+            {
+                Ok(sb) => {
+                    let _ = self.db.insert_sandbox_run(&sb, "loop", &loop_id);
+                    Some(sb)
+                }
+                Err(e) => {
+                    return Ok(error_result(&format!("Failed to create sandbox: {e}")));
+                }
+            }
+        } else {
+            None
+        };
+
         Arc::clone(&self.loop_engine).start_background_run(
             loop_id.clone(),
             queue_id.map(str::to_string),
             workdir.map(str::to_string),
             idea,
+            sandbox,
         );
         Ok(success_result(&format!(
             "Loop '{}' launched in background.",
@@ -18746,6 +18792,7 @@ mod endpoint_tests {
                 queue_id: None,
                 workdir: None,
                 idea: None,
+                sandbox: None,
             }))
             .await
             .unwrap();
@@ -18788,7 +18835,7 @@ mod endpoint_tests {
 
         handler
             .loop_engine
-            .run_loop(lp.id.clone(), None, None, None)
+            .run_loop(lp.id.clone(), None, None, None, None)
             .await
             .unwrap();
 
@@ -20770,6 +20817,7 @@ mod endpoint_tests {
                 queue_id: Some("some-queue".to_string()),
                 workdir: None,
                 idea: Some("build a landing page".to_string()),
+                sandbox: None,
             }))
             .await
             .unwrap();

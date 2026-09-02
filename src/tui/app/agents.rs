@@ -477,6 +477,35 @@ impl App {
         } else {
             let _ = self.db.finish_interactive_session(&agent_id, code);
         }
+
+        if let Some(ref sb) = self.active_sandbox {
+            let sandbox = sb.clone();
+            let merge_result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(async { crate::domain::sandbox::merge_sandbox(&sandbox).await })
+            });
+            match merge_result {
+                Ok(outcome) => {
+                    let status = match &outcome {
+                        crate::domain::sandbox::MergeOutcome::CleanMerge => "merged",
+                        crate::domain::sandbox::MergeOutcome::ConflictResolution => "merged",
+                        crate::domain::sandbox::MergeOutcome::MergeFailed(_) => "failed",
+                    };
+                    let _ = self.db.update_sandbox_run_status(&sandbox.id, status);
+                    if let crate::domain::sandbox::MergeOutcome::MergeFailed(ref reason) = outcome {
+                        tracing::error!("Sandbox merge failed: {reason}");
+                        self.notification_service
+                            .notify_nursery_failed(&format!("Sandbox merge failed: {reason}"));
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Sandbox merge error: {e}");
+                    let _ = self.db.update_sandbox_run_status(&sandbox.id, "failed");
+                }
+            }
+            self.active_sandbox = None;
+        }
+
         let _ = self
             .db
             .close_agent_missions(&agent_id, &agent_name, &working_dir);

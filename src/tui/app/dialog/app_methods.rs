@@ -110,7 +110,7 @@ impl App {
             .get(&session_key)
             .cloned()
             .unwrap_or_default();
-        let should_send_protocol = !state.protocol_sent;
+        let should_send_protocol = !state.protocol_sent && self.active_sandbox.is_none();
 
         let turn_context = self.build_turn_context_block();
         let content = if should_send_protocol {
@@ -170,38 +170,12 @@ impl App {
     /// Build the session-start protocol block: the opening contract
     /// ("[START HERE — required]", the tool-usage protocol, the skills
     /// list). Static across a session — sent once, not per turn.
+    ///
+    /// Single source of truth: [`crate::domain::sandbox::canopy_protocol_block`],
+    /// so the text the promptbuilder injects (non-sandbox path) and the text
+    /// materialised into a sandbox's instruction file can never drift apart.
     fn build_session_protocol_block(&self) -> String {
-        "You are operating within the Canopy multi-agent framework. Its MCP tools and \
-        skills are how work gets coordinated here — use them proactively, on your own \
-        initiative, not only when the user asks.\n\
-        \n\
-        [START HERE — required]\n\
-        Your FIRST action this session, before answering or touching any file, is to call \
-        get_tools(scope=\"session_start\"). It returns the workspace brief and the exact \
-        tools for the job. Do not skip it.\n\
-        \n\
-        [USE CANOPY TOOLS AT EVERY STEP]\n\
-        - Before editing files: get_tools(scope=\"file_write\", path=\"...\"), then \
-        sync_get_context to detect conflicts and sync_declare_intent to claim the work.\n\
-        - Before tests/builds: get_tools(scope=\"test_run\"), then sync_broadcast the start \
-        and the PASS/FAIL result.\n\
-        - When you learn a durable fact or reusable pattern: intelligence_upsert \
-        (kind=\"fact\"|\"pattern\") — never leave knowledge only in chat history.\n\
-        - Session end: get_tools(scope=\"close_session\") — upsert a kind=\"session\" \
-        summary and sync_report_status. The daemon closes missions automatically.\n\
-        - Scheduled tasks: report progress with agent_report.\n\
-        Prefer Canopy's native intelligence/sync tools over ad-hoc shell when both can do \
-        the job.\n\
-        \n\
-        [SKILLS — always active]\n\
-        The `execution-mindset` skill governs how you operate (judgment, \
-        verify-before-reporting, security, resourcefulness, token efficiency) and applies to \
-        every task. Reach for `architect-mindset` when designing or writing specs, \
-        `code-engineering` for code work, and Canopy's own tooling skills \
-        (`canopy-intelligence`, `canopy-sync`, `canopy-loop-design`, `canopy-capabilities`) \
-        when working this MCP surface. Apply the skills directly — they are the source of \
-        truth, not this summary."
-            .to_string()
+        crate::domain::sandbox::canopy_protocol_block().to_string()
     }
 
     /// Extract workdir, intents, and chatter from activity state or fallback.
@@ -605,6 +579,21 @@ impl App {
             // Store nursery path for finalization on session end
             self.nursery_path = Some(nursery_dir);
             (d, true)
+        } else if dialog.sandbox_mode {
+            let protocol = crate::domain::sandbox::canopy_protocol_block();
+            let workdir = dialog.working_dir.clone();
+            let cli_name = cli.as_str().to_string();
+            let sb = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    crate::domain::sandbox::create_sandbox(&workdir, &cli_name, protocol).await
+                })
+            })?;
+            let agent_id_placeholder = format!("interactive-{}", &sb.id[..8]);
+            let _ = self
+                .db
+                .insert_sandbox_run(&sb, "interactive", &agent_id_placeholder);
+            self.active_sandbox = Some(sb.clone());
+            (sb.worktree_path.to_string_lossy().to_string(), false)
         } else {
             (dialog.working_dir.clone(), false)
         };

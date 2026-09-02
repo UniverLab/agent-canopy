@@ -200,6 +200,7 @@ impl App {
             sync_scroll_offset: 0,
             last_sync_area: None,
             session_protocol_state: HashMap::new(),
+            active_sandbox: None,
             project_relation_dialog: None,
             project_graph_edges: Vec::new(),
             project_graph_trees: Vec::new(),

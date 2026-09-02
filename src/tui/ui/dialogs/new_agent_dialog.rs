@@ -32,6 +32,7 @@ struct FieldLayout {
     extra: usize,
     dir: usize,
     yolo: usize,
+    sandbox: usize,
 }
 
 impl FieldLayout {
@@ -45,6 +46,7 @@ impl FieldLayout {
                 extra: 5,
                 dir: 6,
                 yolo: 4,
+                sandbox: 7,
             },
             NewTaskType::Terminal => Self {
                 cli: 0,
@@ -54,6 +56,7 @@ impl FieldLayout {
                 extra: 5,
                 dir: TERMINAL_DIR_FIELD,
                 yolo: 4,
+                sandbox: 0,
             },
             NewTaskType::Background => Self {
                 cli: 2,
@@ -63,6 +66,7 @@ impl FieldLayout {
                 extra: 5,
                 dir: 6,
                 yolo: 4,
+                sandbox: 0,
             },
         }
     }
@@ -427,6 +431,7 @@ fn append_interactive_sections(
     append_session_picker_rows(lines, dialog, theme);
     append_identity_section(lines, dialog, accent, layout.identity, theme);
     append_yolo_section(lines, dialog, accent, layout.yolo, theme);
+    append_sandbox_section(lines, dialog, accent, layout.sandbox, theme);
     append_directory_section(lines, dialog, accent, layout.dir, false, layout.dir, theme);
 }
 
@@ -1121,6 +1126,41 @@ fn append_yolo_section(
         spans.push(Span::styled(
             "  ⚠ agent acts without approval",
             Style::default().fg(Color::Yellow),
+        ));
+    }
+
+    push_spaced_row(lines, Line::from(spans));
+}
+
+fn append_sandbox_section(
+    lines: &mut Vec<Line<'static>>,
+    dialog: &NewAgentDialog,
+    accent: Color,
+    sandbox_field: usize,
+    theme: &Theme,
+) {
+    if sandbox_field == 0 {
+        return;
+    }
+    let checkbox = if dialog.sandbox_mode { "◉" } else { "○" };
+    let checkbox_style = if dialog.field == sandbox_field {
+        focus_style(dialog.field, sandbox_field, accent)
+    } else if dialog.sandbox_mode {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+
+    let mut spans = vec![
+        Span::styled("  Sandbox:  ", Style::default().fg(theme.dim_text)),
+        Span::styled(format!("{checkbox} Isolated worktree"), checkbox_style),
+    ];
+    if dialog.sandbox_mode {
+        spans.push(Span::styled(
+            "  no protocol file in repo",
+            Style::default().fg(Color::Cyan),
         ));
     }
 

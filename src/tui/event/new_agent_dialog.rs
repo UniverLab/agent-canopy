@@ -79,6 +79,7 @@ struct DialogFields {
     extra_field: usize,
     dir_field: usize,
     yolo_field: usize,
+    sandbox_field: usize,
 }
 
 impl DialogFields {
@@ -108,6 +109,7 @@ impl DialogFields {
                 6
             },
             yolo_field: 4,
+            sandbox_field: if is_interactive { 7 } else { 0 },
         }
     }
 
@@ -129,7 +131,7 @@ impl DialogFields {
         if is_watch_dir {
             self.prompt_field
         } else if self.is_interactive {
-            self.yolo_field
+            self.sandbox_field
         } else if self.is_terminal {
             0
         } else {
@@ -139,7 +141,7 @@ impl DialogFields {
 
     fn next_dir_field(self, current_field: usize) -> usize {
         if self.is_interactive {
-            self.yolo_field
+            self.sandbox_field
         } else if self.is_terminal {
             2
         } else {
@@ -309,6 +311,9 @@ fn handle_dialog_field_key(
         2 if fields.is_terminal => handle_shell_field(dialog, code, fields),
         n if n == fields.yolo_field && fields.is_interactive => {
             handle_yolo_field(dialog, code, fields);
+        }
+        n if n == fields.sandbox_field && fields.is_interactive => {
+            handle_sandbox_field(dialog, code, fields);
         }
         _ => {}
     }
@@ -863,6 +868,17 @@ fn handle_yolo_field(dialog: &mut NewAgentDialog, code: KeyCode, fields: DialogF
         }
         KeyCode::Char(' ') => {}
         KeyCode::Up | KeyCode::BackTab => dialog.field = fields.identity_field,
+        KeyCode::Down | KeyCode::Tab => dialog.field = fields.sandbox_field,
+        _ => {}
+    }
+}
+
+fn handle_sandbox_field(dialog: &mut NewAgentDialog, code: KeyCode, fields: DialogFields) {
+    match code {
+        KeyCode::Char(' ') => {
+            dialog.sandbox_mode = !dialog.sandbox_mode;
+        }
+        KeyCode::Up | KeyCode::BackTab => dialog.field = fields.yolo_field,
         KeyCode::Down | KeyCode::Tab => dialog.field = fields.dir_field,
         _ => {}
     }

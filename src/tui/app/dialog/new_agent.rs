@@ -106,6 +106,8 @@ pub struct NewAgentDialog {
     pub resume_sessions_empty: bool,
     /// Whether to launch the agent in yolo (autonomous) mode.
     pub yolo_mode: bool,
+    /// Whether to launch in a sandbox (git worktree with instruction file).
+    pub sandbox_mode: bool,
     /// Index into `seed_options` for the selected seed identity.
     pub seed_index: usize,
     /// Available seed identity options.
@@ -177,6 +179,7 @@ impl NewAgentDialog {
             selected_resume_session: None,
             resume_sessions_empty: false,
             yolo_mode: false,
+            sandbox_mode: false,
             seed_index: 0,
             seed_options,
         };

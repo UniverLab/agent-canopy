@@ -948,6 +948,10 @@ pub struct LoopRunParams {
     /// has no bound specs and no queue. The loop must still have a top-level
     /// graph. Mutually exclusive with `queue_id`.
     pub idea: Option<String>,
+    /// When true, run this loop in a sandbox (temporary worktree with
+    /// instruction file). The protocol is materialized in the worktree's
+    /// instruction file instead of being injected into the prompt.
+    pub sandbox: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
