@@ -169,7 +169,7 @@ impl LoopEngine {
     }
 
     pub fn start_background(self: Arc<Self>, loop_id: String) {
-        Arc::clone(&self).start_background_run(loop_id, None, None);
+        Arc::clone(&self).start_background_run(loop_id, None, None, None);
     }
 
     /// Same as [`Self::start_background`], but optionally drives the loop's
@@ -190,10 +190,11 @@ impl LoopEngine {
         loop_id: String,
         queue_id: Option<String>,
         workdir_override: Option<String>,
+        idea: Option<String>,
     ) {
         tokio::spawn(async move {
             if let Err(error) = self
-                .run_loop(loop_id.clone(), queue_id, workdir_override)
+                .run_loop(loop_id.clone(), queue_id, workdir_override, idea)
                 .await
             {
                 if error.downcast_ref::<EmptySpecSetError>().is_some() {
@@ -267,8 +268,9 @@ impl LoopEngine {
         loop_id: String,
         queue_id: Option<String>,
         workdir_override: Option<String>,
+        idea: Option<String>,
     ) -> Result<()> {
-        self.run_loop_dispatch(loop_id, queue_id, workdir_override, false)
+        self.run_loop_dispatch(loop_id, queue_id, workdir_override, false, idea)
             .await
     }
 
@@ -294,6 +296,7 @@ impl LoopEngine {
         queue_id: Option<String>,
         workdir_override: Option<String>,
         is_resume: bool,
+        idea: Option<String>,
     ) -> Result<()> {
         let Some(lp) = self.db.get_loop(&loop_id)? else {
             bail!("Loop '{}' not found.", loop_id);
@@ -529,7 +532,10 @@ impl LoopEngine {
                 // makes `{{spec_content}}`/`{{spec_name}}` resolve to ""
                 // instead of leaking a fabricated spec into the prompt.
                 if specs.is_empty() {
-                    let placeholder = no_spec_placeholder(&loop_id);
+                    let mut placeholder = no_spec_placeholder(&loop_id);
+                    if let Some(idea_text) = &idea {
+                        placeholder.description = Some(idea_text.clone());
+                    }
                     self.db.insert_loop_spec(&placeholder)?;
                     specs = vec![placeholder];
                 }
@@ -868,7 +874,7 @@ impl LoopEngine {
             .and_then(|lp| lp.active_run_queue_id);
         tokio::spawn(async move {
             if let Err(error) = self
-                .run_loop_dispatch(loop_id.clone(), queue_id, None, true)
+                .run_loop_dispatch(loop_id.clone(), queue_id, None, true, None)
                 .await
             {
                 if error.downcast_ref::<EmptySpecSetError>().is_some() {
@@ -5900,7 +5906,7 @@ mod tests {
         })
         .unwrap();
 
-        engine.run_loop(loop_id, None, None).await.unwrap();
+        engine.run_loop(loop_id, None, None, None).await.unwrap();
 
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
         assert_eq!(
@@ -5929,7 +5935,10 @@ mod tests {
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
@@ -5956,7 +5965,10 @@ mod tests {
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
@@ -6031,7 +6043,10 @@ mod tests {
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
         let worker = runs.iter().find(|r| r.node_id == "worker").unwrap();
@@ -6090,7 +6105,10 @@ mod tests {
         ))
         .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
         assert_eq!(spec.status, LoopSpecStatus::Completed);
@@ -6128,7 +6146,10 @@ mod tests {
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
         assert_eq!(spec.status, LoopSpecStatus::Completed);
@@ -6149,7 +6170,10 @@ mod tests {
         db.insert_loop_node(&rights_node(&spec_id, "worker", COMMIT_CMD, None, 1))
             .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
         assert_eq!(spec.status, LoopSpecStatus::Completed);
@@ -6175,7 +6199,10 @@ mod tests {
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
         assert_eq!(spec.status, LoopSpecStatus::Completed);
@@ -6238,7 +6265,7 @@ mod tests {
         .unwrap();
 
         engine
-            .run_loop_dispatch(loop_id.clone(), None, None, true)
+            .run_loop_dispatch(loop_id.clone(), None, None, true, None)
             .await
             .unwrap();
 
@@ -6289,7 +6316,10 @@ mod tests {
 
         // `run_loop` is the fresh-dispatch entry point (same one `loop_run`
         // uses) — no `is_resume` flag reaches it.
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
         assert_eq!(spec.status, LoopSpecStatus::Completed);
@@ -6367,7 +6397,10 @@ mod tests {
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
         assert_eq!(spec.status, LoopSpecStatus::Completed);
@@ -6438,7 +6471,10 @@ mod tests {
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
@@ -6508,7 +6544,10 @@ mod tests {
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
         assert_eq!(spec.status, LoopSpecStatus::Completed);
@@ -6559,7 +6598,10 @@ mod tests {
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
         assert_eq!(
@@ -6643,7 +6685,7 @@ mod tests {
 
         // A resumed dispatch — same path a daemon restart mid-run takes.
         engine
-            .run_loop_dispatch(loop_id.clone(), None, None, true)
+            .run_loop_dispatch(loop_id.clone(), None, None, true, None)
             .await
             .unwrap();
 
@@ -6714,7 +6756,10 @@ mod tests {
         ))
         .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let spec_a_after = db.get_loop_spec(&spec_id).unwrap().unwrap();
         let spec_b_after = db.get_loop_spec(&spec_b.id).unwrap().unwrap();
@@ -6770,7 +6815,7 @@ mod tests {
         .unwrap();
 
         engine
-            .run_loop_dispatch(loop_id.clone(), None, None, true)
+            .run_loop_dispatch(loop_id.clone(), None, None, true, None)
             .await
             .unwrap();
 
@@ -6828,7 +6873,10 @@ mod tests {
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
@@ -6857,7 +6905,10 @@ mod tests {
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
@@ -8378,7 +8429,10 @@ echo done
         .unwrap();
 
         let guard = HomeGuard::set(home.path());
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
         drop(guard);
 
         // Two runs of the agent node: the first cold, the second resumed.
@@ -8455,7 +8509,7 @@ echo done
 
         let guard = HomeGuard::set(home.path());
         engine
-            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None, None)
             .await
             .unwrap();
         drop(guard);
@@ -8575,7 +8629,7 @@ echo done
 
         let guard = HomeGuard::set(home.path());
         engine
-            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None, None)
             .await
             .unwrap();
         drop(guard);
@@ -8660,7 +8714,7 @@ echo done
 
         let guard = HomeGuard::set(home.path());
         engine
-            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None, None)
             .await
             .unwrap();
         drop(guard);
@@ -9743,7 +9797,10 @@ echo done
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         assert_eq!(lp.status, LoopStatus::Completed);
@@ -9796,7 +9853,10 @@ echo done
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
@@ -9847,7 +9907,10 @@ echo done
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         assert_eq!(lp.status, LoopStatus::Completed);
@@ -9920,7 +9983,10 @@ echo done
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
@@ -9945,7 +10011,10 @@ echo done
         // spec is even marked failed.
         let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
@@ -10079,7 +10148,7 @@ echo done
         .unwrap();
 
         engine
-            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None, None)
             .await
             .unwrap();
 
@@ -10192,7 +10261,13 @@ echo done
         // `Paused` (as reconcile set it) — the dispatch's own atomic claim (B42)
         // owns the flip to `Running`, so no caller pre-flips it anymore.
         engine
-            .run_loop_dispatch(loop_id.clone(), Some("queue-1".to_string()), None, true)
+            .run_loop_dispatch(
+                loop_id.clone(),
+                Some("queue-1".to_string()),
+                None,
+                true,
+                None,
+            )
             .await
             .unwrap();
 
@@ -10269,7 +10344,7 @@ echo done
         .unwrap();
 
         engine
-            .run_loop(lp.id.clone(), None, Some(override_path.clone()))
+            .run_loop(lp.id.clone(), None, Some(override_path.clone()), None)
             .await
             .unwrap();
 
@@ -10309,7 +10384,10 @@ echo done
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         let bound = db.get_loop_spec(&bound_spec_id).unwrap().unwrap();
@@ -10351,7 +10429,7 @@ echo done
         .unwrap();
 
         engine
-            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None, None)
             .await
             .unwrap();
 
@@ -10391,7 +10469,7 @@ echo done
         .unwrap();
 
         engine
-            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None, None)
             .await
             .unwrap();
 
@@ -10437,7 +10515,7 @@ echo done
         insert_queue_with_members(&db, "queue-1", &[&stuck.id]);
 
         engine
-            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None, None)
             .await
             .unwrap();
 
@@ -10543,7 +10621,7 @@ echo done
         let run_loop_id = loop_id.clone();
         let handle = tokio::spawn(async move {
             run_engine
-                .run_loop(run_loop_id, Some("queue-1".to_string()), None)
+                .run_loop(run_loop_id, Some("queue-1".to_string()), None, None)
                 .await
         });
 
@@ -10603,7 +10681,7 @@ echo done
         let run_loop_id = loop_id.clone();
         let handle = tokio::spawn(async move {
             run_engine
-                .run_loop(run_loop_id, Some("queue-1".to_string()), None)
+                .run_loop(run_loop_id, Some("queue-1".to_string()), None, None)
                 .await
         });
 
@@ -10650,7 +10728,7 @@ echo done
             .unwrap();
 
         engine
-            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None, None)
             .await
             .unwrap();
 
@@ -10892,7 +10970,10 @@ echo done
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
@@ -10970,7 +11051,7 @@ echo done
         let dispatch = {
             let engine = Arc::clone(&engine);
             let loop_id = loop_id.clone();
-            tokio::spawn(async move { engine.run_loop(loop_id, None, None).await })
+            tokio::spawn(async move { engine.run_loop(loop_id, None, None, None).await })
         };
 
         // Once the implement run is live (has a pid), supersede it exactly as a
@@ -11070,7 +11151,7 @@ echo done
         let dispatch = {
             let engine = Arc::clone(&engine);
             let loop_id = loop_id.clone();
-            tokio::spawn(async move { engine.run_loop(loop_id, None, None).await })
+            tokio::spawn(async move { engine.run_loop(loop_id, None, None, None).await })
         };
 
         // Terminate the live run exactly as `Database::reset_loop` does when
@@ -11134,7 +11215,7 @@ echo done
         // No outgoing edge from "dead-end" for either status: the spec
         // dead-ends right here.
 
-        engine.run_loop(loop_id, None, None).await.unwrap();
+        engine.run_loop(loop_id, None, None, None).await.unwrap();
 
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
         assert_eq!(spec.status, LoopSpecStatus::Failed);
@@ -11175,7 +11256,7 @@ echo done
         })
         .unwrap();
 
-        engine.run_loop(loop_id, None, None).await.unwrap();
+        engine.run_loop(loop_id, None, None, None).await.unwrap();
 
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
         assert_eq!(spec.status, LoopSpecStatus::Completed);
@@ -11223,7 +11304,10 @@ echo done
 
         // Executions 1 and 2: ordinary Failed, not yet blocked.
         for expected_attempts in 1..=2 {
-            engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+            engine
+                .run_loop(loop_id.clone(), None, None, None)
+                .await
+                .unwrap();
             let lp = db.get_loop(&loop_id).unwrap().unwrap();
             assert_eq!(lp.status, LoopStatus::Failed, "attempt {expected_attempts}");
             assert_eq!(
@@ -11234,7 +11318,10 @@ echo done
         }
 
         // Execution 3: the budget (default 3) is now exceeded — blocked.
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
         assert_eq!(db.get_loop_spec_cross_run_attempts(&spec_id).unwrap(), 3);
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         assert_eq!(
@@ -11324,7 +11411,10 @@ echo done
 
         // Two genuine failures — one short of the default budget of 3.
         for _ in 0..2 {
-            engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+            engine
+                .run_loop(loop_id.clone(), None, None, None)
+                .await
+                .unwrap();
         }
         assert_eq!(db.get_loop_spec_cross_run_attempts(&spec_id).unwrap(), 2);
 
@@ -11344,7 +11434,10 @@ echo done
 
         // The next execution starts fresh: one more genuine failure lands
         // at count 1, not 3 — still an ordinary Failed, not Blocked.
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
         assert_eq!(db.get_loop_spec_cross_run_attempts(&spec_id).unwrap(), 1);
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         assert_eq!(
@@ -11378,7 +11471,10 @@ echo done
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
         assert_eq!(db.get_loop_spec_cross_run_attempts(&spec_id).unwrap(), 1);
 
         db.reset_loop(&loop_id, None).unwrap();
@@ -11618,7 +11714,10 @@ echo done
         .unwrap();
 
         // A second dispatch (autorun/resume racing the live one) must no-op.
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         // The loop is untouched and the in-flight run was neither superseded
         // nor duplicated.
@@ -11670,7 +11769,7 @@ echo done
         })
         .unwrap();
 
-        engine.run_loop(loop_id, None, None).await.unwrap();
+        engine.run_loop(loop_id, None, None, None).await.unwrap();
 
         assert_eq!(
             notifications.events(),
@@ -11719,7 +11818,7 @@ echo done
         })
         .unwrap();
 
-        engine.run_loop(loop_id, None, None).await.unwrap();
+        engine.run_loop(loop_id, None, None, None).await.unwrap();
 
         assert_eq!(
             notifications.events(),
@@ -11829,7 +11928,10 @@ echo done
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         // The spec must have failed on budget exhaustion.
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
@@ -11989,7 +12091,7 @@ echo done
         .unwrap();
 
         let _home = HomeGuard::set(fake_home.path());
-        let result = engine.run_loop(loop_id.clone(), None, None).await;
+        let result = engine.run_loop(loop_id.clone(), None, None, None).await;
         drop(_home);
         result.unwrap();
 
@@ -12040,7 +12142,7 @@ echo done
         .unwrap();
 
         let _home = HomeGuard::set(fake_home.path());
-        let result = engine.run_loop(loop_id.clone(), None, None).await;
+        let result = engine.run_loop(loop_id.clone(), None, None, None).await;
         drop(_home);
         result.unwrap();
 
@@ -12106,7 +12208,10 @@ echo done
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
@@ -12179,7 +12284,7 @@ echo done
 
         let _home = HomeGuard::set(fake_home.path());
         engine
-            .run_loop("wf-test".to_string(), None, None)
+            .run_loop("wf-test".to_string(), None, None, None)
             .await
             .unwrap();
         drop(_home);
@@ -12314,7 +12419,8 @@ echo done
         let _home = HomeGuard::set(fake_home.path());
         let engine2 = Arc::clone(&engine);
         let loop_id2 = loop_id.clone();
-        let dispatch = tokio::spawn(async move { engine2.run_loop(loop_id2, None, None).await });
+        let dispatch =
+            tokio::spawn(async move { engine2.run_loop(loop_id2, None, None, None).await });
 
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
         let lp_mid = db.get_loop(&loop_id).unwrap().unwrap();
@@ -12377,7 +12483,10 @@ echo done
 
         let _home = HomeGuard::set(fake_home.path());
         let start = std::time::Instant::now();
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
         eprintln!("DIAG: dispatch-alone total elapsed = {:?}", start.elapsed());
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         eprintln!("DIAG: final loop status = {:?}", lp.status);
@@ -12469,7 +12578,7 @@ echo done
 
         // Cli::strategy() reads from $CANOPY_HOME_OVERRIDE/.canopy/config.toml.
         let _home = HomeGuard::set(fake_home.path());
-        let result = engine.run_loop(loop_id.clone(), None, None).await;
+        let result = engine.run_loop(loop_id.clone(), None, None, None).await;
         drop(_home);
         drop(fake_home);
         result.unwrap();
@@ -12515,7 +12624,10 @@ echo done
         db.update_loop_completion_hook(&loop_id, Some(&hook))
             .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         assert_eq!(lp.status, LoopStatus::Failed);
@@ -12563,7 +12675,10 @@ echo done
 
         let _home = HomeGuard::set(fake_home.path());
         // First completion.
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         assert_eq!(lp.status, LoopStatus::Completed);
 
@@ -12574,7 +12689,10 @@ echo done
         // doing nothing).
         db.reset_loop(&loop_id, Some(std::slice::from_ref(&spec_id)))
             .unwrap();
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
         drop(_home);
         drop(fake_home);
 
@@ -12598,7 +12716,7 @@ echo done
         let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
 
         let error = engine
-            .run_loop(loop_id.clone(), None, None)
+            .run_loop(loop_id.clone(), None, None, None)
             .await
             .unwrap_err();
         assert!(
@@ -12718,7 +12836,10 @@ echo done
         );
 
         let guard = HomeGuard::set(home.path());
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         assert_eq!(lp.status, LoopStatus::Completed);
@@ -12755,7 +12876,10 @@ echo done
         // `list_loop_specs` and silently skip it like a real finished spec.
         // `claim_loop_for_run` only refuses a claim while `Running`, so the
         // completed status from the first run doesn't block this directly.
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
         drop(guard);
 
         let specs_after = db.list_loop_specs(&loop_id).unwrap();
@@ -12798,7 +12922,7 @@ echo done
         // bound specs are still empty — every spec lives in the queue)
         // without passing `queue_id` back.
         let error = engine
-            .run_loop(loop_id.clone(), None, None)
+            .run_loop(loop_id.clone(), None, None, None)
             .await
             .unwrap_err();
         assert!(
@@ -12833,7 +12957,7 @@ echo done
         insert_queue_with_members(&db, "queue-1", &[&done.id]);
 
         let error = engine
-            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None, None)
             .await
             .unwrap_err();
         assert!(
@@ -12889,7 +13013,7 @@ echo done
 
         let _home = HomeGuard::set(fake_home.path());
         let result = engine
-            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None)
+            .run_loop(loop_id.clone(), Some("queue-1".to_string()), None, None)
             .await;
         drop(_home);
         drop(fake_home);
@@ -12933,7 +13057,7 @@ echo done
             .unwrap();
 
         let _home = HomeGuard::set(fake_home.path());
-        let result = engine.run_loop(loop_id.clone(), None, None).await;
+        let result = engine.run_loop(loop_id.clone(), None, None, None).await;
         drop(_home);
         drop(fake_home);
         result.unwrap();
@@ -13058,7 +13182,7 @@ echo done
             .unwrap();
 
         let _home = HomeGuard::set(fake_home.path());
-        let result = engine.run_loop(loop_id.clone(), None, None).await;
+        let result = engine.run_loop(loop_id.clone(), None, None, None).await;
         drop(_home);
         drop(fake_home);
         result.unwrap();
@@ -13106,7 +13230,10 @@ echo done
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         // Wait for the grace period + a bit extra for the grandchild.
         tokio::time::sleep(std::time::Duration::from_secs(4)).await;
@@ -13395,7 +13522,7 @@ echo done
         let _home = HomeGuard::set(fake_home.path());
         let started = std::time::Instant::now();
         engine
-            .run_loop("wf-test".to_string(), None, None)
+            .run_loop("wf-test".to_string(), None, None, None)
             .await
             .unwrap();
         let elapsed = started.elapsed();
@@ -13467,7 +13594,7 @@ echo done
         let _home = HomeGuard::set(fake_home.path());
         let started = std::time::Instant::now();
         engine
-            .run_loop("wf-test".to_string(), None, None)
+            .run_loop("wf-test".to_string(), None, None, None)
             .await
             .unwrap();
         let elapsed = started.elapsed();
@@ -13534,7 +13661,7 @@ echo done
 
         let _home = HomeGuard::set(fake_home.path());
         engine
-            .run_loop("wf-test".to_string(), None, None)
+            .run_loop("wf-test".to_string(), None, None, None)
             .await
             .unwrap();
         drop(_home);
@@ -13589,7 +13716,7 @@ echo done
 
         let _home = HomeGuard::set(fake_home.path());
         engine
-            .run_loop("wf-test".to_string(), None, None)
+            .run_loop("wf-test".to_string(), None, None, None)
             .await
             .unwrap();
         drop(_home);
@@ -13636,7 +13763,7 @@ echo done
 
         let _home = HomeGuard::set(fake_home.path());
         engine
-            .run_loop("wf-test".to_string(), None, None)
+            .run_loop("wf-test".to_string(), None, None, None)
             .await
             .unwrap();
         drop(_home);
@@ -13795,7 +13922,7 @@ echo done
 
         let _home = HomeGuard::set(fake_home.path());
         engine
-            .run_loop("wf-test".to_string(), None, None)
+            .run_loop("wf-test".to_string(), None, None, None)
             .await
             .unwrap();
         drop(_home);
@@ -13883,7 +14010,7 @@ echo done
 
         let _home = HomeGuard::set(fake_home.path());
         engine
-            .run_loop("wf-test".to_string(), None, None)
+            .run_loop("wf-test".to_string(), None, None, None)
             .await
             .unwrap();
         drop(_home);
@@ -14239,7 +14366,10 @@ echo done
         );
 
         let _home = HomeGuard::set(fake_home.path());
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
         drop(_home);
 
         let join = join_run(&db, &spec_id, "join1");
@@ -14289,7 +14419,10 @@ echo done
         );
 
         let _home = HomeGuard::set(fake_home.path());
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
         drop(_home);
 
         let join = join_run(&db, &spec_id, "join1");
@@ -14342,7 +14475,10 @@ echo done
                 .unwrap();
             db.update_loop_status(&loop_id, LoopStatus::Draft, None, None)
                 .unwrap();
-            engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+            engine
+                .run_loop(loop_id.clone(), None, None, None)
+                .await
+                .unwrap();
 
             let join = join_run(&db, &spec_id, "join1");
             let out = join.output.as_ref().unwrap();
@@ -14384,7 +14520,10 @@ echo done
         );
 
         let _home = HomeGuard::set(fake_home.path());
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
         drop(_home);
 
         let join = join_run(&db, &spec_id, "join1");
@@ -14434,7 +14573,7 @@ echo done
 
         let _home = HomeGuard::set(fake_home.path());
         engine
-            .run_loop("wf-test".to_string(), None, None)
+            .run_loop("wf-test".to_string(), None, None, None)
             .await
             .unwrap();
         drop(_home);
@@ -14486,7 +14625,7 @@ echo done
 
         let _home = HomeGuard::set(fake_home.path());
         engine
-            .run_loop("wf-test".to_string(), None, None)
+            .run_loop("wf-test".to_string(), None, None, None)
             .await
             .unwrap();
         drop(_home);
@@ -14556,7 +14695,7 @@ echo done
 
         let _home = HomeGuard::set(fake_home.path());
         engine
-            .run_loop("wf-test".to_string(), None, None)
+            .run_loop("wf-test".to_string(), None, None, None)
             .await
             .unwrap();
         drop(_home);
@@ -14624,7 +14763,7 @@ echo done
 
         let _home = HomeGuard::set(fake_home.path());
         engine
-            .run_loop("wf-test".to_string(), None, None)
+            .run_loop("wf-test".to_string(), None, None, None)
             .await
             .unwrap();
         drop(_home);
@@ -14698,7 +14837,7 @@ echo done
 
         let _home = HomeGuard::set(fake_home.path());
         engine
-            .run_loop("wf-test".to_string(), None, None)
+            .run_loop("wf-test".to_string(), None, None, None)
             .await
             .unwrap();
         drop(_home);
@@ -14794,7 +14933,7 @@ echo done
 
         let _home = HomeGuard::set(fake_home.path());
         engine
-            .run_loop(lp.id.clone(), Some("queue-1".to_string()), None)
+            .run_loop(lp.id.clone(), Some("queue-1".to_string()), None, None)
             .await
             .unwrap();
         drop(_home);
@@ -15005,7 +15144,10 @@ echo done
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
         let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
@@ -15071,7 +15213,7 @@ echo done
         .unwrap();
 
         let _home = HomeGuard::set(fake_home.path());
-        let result = engine.run_loop(loop_id.clone(), None, None).await;
+        let result = engine.run_loop(loop_id.clone(), None, None, None).await;
         drop(_home);
         result.unwrap();
 
@@ -15156,7 +15298,7 @@ echo done
         .unwrap();
 
         let _home = HomeGuard::set(fake_home.path());
-        let result = engine.run_loop(loop_id.clone(), None, None).await;
+        let result = engine.run_loop(loop_id.clone(), None, None, None).await;
         drop(_home);
         result.unwrap();
 
@@ -15262,7 +15404,10 @@ echo done
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
 
@@ -15360,7 +15505,7 @@ echo done
         .unwrap();
 
         let _home = HomeGuard::set(fake_home.path());
-        let result = engine.run_loop(loop_id.clone(), None, None).await;
+        let result = engine.run_loop(loop_id.clone(), None, None, None).await;
         drop(_home);
         result.unwrap();
 
@@ -15517,7 +15662,7 @@ echo done
         .unwrap();
 
         let _home = HomeGuard::set(fake_home.path());
-        let result = engine.run_loop(loop_id.clone(), None, None).await;
+        let result = engine.run_loop(loop_id.clone(), None, None, None).await;
         drop(_home);
         result.unwrap();
 
@@ -15889,7 +16034,7 @@ echo done
             }
 
             let _home = HomeGuard::set(fake_home.path());
-            let result = engine.run_loop(loop_id.clone(), None, None).await;
+            let result = engine.run_loop(loop_id.clone(), None, None, None).await;
             drop(_home);
             result.unwrap();
 
@@ -16002,7 +16147,7 @@ echo done
         .unwrap();
 
         let _home = HomeGuard::set(fake_home.path());
-        let result = engine.run_loop(loop_id.clone(), None, None).await;
+        let result = engine.run_loop(loop_id.clone(), None, None, None).await;
         drop(_home);
         result.unwrap();
 
@@ -16197,7 +16342,9 @@ echo done
         let dispatch_engine = Arc::clone(&engine);
         let loop_b_id = loop_b.id.clone();
         let dispatch =
-            tokio::spawn(async move { dispatch_engine.run_loop(loop_b_id, None, None).await });
+            tokio::spawn(
+                async move { dispatch_engine.run_loop(loop_b_id, None, None, None).await },
+            );
 
         // Poll (never a fixed sleep) until graph B's node run is actually
         // recorded `Running` before pausing it, to avoid a flaky race
@@ -16243,7 +16390,7 @@ echo done
         // Resume graph B — relaunching a paused loop directly is a
         // supported, documented entry point of `run_loop`.
         engine
-            .run_loop(loop_b.id.clone(), None, None)
+            .run_loop(loop_b.id.clone(), None, None, None)
             .await
             .unwrap();
 
@@ -16409,7 +16556,9 @@ echo done
         let dispatch_engine = Arc::clone(&engine);
         let loop_b_id = loop_b.id.clone();
         let dispatch =
-            tokio::spawn(async move { dispatch_engine.run_loop(loop_b_id, None, None).await });
+            tokio::spawn(
+                async move { dispatch_engine.run_loop(loop_b_id, None, None, None).await },
+            );
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -16493,7 +16642,10 @@ echo done
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
         let check_run = runs
@@ -16573,7 +16725,10 @@ echo done
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
         let check_run = runs
@@ -16625,7 +16780,10 @@ echo done
         })
         .unwrap();
 
-        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap();
 
         let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
         let run = runs
@@ -17125,7 +17283,7 @@ exit 0
         let _home = HomeGuard::set(fake_home.path());
         std::env::set_var("CAPTURE_DIR", capture_dir.to_str().unwrap());
 
-        let result = engine.run_loop(loop_id.clone(), None, None).await;
+        let result = engine.run_loop(loop_id.clone(), None, None, None).await;
         drop(_home);
         std::env::remove_var("CAPTURE_DIR");
 
@@ -17150,6 +17308,123 @@ exit 0
         assert!(
             !implementer_prompt.contains("{{output:Architect}}"),
             "Implementer's prompt must not contain unsubstituted marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn idea_text_populates_spec_content_in_placeholder() {
+        let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+        let argv_file = dir.path().join("argv.log");
+        let script = write_argv_echo_cli(dir.path());
+        let mut env = HashMap::new();
+        env.insert(
+            "ARGV_FILE".to_string(),
+            argv_file.to_string_lossy().into_owned(),
+        );
+        env.insert("RESUME_FLAG".to_string(), "--resume".to_string());
+        let cli = argv_cli_config(&script, env, None, None, None);
+        let home = write_resume_cli_home(cli);
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-impl".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "impl".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({ "platform": "resume-cli" }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 2,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "edge-impl-check".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            from_node: "node-impl".to_string(),
+            to_node: "node-check".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Pass,
+        })
+        .unwrap();
+
+        let guard = HomeGuard::set(home.path());
+        engine
+            .run_loop(
+                loop_id.clone(),
+                None,
+                None,
+                Some("Build a landing page for our startup".to_string()),
+            )
+            .await
+            .unwrap();
+        drop(guard);
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Completed);
+
+        let argv = std::fs::read_to_string(&argv_file).unwrap();
+        assert!(
+            argv.contains("Build a landing page for our startup"),
+            "the idea text must appear in the prompt where {{{{spec_content}}}} was substituted: {argv}"
+        );
+        assert!(
+            !argv.contains("{{spec_content}}"),
+            "the {{{{spec_content}}}} placeholder must have been resolved, not left literal: {argv}"
+        );
+    }
+
+    #[tokio::test]
+    async fn idea_without_graph_still_errors() {
+        let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+
+        let error = engine
+            .run_loop(loop_id.clone(), None, None, Some("some idea".to_string()))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("no specs to run"),
+            "unexpected error message: {error}"
+        );
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(
+            lp.status,
+            LoopStatus::Draft,
+            "an idea without a graph must leave the loop's status untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_idea_no_graph_still_errors() {
+        let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+
+        let error = engine
+            .run_loop(loop_id.clone(), None, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("no specs to run"),
+            "unexpected error message: {error}"
+        );
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(
+            lp.status,
+            LoopStatus::Draft,
+            "no idea and no graph must leave the loop's status untouched"
         );
     }
 }

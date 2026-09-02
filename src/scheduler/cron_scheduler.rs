@@ -1436,7 +1436,7 @@ mod tests {
         // exceed the attempt limit of 1 this fixture set up.
 
         loop_engine
-            .run_loop(loop_id.clone(), None, None)
+            .run_loop(loop_id.clone(), None, None, None)
             .await
             .unwrap();
         let lp = db.get_loop(&loop_id).unwrap().unwrap();

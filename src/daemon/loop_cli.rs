@@ -77,6 +77,10 @@ pub(crate) enum LoopAction {
         /// Absolute workdir override for this run only.
         #[arg(long)]
         workdir: Option<String>,
+        /// Free-form text fed to nodes as `{{spec_content}}` when the loop has
+        /// no bound specs and no queue.
+        #[arg(long)]
+        idea: Option<String>,
     },
     /// Pause a running loop after the current node finishes.
     Pause {
@@ -150,7 +154,8 @@ pub(crate) async fn handle_loop_action(
             id_or_name,
             queue,
             workdir,
-        } => handle_loop_run(&db, port_override, &id_or_name, queue, workdir),
+            idea,
+        } => handle_loop_run(&db, port_override, &id_or_name, queue, workdir, idea),
         LoopAction::Pause { id_or_name } => handle_loop_pause(&db, port_override, &id_or_name),
         LoopAction::Continue {
             id_or_name,
@@ -190,6 +195,7 @@ fn handle_loop_run(
     id_or_name: &str,
     queue: Option<String>,
     workdir: Option<String>,
+    idea: Option<String>,
 ) -> Result<()> {
     let loops = db.list_loops(None, true)?;
     let lp = resolve_loop(&loops, id_or_name)?;
@@ -200,6 +206,9 @@ fn handle_loop_run(
     }
     if let Some(workdir) = workdir {
         args["workdir"] = serde_json::json!(workdir);
+    }
+    if let Some(idea_text) = idea {
+        args["idea"] = serde_json::json!(idea_text);
     }
 
     println!("{}", call_tool(port_override, "loop_run", &args)?);
@@ -930,10 +939,12 @@ mod tests {
                 id_or_name,
                 queue,
                 workdir,
+                idea,
             } => {
                 assert_eq!(id_or_name, "my-loop");
                 assert!(queue.is_none());
                 assert!(workdir.is_none());
+                assert!(idea.is_none());
             }
             other => panic!("expected Run, got {other:?}"),
         }
@@ -953,10 +964,12 @@ mod tests {
                 id_or_name,
                 queue,
                 workdir,
+                idea,
             } => {
                 assert_eq!(id_or_name, "my-loop");
                 assert_eq!(queue.as_deref(), Some("q1"));
                 assert_eq!(workdir.as_deref(), Some("/tmp/proj"));
+                assert!(idea.is_none());
             }
             other => panic!("expected Run, got {other:?}"),
         }
@@ -1694,8 +1707,15 @@ mod tests {
         }));
         let port: u16 = fake.port.parse().unwrap();
 
-        handle_loop_run(&db, Some(port), "my-loop", Some("q1".to_string()), None)
-            .expect("run should succeed");
+        handle_loop_run(
+            &db,
+            Some(port),
+            "my-loop",
+            Some("q1".to_string()),
+            None,
+            None,
+        )
+        .expect("run should succeed");
 
         let calls = fake.recorded_calls();
         assert_eq!(calls.len(), 1);
@@ -1710,7 +1730,7 @@ mod tests {
         // No fake daemon is spawned — a request that reaches the network at
         // all would fail differently (connection refused) than the
         // not-found error resolution must produce locally.
-        let err = handle_loop_run(&db, Some(65535), "missing", None, None).unwrap_err();
+        let err = handle_loop_run(&db, Some(65535), "missing", None, None, None).unwrap_err();
         assert!(err.to_string().contains("No loop matches"));
     }
 

@@ -4216,14 +4216,21 @@ impl TaskTriggerHandler {
             None => None,
         };
 
-        let specs = self
+        let specs: Vec<_> = self
             .db
             .list_specs(
                 params.workdir.as_deref(),
                 status,
                 params.unassigned_only.unwrap_or(false),
             )
-            .map_err(internal_error)?;
+            .map_err(internal_error)?
+            .into_iter()
+            // The blank-name row a spec-less / idea-driven run binds to its
+            // loop to carry `{{spec_content}}` is engine bookkeeping, not work
+            // — never a user-authored spec (`loop_add_spec` rejects an empty
+            // name), so it must not surface here.
+            .filter(|s| !s.name.is_empty())
+            .collect();
 
         let include_descriptions = params.include_descriptions.unwrap_or(false);
         let total = specs.len();
@@ -6533,7 +6540,7 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "loop_run",
-        description = "Run a loop in the background, spec by spec. With `queue_id`, runs the queue's pending specs (in queue order) through the loop's graph instead of the loop's own bound specs. `workdir` overrides the loop's workdir for this run only."
+        description = "Run a loop in the background, spec by spec. With `queue_id`, runs the queue's pending specs (in queue order) through the loop's graph instead of the loop's own bound specs. `workdir` overrides the loop's workdir for this run only. `idea` is free-form text fed to nodes as `{{spec_content}}` when the loop has no bound specs and no queue (mutually exclusive with `queue_id`)."
     )]
     async fn loop_run(
         &self,
@@ -6594,6 +6601,20 @@ impl TaskTriggerHandler {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
+
+        let idea = params
+            .idea
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+
+        if idea.is_some() && queue_id.is_some() {
+            return Ok(error_result(
+                "`idea` and `queue_id` are mutually exclusive: an idea feeds {{spec_content}} directly, a queue provides its own specs.",
+            ));
+        }
+
         if let Some(queue_id) = queue_id {
             if let Err(e) = validate_queue_exists(&self.db, queue_id) {
                 return Ok(error_result(&e));
@@ -6628,6 +6649,7 @@ impl TaskTriggerHandler {
             loop_id.clone(),
             queue_id.map(str::to_string),
             workdir.map(str::to_string),
+            idea,
         );
         Ok(success_result(&format!(
             "Loop '{}' launched in background.",
@@ -7727,6 +7749,10 @@ fn loop_details_json(db: &Database, lp: &LoopDetails) -> anyhow::Result<serde_js
     let specs = lp
         .specs
         .iter()
+        // Skip the blank-name placeholder a spec-less / idea-driven run binds
+        // to the loop to carry `{{spec_content}}`: it's engine bookkeeping,
+        // purged on the next dispatch, and must not read as a unit of work.
+        .filter(|spec| !spec.spec.name.is_empty())
         .map(|spec| loop_spec_details_json(db, spec, lp.lp.status))
         .collect::<anyhow::Result<Vec<_>>>()?;
     let ensembles = db
@@ -18613,6 +18639,7 @@ mod endpoint_tests {
                 loop_id: lp.id.clone(),
                 queue_id: None,
                 workdir: None,
+                idea: None,
             }))
             .await
             .unwrap();
@@ -18655,7 +18682,7 @@ mod endpoint_tests {
 
         handler
             .loop_engine
-            .run_loop(lp.id.clone(), None, None)
+            .run_loop(lp.id.clone(), None, None, None)
             .await
             .unwrap();
 
@@ -20624,5 +20651,90 @@ mod endpoint_tests {
 
         let details = db.get_ensemble_details(&ensemble_id).unwrap().unwrap();
         assert_eq!(details.ensemble.kind, EnsembleKind::Cascade);
+    }
+
+    #[tokio::test]
+    async fn loop_run_idea_and_queue_mutually_exclusive() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+
+        let result = handler
+            .loop_run(Parameters(LoopRunParams {
+                loop_id: lp.id.clone(),
+                queue_id: Some("some-queue".to_string()),
+                workdir: None,
+                idea: Some("build a landing page".to_string()),
+            }))
+            .await
+            .unwrap();
+        assert!(
+            is_err(&result),
+            "idea and queue_id together must be rejected"
+        );
+        assert!(
+            text(&result).contains("mutually exclusive"),
+            "error must mention mutual exclusion: {}",
+            text(&result)
+        );
+    }
+
+    #[tokio::test]
+    async fn idea_placeholder_spec_is_absent_from_spec_listings() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+
+        // The row `run_loop_dispatch` binds to a spec-less / idea-driven loop
+        // to carry `{{spec_content}}`: blank name, idea text in the
+        // description. It is engine bookkeeping and must not surface as work.
+        db.insert_loop_spec(&LoopSpec {
+            id: uuid::Uuid::new_v4().to_string(),
+            loop_id: Some(lp.id.clone()),
+            name: String::new(),
+            description: Some("Build a hyperframes explainer about our launch".to_string()),
+            position: 0,
+            parallelizable: false,
+            status: LoopSpecStatus::Completed,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+
+        let listed = raw_text(
+            &handler
+                .spec_list(Parameters(SpecListParams {
+                    workdir: None,
+                    status: None,
+                    unassigned_only: None,
+                    include_descriptions: Some(true),
+                }))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            !listed.contains("hyperframes explainer"),
+            "the idea placeholder must not appear in spec_list: {listed}"
+        );
+        assert!(
+            listed.contains("\"total\": 0"),
+            "the blank placeholder must not be counted in spec_list total: {listed}"
+        );
+
+        let got = handler
+            .loop_get(Parameters(LoopGetParams {
+                loop_id: lp.id.clone(),
+            }))
+            .await
+            .unwrap();
+        let got = raw_text(&got);
+        assert!(
+            !got.contains("hyperframes explainer"),
+            "the idea placeholder must not appear in loop_get specs: {got}"
+        );
     }
 }

@@ -945,8 +945,11 @@ mod hang_repro {
         let (port, loop_engine) = spawn_test_server(Arc::clone(&db)).await;
 
         let dispatch_loop_id = loop_id.clone();
-        let dispatch =
-            tokio::spawn(async move { loop_engine.run_loop(dispatch_loop_id, None, None).await });
+        let dispatch = tokio::spawn(async move {
+            loop_engine
+                .run_loop(dispatch_loop_id, None, None, None)
+                .await
+        });
 
         // Wait until the loop is actually Running (node process spawned).
         for _ in 0..50 {

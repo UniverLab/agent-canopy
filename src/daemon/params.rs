@@ -944,6 +944,10 @@ pub struct LoopRunParams {
     /// Optional absolute workdir override for this run only. Wins over the
     /// loop's own `workdir`; the loop's `workdir` is left unchanged.
     pub workdir: Option<String>,
+    /// Optional free-form text fed to nodes as `{{spec_content}}` when the loop
+    /// has no bound specs and no queue. The loop must still have a top-level
+    /// graph. Mutually exclusive with `queue_id`.
+    pub idea: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
