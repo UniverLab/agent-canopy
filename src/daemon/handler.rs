@@ -6334,6 +6334,32 @@ impl TaskTriggerHandler {
             }
         }
 
+        // CM1: validate {{output:NodeName}} references
+        {
+            let node_names: Vec<String> =
+                details.graph_nodes.iter().map(|n| n.name.clone()).collect();
+            for node in &details.graph_nodes {
+                if let Some(prompt) = node.config.get("prompt_template").and_then(|v| v.as_str()) {
+                    let mut rest = prompt;
+                    while let Some(start) = rest.find("{{output:") {
+                        let after_prefix = &rest[start + 9..];
+                        if let Some(end) = after_prefix.find("}}") {
+                            let referenced_name = &after_prefix[..end];
+                            if !node_names.iter().any(|n| n == referenced_name) {
+                                return Ok(error_result(&format!(
+                                    "Node '{}' references unknown node '{}' in {{{{output:{}}}}}.",
+                                    node.name, referenced_name, referenced_name
+                                )));
+                            }
+                            rest = &after_prefix[end + 2..];
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         let loop_targets = crate::daemon::probe::distinct_targets_for_loop(&details);
         if loop_targets.is_empty() {
             return Ok(success_result(&format!(
@@ -16215,6 +16241,90 @@ mod endpoint_tests {
         // Identical except the name (decision 4 renamed it on collision).
         second_doc["name"] = first_doc["name"].clone();
         assert_eq!(first_doc, second_doc);
+    }
+
+    #[tokio::test]
+    async fn loop_preflight_rejects_unknown_named_output_reference() {
+        // A structurally valid two-node chain where the downstream node's
+        // prompt references `{{output:Ghost}}` — a node that isn't in the
+        // graph. Preflight must reject it before spending any probe quota,
+        // not leave the marker to surface unsubstituted at runtime (CM1).
+        let (dir, _db, handler) = endpoint_test_handler();
+        let workdir = dir.path().to_string_lossy().to_string();
+        let created = handler
+            .loop_create(Parameters(LoopCreateParams {
+                name: "Preflight Named Output Loop".to_string(),
+                description: None,
+                workdir,
+                trigger: None,
+            }))
+            .await
+            .unwrap();
+        let loop_id = extract_id(&created, "loop_id");
+
+        let alpha = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: None,
+                loop_id: Some(loop_id.clone()),
+                name: "alpha".to_string(),
+                kind: Some("agent".to_string()),
+                config: Some(agent_node_config("claude")),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        let alpha_id = extract_id(&alpha, "node_id");
+
+        let mut beta_config = agent_node_config("claude");
+        beta_config.insert(
+            "prompt_template".to_string(),
+            serde_json::Value::String("Follow the plan: {{output:Ghost}}".to_string()),
+        );
+        let beta = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: None,
+                loop_id: Some(loop_id.clone()),
+                name: "beta".to_string(),
+                kind: Some("agent".to_string()),
+                config: Some(beta_config),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        let beta_id = extract_id(&beta, "node_id");
+
+        let edge = handler
+            .loop_add_edge(Parameters(LoopAddEdgeParams {
+                spec_id: None,
+                loop_id: Some(loop_id.clone()),
+                from_node: alpha_id,
+                to_node: beta_id,
+                condition: "always".to_string(),
+                route: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&edge), "{}", text(&edge));
+
+        let result = handler
+            .loop_preflight(Parameters(LoopPreflightParams {
+                loop_id: loop_id.clone(),
+                timeout_seconds: None,
+            }))
+            .await
+            .unwrap();
+        assert!(
+            is_err(&result),
+            "preflight should reject the unknown named-output reference: {}",
+            text(&result)
+        );
+        let msg = text(&result);
+        assert!(
+            msg.contains("references unknown node 'Ghost'"),
+            "preflight error should name the missing node, got: {msg}"
+        );
     }
 
     #[tokio::test]

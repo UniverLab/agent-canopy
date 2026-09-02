@@ -940,8 +940,13 @@ impl LoopEngine {
         // graph and the loop-level fallback each answer for themselves.
         let enforce_commit_rights = graph_enforces_commit_rights(nodes);
         let existing_runs = self.db.list_loop_runs_for_spec(&spec.id)?;
-        let (mut cursor, mut previous_output, mut iterations) =
+        let all_node_names: Vec<String> = nodes.iter().map(|n| n.name.clone()).collect();
+        let (mut cursor, mut node_outputs, resume_previous_output, mut iterations) =
             resolve_spec_start(nodes, edges, spec, &existing_runs, &ensembles)?;
+        // Name of the node whose output most recently became `previous_output`.
+        // Empty until the first node steps; until then a resumed spec falls
+        // back to `resume_previous_output` (the interrupted node's own input).
+        let mut previous_node_name: Option<String> = None;
 
         // Capture the workdir's git HEAD once, at the moment the engine
         // starts executing this spec in the *current run attempt* — never
@@ -1037,6 +1042,12 @@ impl LoopEngine {
             if self.is_paused(&lp.id)? {
                 return Ok(SpecExecutionOutcome::Paused);
             }
+
+            let previous_output = previous_node_name
+                .as_ref()
+                .and_then(|name| node_outputs.get(name))
+                .cloned()
+                .or_else(|| resume_previous_output.clone());
 
             let budget_key = match &cursor {
                 SpecCursor::Node(node_id) => node_id.clone(),
@@ -1251,6 +1262,8 @@ impl LoopEngine {
                                 workdir,
                                 resume_candidate.as_deref(),
                                 resume_crosses_spec,
+                                &node_outputs,
+                                &all_node_names,
                             )
                             .await?;
                         let run = self.db.get_loop_run(&run_id)?.ok_or_else(|| {
@@ -1440,6 +1453,8 @@ impl LoopEngine {
                             iteration_value,
                             workdir,
                             enforce_commit_rights,
+                            &node_outputs,
+                            &all_node_names,
                         )
                         .await?;
 
@@ -1531,7 +1546,12 @@ impl LoopEngine {
                     // meant to see — the data the router read. A failed router
                     // is not routed, so its failure payload still propagates.
                     if !is_routed_router {
-                        previous_output = Some(final_execution.output);
+                        let from_node_name = nodes_by_id
+                            .get(from_node_id.as_str())
+                            .map(|n| n.name.clone())
+                            .unwrap_or_default();
+                        node_outputs.insert(from_node_name.clone(), final_execution.output.clone());
+                        previous_node_name = Some(from_node_name);
                     }
                     cursor = step;
                 }
@@ -1706,6 +1726,8 @@ impl LoopEngine {
         iteration: usize,
         workdir: &str,
         enforce_commit_rights: bool,
+        node_outputs: &HashMap<String, Value>,
+        all_node_names: &[String],
     ) -> Result<NodeExecution> {
         let ensemble = &details.ensemble;
         // 0 is a legitimate value (mirrors `run_agent_process`'s own
@@ -1773,6 +1795,8 @@ impl LoopEngine {
             let label = member_label(member);
             let ensemble_id = ensemble.id.clone();
             let dynamic_skills = self.dynamic_skills.clone();
+            let node_outputs = node_outputs.clone();
+            let all_node_names = all_node_names.to_vec();
 
             set.spawn(async move {
                 let _permit = semaphore
@@ -1815,6 +1839,8 @@ impl LoopEngine {
                                 // never a different spec's.
                                 false,
                                 dynamic_skills.as_ref(),
+                                &node_outputs,
+                                &all_node_names,
                             )
                             .await?;
                             let run = db.get_loop_run(&member_run_id)?.ok_or_else(|| {
@@ -2043,6 +2069,8 @@ impl LoopEngine {
         workdir: &str,
         resume_session_id: Option<&str>,
         resume_crosses_spec: bool,
+        node_outputs: &HashMap<String, Value>,
+        all_node_names: &[String],
     ) -> Result<NodeExecution> {
         match node.kind {
             LoopNodeKind::Check => {
@@ -2071,6 +2099,8 @@ impl LoopEngine {
                     resume_session_id,
                     resume_crosses_spec,
                     self.dynamic_skills.as_ref(),
+                    node_outputs,
+                    all_node_names,
                 )
                 .await
             }
@@ -2779,6 +2809,8 @@ async fn execute_agent_node(
     resume_session_id: Option<&str>,
     resume_crosses_spec: bool,
     dynamic_skills: Option<&Arc<crate::dynamic_skills::SkillStore>>,
+    node_outputs: &HashMap<String, Value>,
+    all_node_names: &[String],
 ) -> Result<NodeExecution> {
     let cli_name = node
         .config
@@ -2825,6 +2857,8 @@ async fn execute_agent_node(
                 previous_output,
                 workdir,
                 run_id,
+                node_outputs,
+                all_node_names,
             ) {
                 Ok(p) => p,
                 Err(e) => {
@@ -2905,6 +2939,8 @@ async fn execute_agent_node(
         previous_output,
         workdir,
         run_id,
+        node_outputs,
+        all_node_names,
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -4281,8 +4317,23 @@ pub(crate) fn agent_prompt_source(config: &Value) -> &'static str {
 /// own `.replace()`-based renderers, and checks the *template* (not the
 /// rendered output) so a `{{...}}` sequence inside a bound value — a spec
 /// body, prior feedback — is treated as data, not a leftover marker.
-fn refuse_unbindable_template(node_name: &str, template: &str, supported: &[&str]) -> Result<()> {
-    let unbindable = crate::domain::prompts::unbindable_placeholders(template, supported);
+fn refuse_unbindable_template(
+    node_name: &str,
+    template: &str,
+    supported: &[&str],
+    available_node_names: Option<&[String]>,
+) -> Result<()> {
+    let mut extended: Vec<&str> = supported.to_vec();
+    let mut owned: Vec<String> = Vec::new();
+    if let Some(node_names) = available_node_names {
+        for name in node_names {
+            owned.push(format!("output:{name}"));
+        }
+        for s in &owned {
+            extended.push(s.as_str());
+        }
+    }
+    let unbindable = crate::domain::prompts::unbindable_placeholders(template, &extended);
     if unbindable.is_empty() {
         return Ok(());
     }
@@ -4305,6 +4356,35 @@ fn refuse_unbindable_template(node_name: &str, template: &str, supported: &[&str
     ))
 }
 
+fn substitute_named_outputs(
+    template: &str,
+    node_outputs: &HashMap<String, Value>,
+    all_node_names: &[String],
+) -> String {
+    let mut result = template.to_string();
+    let mut search_from = 0;
+    while let Some(rel_start) = result[search_from..].find("{{output:") {
+        let abs_start = search_from + rel_start;
+        let after_prefix = &result[abs_start + 9..];
+        if let Some(end_offset) = after_prefix.find("}}") {
+            let node_name = &after_prefix[..end_offset];
+            let replacement = if let Some(output) = node_outputs.get(node_name) {
+                serde_json::to_string_pretty(output).unwrap_or_else(|_| "(none)".to_string())
+            } else if all_node_names.iter().any(|n| n == node_name) {
+                "(not yet executed)".to_string()
+            } else {
+                "(unknown node)".to_string()
+            };
+            let abs_end = abs_start + 9 + end_offset + 2;
+            result.replace_range(abs_start..abs_end, &replacement);
+            search_from = abs_start + replacement.len();
+        } else {
+            break;
+        }
+    }
+    result
+}
+
 /// The only `{{...}}` markers [`render_agent_prompt`] can bind. A resolved
 /// template — an explicit `prompt_template`, a `prompt_preset` body, or the
 /// default fallback — that carries any other marker is refused (CP1): the
@@ -4320,6 +4400,7 @@ const AGENT_PROMPT_BINDINGS: &[&str] = &[
     "previous_feedback",
 ];
 
+#[allow(clippy::too_many_arguments)]
 fn render_agent_prompt(
     lp: &crate::domain::loops::Loop,
     spec: &LoopSpec,
@@ -4328,8 +4409,15 @@ fn render_agent_prompt(
     previous_output: Option<&Value>,
     workdir: &str,
     run_id: &str,
+    node_outputs: &HashMap<String, Value>,
+    all_node_names: &[String],
 ) -> Result<String> {
-    refuse_unbindable_template(&node.name, prompt_template, AGENT_PROMPT_BINDINGS)?;
+    refuse_unbindable_template(
+        &node.name,
+        prompt_template,
+        AGENT_PROMPT_BINDINGS,
+        Some(all_node_names),
+    )?;
 
     let previous_feedback = previous_output
         .map(|value| serde_json::to_string_pretty(value).unwrap_or_default())
@@ -4344,6 +4432,7 @@ fn render_agent_prompt(
         .replace("{{spec_content}}", spec_content)
         .replace("{{node_id}}", &node.id)
         .replace("{{previous_feedback}}", &previous_feedback);
+    let prompt = substitute_named_outputs(&prompt, node_outputs, all_node_names);
 
     // A spec picked up in `Interrupted` status has a previous attempt's
     // partial work sitting in `workdir` — the engine no longer `git stash`es
@@ -4421,6 +4510,7 @@ const RESUME_PROMPT_CROSS_SPEC_DEFAULT: &str = "# [CONTINUE: NEW SPEC]\nYou are 
 /// already has that spec in its history; re-rendering it wastes tokens and
 /// invites regurgitation), but the cross-spec default does (that session has
 /// never seen this spec).
+#[allow(clippy::too_many_arguments)]
 fn render_resume_prompt(
     lp: &crate::domain::loops::Loop,
     spec: &LoopSpec,
@@ -4429,15 +4519,22 @@ fn render_resume_prompt(
     previous_output: Option<&Value>,
     workdir: &str,
     run_id: &str,
+    node_outputs: &HashMap<String, Value>,
+    all_node_names: &[String],
 ) -> Result<String> {
-    refuse_unbindable_template(&node.name, template, RESUME_PROMPT_BINDINGS)?;
+    refuse_unbindable_template(
+        &node.name,
+        template,
+        RESUME_PROMPT_BINDINGS,
+        Some(all_node_names),
+    )?;
 
     let previous_feedback = previous_output
         .map(|value| serde_json::to_string_pretty(value).unwrap_or_default())
         .unwrap_or_else(|| "(none)".to_string());
     let previous_feedback = bound_previous_feedback(previous_feedback);
     let spec_content = spec.description.as_deref().unwrap_or(&spec.name);
-    Ok(template
+    let prompt = template
         .replace("{{loop_name}}", &lp.name)
         .replace("{{workdir}}", workdir)
         .replace("{{spec_id}}", &spec.id)
@@ -4446,7 +4543,12 @@ fn render_resume_prompt(
         .replace("{{node}}", &node.name)
         .replace("{{node_id}}", &node.id)
         .replace("{{run_id}}", run_id)
-        .replace("{{previous_feedback}}", &previous_feedback))
+        .replace("{{previous_feedback}}", &previous_feedback);
+    Ok(substitute_named_outputs(
+        &prompt,
+        node_outputs,
+        all_node_names,
+    ))
 }
 
 /// The only `{{...}}` markers [`render_resume_prompt`] can bind — the
@@ -4487,6 +4589,7 @@ fn render_completion_hook_prompt(
         "on_completed hook",
         prompt_template,
         COMPLETION_HOOK_BINDINGS,
+        None,
     )?;
 
     let completed_specs_text = if completed_specs.is_empty() {
@@ -4688,13 +4791,19 @@ fn is_no_spec_placeholder(spec: &LoopSpec) -> bool {
     spec.name.is_empty()
 }
 
+#[allow(clippy::type_complexity)]
 fn resolve_spec_start(
     nodes: &[LoopNode],
     edges: &[LoopEdge],
     spec: &LoopSpec,
     existing_runs: &[LoopNodeRun],
     ensembles: &[EnsembleDetails],
-) -> Result<(SpecCursor, Option<Value>, HashMap<String, usize>)> {
+) -> Result<(
+    SpecCursor,
+    HashMap<String, Value>,
+    Option<Value>,
+    HashMap<String, usize>,
+)> {
     if spec.status == LoopSpecStatus::Running {
         if let Some(last_run) = existing_runs.last() {
             // An ensemble's N members (+ its join) each get their own
@@ -4716,12 +4825,31 @@ fn resolve_spec_start(
                 Some(ensemble_id) => SpecCursor::Ensemble(ensemble_id),
                 None => SpecCursor::Node(last_run.node_id.clone()),
             };
-            return Ok((cursor, last_run.input.clone(), iterations));
+            // CM1 multi-hop retention: every already-completed node's output,
+            // keyed by name, so a resumed pass can still resolve
+            // `{{output:NodeName}}` for any earlier node — not only the last.
+            let mut node_outputs = HashMap::new();
+            for run in existing_runs {
+                if (run.status == LoopRunStatus::Pass || run.status == LoopRunStatus::Fail)
+                    && run.output.is_some()
+                {
+                    if let Some(node) = nodes.iter().find(|n| n.id == run.node_id) {
+                        node_outputs
+                            .insert(node.name.clone(), run.output.clone().unwrap_or(Value::Null));
+                    }
+                }
+            }
+            // `{{previous_feedback}}` on the resumed node must reproduce exactly
+            // what it saw on its interrupted attempt: the value propagated
+            // *into* it, captured as `last_run.input` when its row was inserted
+            // — never that node's own (later) output row.
+            return Ok((cursor, node_outputs, last_run.input.clone(), iterations));
         }
     }
 
     Ok((
         SpecCursor::Node(find_entry_node(nodes, edges, &spec.name)?),
+        HashMap::new(),
         None,
         HashMap::new(),
     ))
@@ -6093,7 +6221,9 @@ mod tests {
             node_id: "node-1".to_string(),
             status: LoopRunStatus::Fail,
             input: Some(serde_json::json!({"previous": "context"})),
-            output: None,
+            // Deliberately distinct from `input`: a resumed node must be fed
+            // the value propagated into it, not its own verdict.
+            output: Some(serde_json::json!({"verdict": "fail"})),
             started_at: chrono::Utc::now(),
             completed_at: Some(chrono::Utc::now()),
             iteration: 1,
@@ -6102,14 +6232,25 @@ mod tests {
             session_id: None,
         }];
 
-        let (cursor, previous_output, iterations) =
+        let (cursor, node_outputs, resume_previous_output, iterations) =
             resolve_spec_start(&details.nodes, &details.edges, &spec, &runs, &[]).unwrap();
 
         assert_eq!(cursor, SpecCursor::Node("node-1".to_string()));
         assert_eq!(iterations.get("node-1"), Some(&1));
         assert_eq!(
-            previous_output.and_then(|value| value.get("previous").cloned()),
-            Some(serde_json::json!("context"))
+            resume_previous_output
+                .as_ref()
+                .and_then(|value| value.get("previous").cloned()),
+            Some(serde_json::json!("context")),
+            "resumed node must see its interrupted attempt's input, not its output"
+        );
+        // The completed run's output is still retained by name so
+        // `{{output:Node}}` multi-hop references keep resolving after a resume.
+        assert_eq!(
+            node_outputs
+                .get("Node")
+                .and_then(|value| value.get("verdict").cloned()),
+            Some(serde_json::json!("fail"))
         );
     }
 
@@ -6166,11 +6307,11 @@ mod tests {
             })
             .collect();
 
-        let (cursor, previous_output, iterations) =
+        let (cursor, node_outputs, _resume_previous_output, iterations) =
             resolve_spec_start(&details.nodes, &details.edges, &spec, &runs, &[]).unwrap();
 
         assert_eq!(cursor, SpecCursor::Node("node-1".to_string()));
-        assert!(previous_output.is_none());
+        assert!(node_outputs.is_empty());
         assert!(iterations.is_empty());
     }
 
@@ -6297,6 +6438,8 @@ mod tests {
             Some(&serde_json::json!({"feedback":"ok"})),
             &lp.workdir,
             "run-1",
+            &HashMap::new(),
+            &[],
         )
         .unwrap();
 
@@ -6369,6 +6512,8 @@ mod tests {
             None,
             &lp.workdir,
             "run-1",
+            &HashMap::new(),
+            &[],
         )
         .unwrap();
         assert!(!pending_prompt.contains("[CONTINUATION]"));
@@ -6382,6 +6527,8 @@ mod tests {
             None,
             &lp.workdir,
             "run-1",
+            &HashMap::new(),
+            &[],
         )
         .unwrap();
         assert!(interrupted_prompt.contains("[CONTINUATION]"));
@@ -6555,6 +6702,8 @@ mod tests {
             Some(&serde_json::json!({"stdout": huge_log})),
             &lp.workdir,
             "run-1",
+            &HashMap::new(),
+            &[],
         )
         .unwrap();
 
@@ -6821,6 +6970,8 @@ mod tests {
                 dir.path().to_str().unwrap(),
                 None,
                 false,
+                &HashMap::new(),
+                &[],
             )
             .await
             .unwrap();
@@ -7305,6 +7456,8 @@ echo done
             resume_session_id,
             cross_spec,
             None,
+            &HashMap::new(),
+            &[],
         )
         .await
         .unwrap();
@@ -9927,6 +10080,8 @@ echo done
             Some(&serde_json::json!({"stdout": huge_log})),
             &lp.workdir,
             "run-1",
+            &HashMap::new(),
+            &[],
         )
         .unwrap();
         assert!(
@@ -15179,8 +15334,17 @@ echo done
         };
         let template = "Do this: {{spec_content}} and also {{custom_var}}";
 
-        let result =
-            render_agent_prompt(&lp, &spec, &node, template, None, "/tmp/project", "run-1");
+        let result = render_agent_prompt(
+            &lp,
+            &spec,
+            &node,
+            template,
+            None,
+            "/tmp/project",
+            "run-1",
+            &HashMap::new(),
+            &[],
+        );
 
         assert!(
             result.is_err(),
@@ -15190,6 +15354,430 @@ echo done
         assert!(
             err_msg.contains("custom_var"),
             "error must name the unbindable placeholder: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn named_output_substitution_replaces_marker_with_node_output() {
+        let mut node_outputs = HashMap::new();
+        node_outputs.insert(
+            "Architect".to_string(),
+            serde_json::json!({"design": "foo"}),
+        );
+        let all_nodes = vec!["Architect".to_string(), "Implementer".to_string()];
+
+        let template = "Build {{output:Architect}}";
+        let result = substitute_named_outputs(template, &node_outputs, &all_nodes);
+
+        assert!(result.contains("\"design\": \"foo\""));
+        assert!(!result.contains("{{output:Architect}}"));
+    }
+
+    #[test]
+    fn named_output_substitution_marks_unexecuted_node() {
+        let node_outputs = HashMap::new();
+        let all_nodes = vec!["Architect".to_string(), "Implementer".to_string()];
+
+        let template = "Build {{output:Architect}}";
+        let result = substitute_named_outputs(template, &node_outputs, &all_nodes);
+
+        assert!(
+            result.contains("(not yet executed)"),
+            "expected '(not yet executed)' in: {result}"
+        );
+    }
+
+    #[test]
+    fn named_output_substitution_preserves_multiple_markers() {
+        let mut node_outputs = HashMap::new();
+        node_outputs.insert(
+            "Architect".to_string(),
+            serde_json::json!({"design": "plan-a"}),
+        );
+        node_outputs.insert(
+            "Reviewer".to_string(),
+            serde_json::json!({"feedback": "approve"}),
+        );
+        let all_nodes = vec![
+            "Architect".to_string(),
+            "Reviewer".to_string(),
+            "Implementer".to_string(),
+        ];
+
+        let template = "Design: {{output:Architect}} Review: {{output:Reviewer}}";
+        let result = substitute_named_outputs(template, &node_outputs, &all_nodes);
+
+        assert!(result.contains("\"design\": \"plan-a\""));
+        assert!(result.contains("\"feedback\": \"approve\""));
+    }
+
+    #[test]
+    fn render_agent_prompt_substitutes_named_output_marker() {
+        let dir = tempdir().unwrap();
+        let lp = crate::domain::loops::Loop {
+            archived: false,
+            paused_by_reconciliation: false,
+            id: "wf-test".to_string(),
+            name: "Loop".to_string(),
+            description: None,
+            workdir: dir.path().to_string_lossy().to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        };
+        let spec = LoopSpec {
+            id: "spec".to_string(),
+            loop_id: Some(lp.id.clone()),
+            name: "Spec".to_string(),
+            description: Some("Do the thing".to_string()),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        let node = LoopNode {
+            id: "node-impl".to_string(),
+            spec_id: Some(spec.id.clone()),
+            loop_id: None,
+            name: "Implementer".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+
+        let mut node_outputs = HashMap::new();
+        node_outputs.insert(
+            "Architect".to_string(),
+            serde_json::json!({"plan": "build-it"}),
+        );
+        let all_nodes = vec!["Architect".to_string(), "Implementer".to_string()];
+
+        let prompt = render_agent_prompt(
+            &lp,
+            &spec,
+            &node,
+            "Follow this design: {{output:Architect}}",
+            None,
+            &lp.workdir,
+            "run-1",
+            &node_outputs,
+            &all_nodes,
+        )
+        .unwrap();
+
+        assert!(
+            prompt.contains("\"plan\": \"build-it\""),
+            "prompt must contain architect's output: {prompt}"
+        );
+        assert!(
+            !prompt.contains("{{output:Architect}}"),
+            "prompt must not contain unsubstituted marker: {prompt}"
+        );
+    }
+
+    #[test]
+    fn render_agent_prompt_accepts_output_marker_without_refusing() {
+        let dir = tempdir().unwrap();
+        let lp = crate::domain::loops::Loop {
+            archived: false,
+            paused_by_reconciliation: false,
+            id: "wf-test".to_string(),
+            name: "Loop".to_string(),
+            description: None,
+            workdir: dir.path().to_string_lossy().to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        };
+        let spec = LoopSpec {
+            id: "spec".to_string(),
+            loop_id: Some(lp.id.clone()),
+            name: "Spec".to_string(),
+            description: Some("task".to_string()),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        let node = LoopNode {
+            id: "node-impl".to_string(),
+            spec_id: Some(spec.id.clone()),
+            loop_id: None,
+            name: "Implementer".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+        let all_nodes = vec!["Architect".to_string(), "Implementer".to_string()];
+
+        let result = render_agent_prompt(
+            &lp,
+            &spec,
+            &node,
+            "See {{output:Architect}}",
+            None,
+            &lp.workdir,
+            "run-1",
+            &HashMap::new(),
+            &all_nodes,
+        );
+
+        assert!(
+            result.is_ok(),
+            "output:NodeName marker must be accepted: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn previous_feedback_still_works_without_named_outputs() {
+        let dir = tempdir().unwrap();
+        let lp = crate::domain::loops::Loop {
+            archived: false,
+            paused_by_reconciliation: false,
+            id: "wf-test".to_string(),
+            name: "Loop".to_string(),
+            description: None,
+            workdir: dir.path().to_string_lossy().to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        };
+        let spec = LoopSpec {
+            id: "spec".to_string(),
+            loop_id: Some(lp.id.clone()),
+            name: "Spec".to_string(),
+            description: Some("task".to_string()),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        let node = LoopNode {
+            id: "node-1".to_string(),
+            spec_id: Some(spec.id.clone()),
+            loop_id: None,
+            name: "Worker".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+
+        let prompt = render_agent_prompt(
+            &lp,
+            &spec,
+            &node,
+            "{{previous_feedback}}",
+            Some(&serde_json::json!({"status": "ok"})),
+            &lp.workdir,
+            "run-1",
+            &HashMap::new(),
+            &[],
+        )
+        .unwrap();
+
+        assert!(
+            prompt.contains("\"status\": \"ok\""),
+            "previous_feedback must still be substituted: {prompt}"
+        );
+    }
+
+    fn setup_prompt_capturing_cli_home() -> tempfile::TempDir {
+        let fake_home = tempfile::tempdir().unwrap();
+        let canopy_dir = fake_home.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        let script = fake_home.path().join("capture-cli.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+CAPTURE_DIR="${CAPTURE_DIR:-/tmp}"
+COUNTER_FILE="${CAPTURE_DIR}/counter"
+COUNTER=$(cat "$COUNTER_FILE" 2>/dev/null || echo 0)
+COUNTER=$((COUNTER + 1))
+echo $COUNTER > "$COUNTER_FILE"
+cat > "${CAPTURE_DIR}/prompt_${COUNTER}"
+echo "NODE_OUTPUT_DATA_${COUNTER}"
+exit 0
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config = crate::domain::canopy_config::CanopyConfig {
+            configured_at: Some(chrono::Utc::now().to_rfc3339()),
+            clis: vec![crate::domain::cli_config::CliConfig {
+                name: "capture-cli".to_string(),
+                binary: script.to_string_lossy().to_string(),
+                headless_mode: "-c".to_string(),
+                model_flag: None,
+                supports_working_dir: false,
+                working_dir_flag: None,
+                env_vars: std::collections::HashMap::new(),
+                interactive_args: None,
+                fallback_interactive_args: None,
+                resume_args: None,
+                session_list_cmd: None,
+                session_resume_cmd: None,
+                accent_color: None,
+                yolo_flag: None,
+                prompt_via_stdin: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        config.save(&canopy_dir).unwrap();
+        fake_home
+    }
+
+    #[tokio::test]
+    async fn execute_spec_retains_outputs_across_multiple_hops() {
+        let fake_home = setup_prompt_capturing_cli_home();
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        let capture_dir = dir.path().join("prompts");
+        std::fs::create_dir_all(&capture_dir).unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-architect".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "Architect".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({
+                "platform": "capture-cli",
+                "prompt_template": "Design the system architecture",
+                "timeout_minutes": 1,
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-tester".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "Tester".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({
+                "platform": "capture-cli",
+                "prompt_template": "Review the design for testability",
+                "timeout_minutes": 1,
+            }),
+            position: 2,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-implementer".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "Implementer".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({
+                "platform": "capture-cli",
+                "prompt_template": "Implement based on this design: {{output:Architect}}",
+                "timeout_minutes": 1,
+            }),
+            position: 3,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        db.insert_loop_edge(&LoopEdge {
+            id: "edge-arch-test".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "node-architect".to_string(),
+            to_node: "node-tester".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Always,
+        })
+        .unwrap();
+
+        db.insert_loop_edge(&LoopEdge {
+            id: "edge-test-impl".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "node-tester".to_string(),
+            to_node: "node-implementer".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Always,
+        })
+        .unwrap();
+
+        let _home = HomeGuard::set(fake_home.path());
+        std::env::set_var("CAPTURE_DIR", capture_dir.to_str().unwrap());
+
+        let result = engine.run_loop(loop_id.clone(), None, None).await;
+        drop(_home);
+        std::env::remove_var("CAPTURE_DIR");
+
+        result.unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Completed);
+
+        let implementer_prompt_path = capture_dir.join("prompt_3");
+        assert!(
+            implementer_prompt_path.exists(),
+            "Implementer's prompt must have been captured (expected prompt_3)"
+        );
+        let implementer_prompt = std::fs::read_to_string(&implementer_prompt_path).unwrap();
+
+        assert!(
+            implementer_prompt.contains("NODE_OUTPUT_DATA_1"),
+            "Implementer's prompt must contain Architect's output (multi-hop retention). \
+             Prompt was: {}",
+            implementer_prompt
+        );
+        assert!(
+            !implementer_prompt.contains("{{output:Architect}}"),
+            "Implementer's prompt must not contain unsubstituted marker"
         );
     }
 }

@@ -409,6 +409,31 @@ pub fn build_import_plan(
         });
     }
 
+    for doc_node in &document.nodes {
+        if let Some(prompt) = doc_node
+            .config
+            .get("prompt_template")
+            .and_then(|v| v.as_str())
+        {
+            let mut rest = prompt;
+            while let Some(start) = rest.find("{{output:") {
+                let after_prefix = &rest[start + 9..];
+                if let Some(end) = after_prefix.find("}}") {
+                    let referenced_name = &after_prefix[..end];
+                    if !name_to_id.contains_key(referenced_name) {
+                        return Err(format!(
+                            "Node '{}' references unknown node '{}' in {{{{output:{}}}}}.",
+                            doc_node.name, referenced_name, referenced_name
+                        ));
+                    }
+                    rest = &after_prefix[end + 2..];
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
     let resolve = |name: &str| -> Result<String, String> {
         name_to_id
             .get(name)
@@ -1359,5 +1384,91 @@ mod tests {
         let err = build_import_plan(&doc, "new-loop").unwrap_err();
         assert!(err.contains("resilience"), "err: {err}");
         assert!(err.to_lowercase().contains("fail"), "err: {err}");
+    }
+
+    #[test]
+    fn build_import_plan_rejects_unknown_node_reference() {
+        let doc = LoopExportDocument {
+            format_version: LOOP_EXPORT_FORMAT_VERSION,
+            name: "test".to_string(),
+            description: None,
+            nodes: vec![LoopExportNode {
+                name: "Worker".to_string(),
+                kind: LoopNodeKind::Agent,
+                config: serde_json::json!({
+                    "platform": "test",
+                    "prompt_template": "See {{output:Nonexistent}}"
+                }),
+                position: 1,
+            }],
+            edges: vec![],
+            ensembles: vec![],
+        };
+        let err = build_import_plan(&doc, "new-loop").unwrap_err();
+        assert!(
+            err.contains("references unknown node 'Nonexistent'"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn build_import_plan_accepts_valid_node_reference() {
+        let doc = LoopExportDocument {
+            format_version: LOOP_EXPORT_FORMAT_VERSION,
+            name: "test".to_string(),
+            description: None,
+            nodes: vec![
+                LoopExportNode {
+                    name: "Architect".to_string(),
+                    kind: LoopNodeKind::Agent,
+                    config: serde_json::json!({"platform": "test"}),
+                    position: 1,
+                },
+                LoopExportNode {
+                    name: "Implementer".to_string(),
+                    kind: LoopNodeKind::Agent,
+                    config: serde_json::json!({
+                        "platform": "test",
+                        "prompt_template": "Follow {{output:Architect}}"
+                    }),
+                    position: 2,
+                },
+                LoopExportNode {
+                    name: "Resilience".to_string(),
+                    kind: LoopNodeKind::Agent,
+                    config: serde_json::json!({"platform": "test"}),
+                    position: 3,
+                },
+            ],
+            edges: vec![
+                LoopExportEdge {
+                    from_node: "Architect".to_string(),
+                    to_node: "Implementer".to_string(),
+                    condition: LoopEdgeCondition::Pass,
+                },
+                LoopExportEdge {
+                    from_node: "Architect".to_string(),
+                    to_node: "Resilience".to_string(),
+                    condition: LoopEdgeCondition::Fail,
+                },
+                LoopExportEdge {
+                    from_node: "Implementer".to_string(),
+                    to_node: "Resilience".to_string(),
+                    condition: LoopEdgeCondition::Pass,
+                },
+                LoopExportEdge {
+                    from_node: "Implementer".to_string(),
+                    to_node: "Resilience".to_string(),
+                    condition: LoopEdgeCondition::Fail,
+                },
+            ],
+            ensembles: vec![],
+        };
+        let result = build_import_plan(&doc, "new-loop");
+        assert!(
+            result.is_ok(),
+            "valid {{output:NodeName}} reference must be accepted: {:?}",
+            result.err()
+        );
     }
 }
