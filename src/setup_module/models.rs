@@ -112,7 +112,7 @@ pub fn is_platform_available(p: &Platform) -> bool {
 /// Handles the `.json` ↔ `.jsonc` ambiguity (e.g. opencode supports both).
 /// Returns the existing file if found, falling back to an alternate extension,
 /// and finally the registry default.
-pub(crate) fn resolve_config_path(home: &Path, config_path: &str) -> std::path::PathBuf {
+pub fn resolve_config_path(home: &Path, config_path: &str) -> std::path::PathBuf {
     let primary = home.join(config_path);
     if primary.exists() {
         return primary;

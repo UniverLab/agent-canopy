@@ -7,8 +7,60 @@ mod setup_module {
         pub cli: Option<crate::domain::cli_config::CliConfig>,
     }
 
+    pub fn strip_jsonc_comments(input: &str) -> String {
+        let mut out = String::with_capacity(input.len());
+        let mut chars = input.chars().peekable();
+        let mut in_string = false;
+
+        while let Some(c) = chars.next() {
+            if in_string {
+                out.push(c);
+                if c == '\\' {
+                    if let Some(&next) = chars.peek() {
+                        out.push(next);
+                        chars.next();
+                    }
+                    continue;
+                }
+                if c == '"' {
+                    in_string = false;
+                }
+            } else {
+                match c {
+                    '"' => {
+                        in_string = true;
+                        out.push(c);
+                    }
+                    '/' => match chars.peek() {
+                        Some('/') => {
+                            for ch in chars.by_ref() {
+                                if ch == '\n' {
+                                    out.push('\n');
+                                    break;
+                                }
+                            }
+                        }
+                        Some('*') => {
+                            chars.next();
+                            while let Some(ch) = chars.next() {
+                                if ch == '*' && chars.peek() == Some(&'/') {
+                                    chars.next();
+                                    break;
+                                }
+                            }
+                        }
+                        _ => out.push('/'),
+                    },
+                    _ => out.push(c),
+                }
+            }
+        }
+        out
+    }
+
     pub mod models {
         use serde::{Deserialize, Serialize};
+        use std::path::Path;
 
         #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
         pub struct Platform {
@@ -42,6 +94,23 @@ mod setup_module {
 
         fn default_command_format() -> String {
             "separate".to_string()
+        }
+
+        pub fn resolve_config_path(home: &Path, config_path: &str) -> std::path::PathBuf {
+            let primary = home.join(config_path);
+            if primary.exists() {
+                return primary;
+            }
+            let ext = primary.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let alternate = match ext {
+                "jsonc" => primary.with_extension("json"),
+                "json" => primary.with_extension("jsonc"),
+                _ => return primary,
+            };
+            if alternate.exists() {
+                return alternate;
+            }
+            primary
         }
     }
 }

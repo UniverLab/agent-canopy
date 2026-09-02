@@ -25,6 +25,8 @@ pub(crate) mod rag_cli;
 pub(crate) mod server;
 pub(crate) mod service_install;
 pub(crate) mod spec_cli;
+pub(crate) mod subagent;
+pub(crate) mod subagent_cli;
 
 pub mod handler;
 

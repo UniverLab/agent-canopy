@@ -594,7 +594,30 @@ impl Database {
             );
 
             CREATE INDEX IF NOT EXISTS idx_last_prompts_workdir_created
-                ON last_prompts(workdir, created_at DESC);",
+                ON last_prompts(workdir, created_at DESC);
+
+            -- CM5: ephemeral subagent runs. Not `agents` (no trigger, no
+            -- schedule, no permanent state) and not `loop_runs` (no spec/graph).
+            -- A row lives only until it is collected or its TTL (`expires_at`)
+            -- passes; the health routine deletes both on its periodic tick.
+            CREATE TABLE IF NOT EXISTS subagent_runs (
+                id TEXT PRIMARY KEY,
+                platform TEXT NOT NULL,
+                model TEXT,
+                prompt TEXT NOT NULL,
+                workdir TEXT NOT NULL,
+                mcp_surface TEXT,
+                status TEXT NOT NULL DEFAULT 'running',
+                exit_code INTEGER,
+                stdout TEXT,
+                stderr TEXT,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                collected_at TEXT,
+                expires_at TEXT NOT NULL,
+                pid INTEGER,
+                boot_id TEXT
+            );",
         )?;
 
         // `workdir` records which project a scheduled send targeted so a
@@ -1250,6 +1273,166 @@ impl Database {
 
         Ok(())
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_subagent_run(
+        &self,
+        id: &str,
+        platform: &str,
+        model: Option<&str>,
+        prompt: &str,
+        workdir: &str,
+        started_at: &str,
+        expires_at: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO subagent_runs (id, platform, model, prompt, workdir, status, started_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, ?7)",
+            rusqlite::params![id, platform, model, prompt, workdir, started_at, expires_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_subagent_run_pid(&self, id: &str, pid: i64, boot_id: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE subagent_runs SET pid = ?1, boot_id = ?2 WHERE id = ?3",
+            rusqlite::params![pid, boot_id, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn complete_subagent_run(
+        &self,
+        id: &str,
+        exit_code: i32,
+        stdout: &str,
+        stderr: &str,
+        mcp_surface: Option<&str>,
+        finished_at: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE subagent_runs SET status = 'finished', exit_code = ?1, stdout = ?2, stderr = ?3, mcp_surface = ?4, finished_at = ?5 WHERE id = ?6",
+            rusqlite::params![exit_code, stdout, stderr, mcp_surface, finished_at, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn fail_subagent_run(
+        &self,
+        id: &str,
+        stderr: &str,
+        mcp_surface: Option<&str>,
+        finished_at: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE subagent_runs SET status = 'failed', stderr = ?1, mcp_surface = ?2, finished_at = ?3 WHERE id = ?4",
+            rusqlite::params![stderr, mcp_surface, finished_at, id],
+        )?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn get_subagent_run(&self, id: &str) -> Result<Option<SubagentRunRecord>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, platform, model, prompt, workdir, mcp_surface, status, exit_code, stdout, stderr, started_at, finished_at, collected_at, expires_at
+             FROM subagent_runs WHERE id = ?1",
+            [id],
+            |row| {
+                Ok(SubagentRunRecord {
+                    id: row.get(0)?,
+                    platform: row.get(1)?,
+                    model: row.get(2)?,
+                    prompt: row.get(3)?,
+                    workdir: row.get(4)?,
+                    mcp_surface: row.get(5)?,
+                    status: row.get(6)?,
+                    exit_code: row.get(7)?,
+                    stdout: row.get(8)?,
+                    stderr: row.get(9)?,
+                    started_at: row.get(10)?,
+                    finished_at: row.get(11)?,
+                    collected_at: row.get(12)?,
+                    expires_at: row.get(13)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn collect_subagent_run(&self, id: &str) -> Result<Option<SubagentRunRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let record = conn
+            .query_row(
+                "SELECT id, platform, model, prompt, workdir, mcp_surface, status, exit_code, stdout, stderr, started_at, finished_at, collected_at, expires_at
+                 FROM subagent_runs WHERE id = ?1",
+                [id],
+                |row| {
+                    Ok(SubagentRunRecord {
+                        id: row.get(0)?,
+                        platform: row.get(1)?,
+                        model: row.get(2)?,
+                        prompt: row.get(3)?,
+                        workdir: row.get(4)?,
+                        mcp_surface: row.get(5)?,
+                        status: row.get(6)?,
+                        exit_code: row.get(7)?,
+                        stdout: row.get(8)?,
+                        stderr: row.get(9)?,
+                        started_at: row.get(10)?,
+                        finished_at: row.get(11)?,
+                        collected_at: row.get(12)?,
+                        expires_at: row.get(13)?,
+                    })
+                },
+            )
+            .optional()?;
+        // Discard the row only once it holds a real result. A collect that
+        // races the still-`running` subagent returns the "running" status but
+        // leaves the row so a later collect can retrieve the actual output;
+        // an abandoned running row is caught by `expire_subagent_runs`.
+        if record
+            .as_ref()
+            .is_some_and(|r| r.status == "finished" || r.status == "failed")
+        {
+            conn.execute("DELETE FROM subagent_runs WHERE id = ?1", [id])?;
+        }
+        Ok(record)
+    }
+
+    pub fn expire_subagent_runs(&self) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let count = conn.execute(
+            "DELETE FROM subagent_runs WHERE collected_at IS NOT NULL OR expires_at < ?1",
+            [now],
+        )?;
+        Ok(count as u64)
+    }
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct SubagentRunRecord {
+    pub id: String,
+    pub platform: String,
+    pub model: Option<String>,
+    pub prompt: String,
+    pub workdir: String,
+    pub mcp_surface: Option<String>,
+    pub status: String,
+    pub exit_code: Option<i32>,
+    pub stdout: Option<String>,
+    pub stderr: Option<String>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub collected_at: Option<String>,
+    pub expires_at: String,
 }
 
 pub mod achievements;

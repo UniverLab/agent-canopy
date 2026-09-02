@@ -41,6 +41,7 @@ use daemon::prompts_cli::{handle_prompts_action, PromptsAction};
 use daemon::rag_cli::{handle_rag_action, RagAction};
 use daemon::server::{run_http_server, run_stdio_server};
 use daemon::spec_cli::{handle_spec_action, SpecAction};
+use daemon::subagent_cli::{handle_subagent_action, SubagentAction};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -155,6 +156,11 @@ enum Commands {
         #[command(subcommand)]
         action: PromptsAction,
     },
+    /// Launch and collect ephemeral subagents.
+    Subagent {
+        #[command(subcommand)]
+        action: SubagentAction,
+    },
     /// Run a stdio sidecar proxy that injects canopy identity headers.
     Bridge {
         /// Agent session ID to bind this bridge process.
@@ -220,6 +226,7 @@ async fn main() -> Result<()> {
             stop_daemon,
         }) => handle_clean_action(dry_run, older_than, hard, yes, no_reclaim, stop_daemon).await,
         Some(Commands::Prompts { action }) => handle_prompts_action(action).await,
+        Some(Commands::Subagent { action }) => handle_subagent_action(action, cli.port).await,
         Some(Commands::Bridge {
             agent_id,
             port,

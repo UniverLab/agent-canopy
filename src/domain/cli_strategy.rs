@@ -247,7 +247,23 @@ impl CliStrategy {
             (Some(flag), Some(id)) => Some((flag, id)),
             _ => None,
         };
-        self.build_headless_command(prompt, model, working_dir, session_arg)
+        self.build_headless_command(prompt, model, working_dir, session_arg, None)
+    }
+
+    /// CM5: build a headless command that points the CLI at a canopy-synthesized
+    /// MCP config file (via the `{{mcp_config}}` invocation-template marker)
+    /// instead of the platform's global config, so an ephemeral subagent only
+    /// sees the MCP surface it was granted. A platform with no
+    /// `invocation_template` has no marker to inject: `mcp_config_path` is then
+    /// inert and the CLI runs with its full global surface (the caller warns).
+    pub fn build_command_with_mcp_config(
+        &self,
+        prompt: &str,
+        model: Option<&str>,
+        working_dir: Option<&str>,
+        mcp_config_path: Option<&str>,
+    ) -> Result<Command> {
+        self.build_headless_command(prompt, model, working_dir, None, mcp_config_path)
     }
 
     /// Build a headless command that RESUMES an existing session by id (RS2).
@@ -270,7 +286,7 @@ impl CliStrategy {
                 self.binary
             )
         })?;
-        self.build_headless_command(prompt, model, working_dir, Some((flag, session_id)))
+        self.build_headless_command(prompt, model, working_dir, Some((flag, session_id)), None)
     }
 
     /// Whether this platform can resume a specific session by id in headless
@@ -377,6 +393,7 @@ impl CliStrategy {
         model: Option<&str>,
         working_dir: Option<&str>,
         session_arg: Option<(&str, &str)>,
+        mcp_config: Option<&str>,
     ) -> Result<Command> {
         let resolved = resolve_binary(&self.binary)?;
         let mut cmd = Command::new(resolved);
@@ -405,7 +422,7 @@ impl CliStrategy {
                 working_dir,
                 session_arg,
                 None, // effort: CB4 will provide this
-                None, // mcp_config: CB3 will provide this
+                mcp_config,
             );
 
             // Headless flags are always prepended (not part of template).
@@ -1574,5 +1591,31 @@ mod tests {
         );
         assert_eq!(argv2, vec!["-p", "hello", "--add-dir", "/proj"]);
         assert!(!argv2.iter().any(|w| w.contains("high")));
+    }
+
+    #[test]
+    fn build_command_with_mcp_config_injects_path() {
+        let template = "-p {{prompt}} --mcp-config {{mcp_config}}";
+        let s = strategy_with_template(template);
+        let argv = s.build_argv_from_template(
+            template,
+            "hello",
+            None,
+            None,
+            None,
+            None,
+            Some("/tmp/mcp.json"),
+        );
+        assert!(argv.contains(&"/tmp/mcp.json".to_string()));
+        assert!(argv.contains(&"--mcp-config".to_string()));
+    }
+
+    #[test]
+    fn build_command_with_mcp_config_none_omits_marker() {
+        let template = "-p {{prompt}} --mcp-config {{mcp_config}}";
+        let s = strategy_with_template(template);
+        let argv = s.build_argv_from_template(template, "hello", None, None, None, None, None);
+        assert!(!argv.iter().any(|w| w.contains("mcp")));
+        assert_eq!(argv, vec!["-p", "hello"]);
     }
 }

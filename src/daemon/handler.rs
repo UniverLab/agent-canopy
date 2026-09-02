@@ -7369,6 +7369,112 @@ impl TaskTriggerHandler {
             let _ = self.db.set_state("gamification:digital_archeologist", "1");
         }
     }
+
+    #[tool(
+        name = "subagent_spawn",
+        description = "Launch an ephemeral subagent. Returns an ID immediately; \
+         use subagent_collect to get the result. The result persists until collected \
+         or until TTL expires. No agent, schedule, or permanent state is registered."
+    )]
+    async fn subagent_spawn(
+        &self,
+        Parameters(params): Parameters<SubagentSpawnParams>,
+        OptionalExtension(parts): OptionalExtension<Parts>,
+    ) -> Result<CallToolResult, McpError> {
+        // Block spawning mid seed-creation interview — but only for a synced
+        // agent caller. The `canopy subagent` CLI reaches this tool through
+        // the daemon with no sync identity, and `reject_if_nursery` would
+        // otherwise hard-fail it on identity resolution alone.
+        if self.resolve_sync_agent_id(parts.as_ref()).is_ok() {
+            self.reject_if_nursery(parts.as_ref())?;
+        }
+
+        let platform = params.cli.as_deref().unwrap_or("opencode");
+        let workdir = params
+            .workdir
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                self.resolve_sync_agent_id(parts.as_ref())
+                    .ok()
+                    .and_then(|agent_id| resolve_effective_project_hash(&self.db, None, &agent_id))
+            })
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .and_then(|p| p.to_str().map(String::from))
+            })
+            .unwrap_or_else(|| "/tmp".to_string());
+
+        let mcp_servers = params.mcp_servers.unwrap_or_default();
+        let timeout_minutes = params.timeout_minutes.unwrap_or(15);
+        let ttl_minutes = params.ttl_minutes.unwrap_or(60);
+
+        let db = Arc::clone(&self.db);
+        let prompt = params.prompt.clone();
+        let model = params.model.clone();
+        let workdir_clone = workdir.clone();
+
+        match crate::daemon::subagent::spawn_subagent(
+            &db,
+            platform,
+            &prompt,
+            model.as_deref(),
+            &workdir_clone,
+            &mcp_servers,
+            timeout_minutes,
+            ttl_minutes,
+        )
+        .await
+        {
+            Ok(id) => {
+                let result = serde_json::json!({
+                    "id": id,
+                    "status": "running",
+                    "handle": id,
+                });
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&result).unwrap_or_default(),
+                )]))
+            }
+            Err(e) => Ok(error_result(&e.to_string())),
+        }
+    }
+
+    #[tool(
+        name = "subagent_collect",
+        description = "Collect the result of an ephemeral subagent. \
+         Returns the result and marks it for cleanup. Returns status='running' \
+         if the subagent hasn't finished yet."
+    )]
+    async fn subagent_collect(
+        &self,
+        Parameters(params): Parameters<SubagentCollectParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = Arc::clone(&self.db);
+        match crate::daemon::subagent::collect_subagent(&db, &params.id) {
+            Ok(Some(result)) => {
+                let json = serde_json::json!({
+                    "id": result.id,
+                    "status": result.status,
+                    "exit_code": result.exit_code,
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                    "mcp_surface": result.mcp_surface,
+                    "platform": result.platform,
+                    "model": result.model,
+                });
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&json).unwrap_or_default(),
+                )]))
+            }
+            Ok(None) => Ok(error_result(&format!(
+                "Subagent run '{}' not found",
+                params.id
+            ))),
+            Err(e) => Ok(error_result(&e.to_string())),
+        }
+    }
 }
 
 /// Resolve `agent_probe`/`loop_preflight`'s `timeout_seconds` param to an

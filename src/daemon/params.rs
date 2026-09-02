@@ -1092,6 +1092,35 @@ pub struct SkillGetParams {
     pub name: String,
 }
 
+// ── Ephemeral subagent tool parameter types ───────────────────────────
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SubagentSpawnParams {
+    /// The instruction for the subagent to execute.
+    pub prompt: String,
+    /// CLI platform to use. Auto-detects if omitted.
+    pub cli: Option<String>,
+    /// Working directory for the subagent. Omit to inherit the caller's:
+    /// the calling agent's project for an MCP call, or the process cwd for
+    /// the `canopy subagent` CLI (which passes it explicitly).
+    pub workdir: Option<String>,
+    /// Optional provider/model string.
+    pub model: Option<String>,
+    /// MCP servers to expose (by name). Empty/omitted = blind (no MCP).
+    /// Include "canopy" to make the canopy server visible.
+    pub mcp_servers: Option<Vec<String>>,
+    /// Timeout in minutes. Default: 15.
+    pub timeout_minutes: Option<u64>,
+    /// TTL in minutes before an uncollected result expires. Default: 60.
+    pub ttl_minutes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SubagentCollectParams {
+    /// The subagent run ID returned by subagent_spawn.
+    pub id: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

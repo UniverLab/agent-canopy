@@ -88,8 +88,25 @@ impl HealthRoutine {
                 _ = cancel.cancelled() => break,
                 _ = tokio::time::sleep(POLL_INTERVAL) => {
                     self.maybe_run().await;
+                    self.expire_subagent_runs().await;
                 }
             }
+        }
+    }
+
+    async fn expire_subagent_runs(&self) {
+        let db = Arc::clone(&self.db);
+        match tokio::task::spawn_blocking(move || db.expire_subagent_runs()).await {
+            Ok(Ok(count)) if count > 0 => {
+                tracing::info!("subagent TTL cleanup: expired {count} run(s)");
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("subagent TTL cleanup: {e}");
+            }
+            Err(e) => {
+                tracing::warn!("subagent TTL cleanup: task panicked: {e}");
+            }
+            _ => {}
         }
     }
 
@@ -415,8 +432,11 @@ mod tests {
         // tests: a valid header first, then bit-flipped page data, so this
         // is in-page corruption rather than a "not a database" error.
         let mut bytes = std::fs::read(&db_path).unwrap();
-        let start = bytes.len() / 2;
-        let end = start + 200.min(bytes.len() - start);
+        // CM5: a fixed offset in page 3 rather than bytes.len()/2 — the
+        // subagent_runs table shifted the file so the midpoint no longer
+        // lands in a page quick_check validates.
+        let start = 8192;
+        let end = (start + 100).min(bytes.len());
         for b in &mut bytes[start..end] {
             *b ^= 0xFF;
         }
@@ -455,8 +475,11 @@ mod tests {
         let temp_path = temp_backup_path(&backup_path);
         db.backup_into(&temp_path).unwrap();
         let mut bytes = std::fs::read(&temp_path).unwrap();
-        let start = bytes.len() / 2;
-        let end = start + 200.min(bytes.len() - start);
+        // CM5: a fixed offset in page 3 rather than bytes.len()/2 — the
+        // subagent_runs table shifted the file so the midpoint no longer
+        // lands in a page quick_check validates.
+        let start = 8192;
+        let end = (start + 100).min(bytes.len());
         for b in &mut bytes[start..end] {
             *b ^= 0xFF;
         }

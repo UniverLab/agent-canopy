@@ -2034,8 +2034,11 @@ mod tests {
         // stomp on page data after every handle is dropped so the file has
         // a valid SQLite header but fails `quick_check`.
         let mut bytes = std::fs::read(&db_path).unwrap();
-        let start = bytes.len() / 2;
-        let end = start + 200.min(bytes.len() - start);
+        // CM5: a fixed offset in page 3 rather than bytes.len()/2 — the
+        // subagent_runs table shifted the file so the midpoint no longer
+        // lands in a page quick_check validates.
+        let start = 8192;
+        let end = (start + 100).min(bytes.len());
         for b in &mut bytes[start..end] {
             *b ^= 0xFF;
         }
@@ -2127,8 +2130,11 @@ mod tests {
             drop(db);
             bytes = std::fs::read(&db_path).unwrap();
         }
-        let start = bytes.len() / 2;
-        let end = start + 200.min(bytes.len() - start);
+        // CM5: a fixed offset in page 3 rather than bytes.len()/2 — the
+        // subagent_runs table shifted the file so the midpoint no longer
+        // lands in a page quick_check validates.
+        let start = 8192;
+        let end = (start + 100).min(bytes.len());
         for b in &mut bytes[start..end] {
             *b ^= 0xFF;
         }

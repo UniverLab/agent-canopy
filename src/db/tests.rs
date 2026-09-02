@@ -5735,3 +5735,96 @@ fn ensemble_kind_migration_is_idempotent_and_pre_migration_db_opens_cleanly() {
     drop(db);
     let _db2 = Database::new(&path).expect("reopen after migration — idempotent");
 }
+
+#[test]
+fn insert_and_collect_subagent_run() {
+    let db = test_db();
+    let now = Utc::now().to_rfc3339();
+    let expires = (Utc::now() + Duration::hours(1)).to_rfc3339();
+    db.insert_subagent_run(
+        "run-1",
+        "opencode",
+        Some("model-x"),
+        "do stuff",
+        "/tmp",
+        &now,
+        &expires,
+    )
+    .unwrap();
+    db.complete_subagent_run("run-1", 0, "hello", "", Some("blind"), &now)
+        .unwrap();
+
+    let record = db.collect_subagent_run("run-1").unwrap();
+    assert!(record.is_some());
+    let r = record.unwrap();
+    assert_eq!(r.id, "run-1");
+    assert_eq!(r.status, "finished");
+    assert_eq!(r.stdout.as_deref(), Some("hello"));
+
+    let second = db.collect_subagent_run("run-1").unwrap();
+    assert!(second.is_none(), "row must be deleted after collection");
+}
+
+#[test]
+fn collect_while_running_does_not_discard_the_result() {
+    let db = test_db();
+    let now = Utc::now().to_rfc3339();
+    let expires = (Utc::now() + Duration::hours(1)).to_rfc3339();
+    db.insert_subagent_run("run-2", "opencode", None, "p", "/tmp", &now, &expires)
+        .unwrap();
+
+    // A poll before the subagent finishes reports "running" but must NOT
+    // delete the row — otherwise the eventual result is lost forever.
+    let early = db.collect_subagent_run("run-2").unwrap().unwrap();
+    assert_eq!(early.status, "running");
+
+    db.complete_subagent_run("run-2", 0, "the answer", "", Some("blind"), &now)
+        .unwrap();
+
+    let collected = db.collect_subagent_run("run-2").unwrap().unwrap();
+    assert_eq!(collected.status, "finished");
+    assert_eq!(collected.stdout.as_deref(), Some("the answer"));
+    assert!(
+        db.collect_subagent_run("run-2").unwrap().is_none(),
+        "row is discarded only after a terminal result is collected"
+    );
+}
+
+#[test]
+fn expire_subagent_runs_deletes_expired() {
+    let db = test_db();
+    let past = (Utc::now() - Duration::hours(1)).to_rfc3339();
+    let now = Utc::now().to_rfc3339();
+    db.insert_subagent_run("run-exp", "opencode", None, "p", "/tmp", &now, &past)
+        .unwrap();
+    let deleted = db.expire_subagent_runs().unwrap();
+    assert_eq!(deleted, 1);
+    assert!(db.get_subagent_run("run-exp").unwrap().is_none());
+}
+
+#[test]
+fn expire_subagent_runs_keeps_unexpired() {
+    let db = test_db();
+    let now = Utc::now().to_rfc3339();
+    let future = (Utc::now() + Duration::hours(1)).to_rfc3339();
+    db.insert_subagent_run("run-keep", "opencode", None, "p", "/tmp", &now, &future)
+        .unwrap();
+    let deleted = db.expire_subagent_runs().unwrap();
+    assert_eq!(deleted, 0);
+    assert!(db.get_subagent_run("run-keep").unwrap().is_some());
+}
+
+#[test]
+fn fail_subagent_run_sets_status() {
+    let db = test_db();
+    let now = Utc::now().to_rfc3339();
+    let expires = (Utc::now() + Duration::hours(1)).to_rfc3339();
+    db.insert_subagent_run("run-fail", "opencode", None, "p", "/tmp", &now, &expires)
+        .unwrap();
+    db.fail_subagent_run("run-fail", "oops", Some("blind"), &now)
+        .unwrap();
+    let record = db.get_subagent_run("run-fail").unwrap().unwrap();
+    assert_eq!(record.status, "failed");
+    assert_eq!(record.stderr.as_deref(), Some("oops"));
+    assert!(record.exit_code.is_none());
+}
