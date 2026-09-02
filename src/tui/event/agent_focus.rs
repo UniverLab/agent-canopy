@@ -909,6 +909,7 @@ mod tests {
             }),
             cli: Cli::new("claude"),
             model: Some("original-model".to_string()),
+            effort: None,
             working_dir: Some("/original/dir".to_string()),
             enabled: true,
             enable_at: None,

@@ -172,6 +172,30 @@ pub struct EffortDeclaration {
     pub values: Vec<String>,
 }
 
+/// The one place the "why `effort = value` won't apply on `platform`" wording
+/// is produced. `None` means it WILL apply. Every surface that reports
+/// non-application — the loop run record, `loop_preflight`, the background
+/// agent log — goes through this so the message can never drift between them
+/// (the CM7 pre-mortem: a notice that says one thing here and another there
+/// is a notice someone stops trusting).
+pub fn effort_rejection_reason(
+    declaration: Option<&EffortDeclaration>,
+    platform: &str,
+    value: &str,
+) -> Option<String> {
+    match declaration {
+        None => Some(format!("platform '{platform}' does not support effort")),
+        Some(d) if d.values.is_empty() => {
+            Some(format!("platform '{platform}' does not support effort"))
+        }
+        Some(d) if d.values.iter().any(|v| v == value) => None,
+        Some(d) => Some(format!(
+            "value '{value}' not in platform's accepted values: [{}]",
+            d.values.join(", ")
+        )),
+    }
+}
+
 fn default_paste_submit_presses() -> u8 {
     1
 }
@@ -726,5 +750,49 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: CliConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.effort_declaration, config.effort_declaration);
+    }
+
+    #[test]
+    fn effort_rejection_reason_none_declaration_is_unsupported() {
+        let r = effort_rejection_reason(None, "opencode", "high");
+        assert_eq!(
+            r.as_deref(),
+            Some("platform 'opencode' does not support effort")
+        );
+    }
+
+    #[test]
+    fn effort_rejection_reason_empty_values_is_unsupported() {
+        let decl = EffortDeclaration {
+            form: Some(String::new()),
+            values: vec![],
+        };
+        let r = effort_rejection_reason(Some(&decl), "cline", "high");
+        assert_eq!(
+            r.as_deref(),
+            Some("platform 'cline' does not support effort")
+        );
+    }
+
+    #[test]
+    fn effort_rejection_reason_none_when_value_accepted() {
+        let decl = EffortDeclaration {
+            form: Some("--effort".to_string()),
+            values: vec!["low".to_string(), "medium".to_string(), "high".to_string()],
+        };
+        assert_eq!(effort_rejection_reason(Some(&decl), "claude", "high"), None);
+    }
+
+    #[test]
+    fn effort_rejection_reason_lists_accepted_values_when_value_rejected() {
+        let decl = EffortDeclaration {
+            form: Some("--effort".to_string()),
+            values: vec!["low".to_string(), "high".to_string()],
+        };
+        let r = effort_rejection_reason(Some(&decl), "claude", "ultra");
+        assert_eq!(
+            r.as_deref(),
+            Some("value 'ultra' not in platform's accepted values: [low, high]")
+        );
     }
 }

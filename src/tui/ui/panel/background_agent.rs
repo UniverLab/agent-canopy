@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
 use ratatui::Frame;
 
-const METADATA_HEIGHT: u16 = 6;
+const METADATA_HEIGHT: u16 = 7;
 const WARN_COLOR: Color = Color::Rgb(255, 193, 7);
 
 pub fn draw_background_agent_panel(
@@ -77,6 +77,10 @@ fn background_agent_metadata_lines(
         Line::from(vec![
             Span::styled("Model:   ", Style::default().fg(theme.dim_text)),
             Span::raw(model),
+        ]),
+        Line::from(vec![
+            Span::styled("Effort:  ", Style::default().fg(theme.dim_text)),
+            Span::raw(agent.effort.as_deref().unwrap_or("-").to_string()),
         ]),
         Line::from(vec![
             Span::styled("Last run:", Style::default().fg(theme.dim_text)),
@@ -161,6 +165,7 @@ mod tests {
             }),
             cli: Cli::new("opencode"),
             model: Some("gpt-5".to_string()),
+            effort: None,
             working_dir: Some("/tmp/project".to_string()),
             enabled: true,
             enable_at: None,
@@ -221,13 +226,19 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect::<String>();
-        let trigger_line = lines[4]
+        let effort_line = lines[3]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        let trigger_line = lines[5]
             .spans
             .iter()
             .map(|s| s.content.as_ref())
             .collect::<String>();
         assert!(cli_line.contains("opencode"));
         assert!(model_line.contains("gpt-5"));
+        assert!(effort_line.contains("Effort"));
         assert!(trigger_line.contains("cron"));
         assert!(trigger_line.contains("*/5 * * * *"));
     }

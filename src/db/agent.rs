@@ -6,7 +6,7 @@ use crate::application::ports::AgentRepository;
 use crate::db::Database;
 use crate::domain::models::{Agent, Cli, CorruptAgent, Trigger};
 
-const AGENT_COLUMNS: &str = "id, prompt, trigger_type, trigger_config, cli, model, working_dir, \
+const AGENT_COLUMNS: &str = "id, prompt, trigger_type, trigger_config, cli, model, effort, working_dir, \
                              enabled, enable_at, created_at, log_path, timeout_minutes, expires_at, last_run_at, \
                              last_run_ok, last_triggered_at, trigger_count";
 
@@ -38,7 +38,7 @@ impl AgentRepository for Database {
             .join(", ");
         conn.execute(
             &format!(
-                "INSERT INTO agents ({AGENT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
+                "INSERT INTO agents ({AGENT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18) \
                  ON CONFLICT(id) DO UPDATE SET {set_clause}"
             ),
             params![
@@ -48,6 +48,7 @@ impl AgentRepository for Database {
                 trigger_config,
                 agent.cli.as_str(),
                 &agent.model,
+                &agent.effort,
                 &agent.working_dir,
                 agent.enabled,
                 agent.enable_at.map(|t| t.to_rfc3339()),
@@ -313,6 +314,7 @@ struct AgentRow {
     trigger_config: Option<String>,
     cli_str: String,
     model: Option<String>,
+    effort: Option<String>,
     working_dir: Option<String>,
     enabled: bool,
     enable_at_str: Option<String>,
@@ -335,17 +337,18 @@ impl AgentRow {
             trigger_config: row.get(3)?,
             cli_str: row.get(4)?,
             model: row.get(5)?,
-            working_dir: row.get(6)?,
-            enabled: row.get(7)?,
-            enable_at_str: row.get(8)?,
-            created_at_str: row.get(9)?,
-            log_path: row.get(10)?,
-            timeout_minutes: row.get(11)?,
-            expires_at_str: row.get(12)?,
-            last_run_at_str: row.get(13)?,
-            last_run_ok: row.get(14)?,
-            last_triggered_at_str: row.get(15)?,
-            trigger_count: row.get(16)?,
+            effort: row.get(6)?,
+            working_dir: row.get(7)?,
+            enabled: row.get(8)?,
+            enable_at_str: row.get(9)?,
+            created_at_str: row.get(10)?,
+            log_path: row.get(11)?,
+            timeout_minutes: row.get(12)?,
+            expires_at_str: row.get(13)?,
+            last_run_at_str: row.get(14)?,
+            last_run_ok: row.get(15)?,
+            last_triggered_at_str: row.get(16)?,
+            trigger_count: row.get(17)?,
         })
     }
 
@@ -386,6 +389,7 @@ impl AgentRow {
             trigger,
             cli,
             model: self.model,
+            effort: self.effort,
             working_dir: self.working_dir,
             enabled: self.enabled,
             enable_at,
@@ -448,6 +452,7 @@ mod tests {
             }),
             cli: Cli::new("opencode"),
             model: None,
+            effort: None,
             working_dir: None,
             enabled: true,
             enable_at: None,

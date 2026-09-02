@@ -49,6 +49,7 @@ pub(crate) const MAX_PROBE_TIMEOUT_SECS: u64 = 120;
 pub(crate) struct ProbeTarget {
     pub platform: String,
     pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 /// What actually happened when a target was invoked. Distinct from a bare
@@ -449,30 +450,37 @@ pub(crate) struct LoopProbeTarget {
 /// return the distinct platform+model pairs they reference. A platform used
 /// by five nodes appears once, with all five names attached.
 pub(crate) fn distinct_targets_for_loop(details: &LoopDetails) -> Vec<LoopProbeTarget> {
-    let mut by_key: HashMap<(String, Option<String>), usize> = HashMap::new();
+    let mut by_key: HashMap<(String, Option<String>, Option<String>), usize> = HashMap::new();
     let mut result: Vec<LoopProbeTarget> = Vec::new();
 
-    let mut record = |platform: Option<&str>, model: Option<&str>, label: String| {
-        let Some(platform) = platform else { return };
-        let key = (platform.to_string(), model.map(str::to_string));
-        if let Some(&idx) = by_key.get(&key) {
-            result[idx].used_by.push(label);
-        } else {
-            by_key.insert(key.clone(), result.len());
-            result.push(LoopProbeTarget {
-                target: ProbeTarget {
-                    platform: key.0,
-                    model: key.1,
-                },
-                used_by: vec![label],
-            });
-        }
-    };
+    let mut record =
+        |platform: Option<&str>, model: Option<&str>, effort: Option<&str>, label: String| {
+            let Some(platform) = platform else { return };
+            let key = (
+                platform.to_string(),
+                model.map(str::to_string),
+                effort.map(str::to_string),
+            );
+            if let Some(&idx) = by_key.get(&key) {
+                result[idx].used_by.push(label);
+            } else {
+                by_key.insert(key.clone(), result.len());
+                result.push(LoopProbeTarget {
+                    target: ProbeTarget {
+                        platform: key.0,
+                        model: key.1,
+                        effort: key.2,
+                    },
+                    used_by: vec![label],
+                });
+            }
+        };
 
     if let Some(hook) = &details.lp.on_completed {
         record(
             Some(hook.platform.as_str()),
             hook.model.as_deref(),
+            hook.effort.as_deref(),
             "on_completed hook".to_string(),
         );
     }
@@ -491,7 +499,8 @@ pub(crate) fn distinct_targets_for_loop(details: &LoopDetails) -> Vec<LoopProbeT
             .or_else(|| node.config.get("cli"))
             .and_then(Value::as_str);
         let model = node.config.get("model").and_then(Value::as_str);
-        record(platform, model, format!("node: {}", node.name));
+        let effort = node.config.get("effort").and_then(Value::as_str);
+        record(platform, model, effort, format!("node: {}", node.name));
     }
 
     result
@@ -551,6 +560,7 @@ mod tests {
         let target = ProbeTarget {
             platform: "ghost-cli".to_string(),
             model: None,
+            effort: None,
         };
         let report = probe_target(&config, &target, None, Duration::from_secs(5)).await;
         assert_eq!(report.outcome, ProbeOutcome::NotConfigured);
@@ -572,6 +582,7 @@ mod tests {
         let target = ProbeTarget {
             platform: "broken-stderr".to_string(),
             model: None,
+            effort: None,
         };
         let report = probe_target(&config, &target, None, Duration::from_secs(5)).await;
         assert_eq!(report.outcome, ProbeOutcome::Broken);
@@ -595,6 +606,7 @@ mod tests {
         let target = ProbeTarget {
             platform: "broken-stdout".to_string(),
             model: None,
+            effort: None,
         };
         let report = probe_target(&config, &target, None, Duration::from_secs(5)).await;
         assert_eq!(report.outcome, ProbeOutcome::Broken);
@@ -622,6 +634,7 @@ mod tests {
         let target = ProbeTarget {
             platform: "healthy".to_string(),
             model: None,
+            effort: None,
         };
         let report = probe_target(&config, &target, None, Duration::from_secs(5)).await;
         assert_eq!(report.outcome, ProbeOutcome::Reachable);
@@ -641,6 +654,7 @@ mod tests {
         let target = ProbeTarget {
             platform: "healthy-model".to_string(),
             model: Some("some-model".to_string()),
+            effort: None,
         };
         let report = probe_target(&config, &target, None, Duration::from_secs(5)).await;
         assert_eq!(report.outcome, ProbeOutcome::Reachable);
@@ -662,6 +676,7 @@ mod tests {
         let target = ProbeTarget {
             platform: "codex-400".to_string(),
             model: Some("gpt-5.6".to_string()),
+            effort: None,
         };
         let report = probe_target(&config, &target, None, Duration::from_secs(5)).await;
         assert_eq!(report.outcome, ProbeOutcome::Broken);
@@ -686,6 +701,7 @@ mod tests {
         let target = ProbeTarget {
             platform: "reject-with-token".to_string(),
             model: Some("gpt-5.6".to_string()),
+            effort: None,
         };
         let report = probe_target(&config, &target, None, Duration::from_secs(5)).await;
         assert_eq!(report.outcome, ProbeOutcome::Broken);
@@ -715,6 +731,7 @@ mod tests {
         let target = ProbeTarget {
             platform: "invalid-request".to_string(),
             model: Some("gpt-5.6".to_string()),
+            effort: None,
         };
         let report = probe_target(&config, &target, None, Duration::from_secs(5)).await;
         assert_eq!(report.outcome, ProbeOutcome::Broken);
@@ -737,6 +754,7 @@ mod tests {
         let target = ProbeTarget {
             platform: "noisy-healthy".to_string(),
             model: Some("gpt-5".to_string()),
+            effort: None,
         };
         let report = probe_target(&config, &target, None, Duration::from_secs(5)).await;
         assert_eq!(report.outcome, ProbeOutcome::Reachable);
@@ -761,6 +779,7 @@ mod tests {
         let target = ProbeTarget {
             platform: "fallback".to_string(),
             model: Some("gpt-5.6".to_string()),
+            effort: None,
         };
         let report = probe_target(&config, &target, None, Duration::from_secs(5)).await;
         assert_eq!(report.outcome, ProbeOutcome::Substituted);
@@ -787,6 +806,7 @@ mod tests {
         let target = ProbeTarget {
             platform: "plain-broken".to_string(),
             model: Some("some-model".to_string()),
+            effort: None,
         };
         let report = probe_target(&config, &target, None, Duration::from_secs(5)).await;
         assert_eq!(report.outcome, ProbeOutcome::Broken);
@@ -808,6 +828,7 @@ mod tests {
         let target = ProbeTarget {
             platform: "no-model-flag".to_string(),
             model: Some("mistral-medium-latest".to_string()),
+            effort: None,
         };
         let report = probe_target(&config, &target, None, Duration::from_secs(5)).await;
         assert_eq!(report.outcome, ProbeOutcome::Unknown);
@@ -827,6 +848,7 @@ mod tests {
         let target = ProbeTarget {
             platform: "no-model-flag-default".to_string(),
             model: None,
+            effort: None,
         };
         let report = probe_target(&config, &target, None, Duration::from_secs(5)).await;
         assert_eq!(report.outcome, ProbeOutcome::Reachable);
@@ -842,6 +864,7 @@ mod tests {
         let target = ProbeTarget {
             platform: "hang".to_string(),
             model: None,
+            effort: None,
         };
         let report = probe_target(&config, &target, None, Duration::from_millis(200)).await;
         assert_eq!(report.outcome, ProbeOutcome::TimedOut);
@@ -854,6 +877,7 @@ mod tests {
         let target = ProbeTarget {
             platform: "missing".to_string(),
             model: None,
+            effort: None,
         };
         let report = probe_target(&config, &target, None, Duration::from_secs(5)).await;
         assert_eq!(report.outcome, ProbeOutcome::SpawnFailed);
@@ -872,6 +896,7 @@ mod tests {
         let target = ProbeTarget {
             platform: "leaky".to_string(),
             model: None,
+            effort: None,
         };
         let report = probe_target(&config, &target, None, Duration::from_secs(5)).await;
         let error = report.error.unwrap();
@@ -904,10 +929,12 @@ mod tests {
             ProbeTarget {
                 platform: "hang-a".to_string(),
                 model: None,
+                effort: None,
             },
             ProbeTarget {
                 platform: "hang-b".to_string(),
                 model: None,
+                effort: None,
             },
         ];
         let timeout = Duration::from_millis(300);
@@ -1003,6 +1030,7 @@ mod tests {
         let hook = crate::domain::loops::LoopCompletionHook {
             platform: "mimo".to_string(),
             model: None,
+            effort: None,
             prompt: "done".to_string(),
             timeout_minutes: None,
         };

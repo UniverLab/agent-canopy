@@ -69,6 +69,9 @@ pub(crate) fn apply_scalar_updates(
     if let Some(model) = params.model.as_ref() {
         agent.model = model.clone();
     }
+    if let Some(effort) = params.effort.as_ref() {
+        agent.effort = effort.clone();
+    }
     if let Some(working_dir) = params.working_dir.as_ref() {
         agent.working_dir = working_dir.clone();
     }
@@ -176,6 +179,7 @@ pub(crate) fn watcher_restart_needed(params: &TaskUpdateParams) -> bool {
         || params.cli.is_some()
         || params.prompt.is_some()
         || params.model.is_some()
+        || params.effort.is_some()
 }
 
 fn validate_cron_schedule(
@@ -274,6 +278,7 @@ pub(crate) fn new_agent_base(
         prompt,
         cli,
         model,
+        effort: None,
         working_dir,
         enabled: true,
         enable_at: None,
@@ -439,6 +444,7 @@ mod tests {
             prompt: None,
             cli: None,
             model: None,
+            effort: None,
             schedule: None,
             working_dir: None,
             duration_minutes: None,
@@ -525,6 +531,7 @@ mod tests {
             trigger: None,
             cli: Cli::new("opencode"),
             model: None,
+            effort: None,
             working_dir: None,
             enabled: true,
             enable_at: None,
@@ -544,6 +551,7 @@ mod tests {
             prompt: Some("new prompt".to_string()),
             cli: None,
             model: None,
+            effort: None,
             schedule: None,
             working_dir: None,
             duration_minutes: None,
@@ -567,6 +575,7 @@ mod tests {
             trigger: None,
             cli: Cli::new("opencode"),
             model: None,
+            effort: None,
             working_dir: None,
             enabled: true,
             enable_at: None,
@@ -586,6 +595,7 @@ mod tests {
             prompt: None,
             cli: None,
             model: None,
+            effort: None,
             schedule: None,
             working_dir: None,
             duration_minutes: None,
@@ -609,6 +619,7 @@ mod tests {
             trigger: None,
             cli: Cli::new("opencode"),
             model: Some("model-1".to_string()),
+            effort: None,
             working_dir: Some("/original".to_string()),
             enabled: true,
             enable_at: None,
@@ -628,6 +639,7 @@ mod tests {
             prompt: None,
             cli: None,
             model: None,
+            effort: None,
             schedule: None,
             working_dir: None,
             duration_minutes: None,
@@ -670,6 +682,7 @@ mod tests {
             schedule: "0 9 * * *".to_string(),
             cli: Some("opencode".to_string()),
             model: None,
+            effort: None,
             duration_minutes: None,
             working_dir: None,
             timeout_minutes: None,
@@ -690,6 +703,7 @@ mod tests {
             schedule: "0 9 * * *".to_string(),
             cli: None,
             model: None,
+            effort: None,
             duration_minutes: None,
             working_dir: None,
             timeout_minutes: None,
@@ -707,6 +721,7 @@ mod tests {
             schedule: "not a cron".to_string(),
             cli: None,
             model: None,
+            effort: None,
             duration_minutes: None,
             working_dir: None,
             timeout_minutes: None,
@@ -725,6 +740,7 @@ mod tests {
             prompt: "Check files".to_string(),
             cli: Some("claude".to_string()),
             model: None,
+            effort: None,
             debounce_seconds: Some(5),
             recursive: Some(true),
             timeout_minutes: None,
@@ -748,6 +764,7 @@ mod tests {
             prompt: "Check files".to_string(),
             cli: Some("opencode".to_string()),
             model: None,
+            effort: None,
             debounce_seconds: None,
             recursive: None,
             timeout_minutes: None,
@@ -767,6 +784,7 @@ mod tests {
             prompt: "Check files".to_string(),
             cli: None,
             model: None,
+            effort: None,
             debounce_seconds: None,
             recursive: None,
             timeout_minutes: None,
@@ -790,6 +808,7 @@ mod tests {
             }),
             cli: Cli::new("opencode"),
             model: None,
+            effort: None,
             working_dir: None,
             enabled: true,
             enable_at: None,
@@ -809,6 +828,7 @@ mod tests {
             prompt: None,
             cli: None,
             model: None,
+            effort: None,
             schedule: Some("30 * * * *".to_string()),
             working_dir: None,
             duration_minutes: None,

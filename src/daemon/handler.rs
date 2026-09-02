@@ -199,10 +199,17 @@ fn build_loop_completion_hook(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let effort = params
+        .effort
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
 
     Ok(crate::domain::loops::LoopCompletionHook {
         platform: platform.to_string(),
         model,
+        effort,
         prompt: prompt.to_string(),
         timeout_minutes: params.timeout_minutes,
     })
@@ -898,6 +905,7 @@ const AGENT_CONFIG_KEYS: &[&str] = &[
     "platform",
     "cli",
     "model",
+    "effort",
     "timeout_minutes",
     "resume",
     "resume_prompt",
@@ -2429,6 +2437,7 @@ impl TaskTriggerHandler {
             params.timeout_minutes,
             log_path,
         );
+        agent.effort = params.effort;
         agent.trigger = Some(Trigger::Cron {
             schedule_expr: prepared.schedule_expr.clone(),
         });
@@ -2479,6 +2488,7 @@ impl TaskTriggerHandler {
             params.timeout_minutes,
             log_path,
         );
+        agent.effort = params.effort;
         agent.trigger = Some(Trigger::Watch {
             path: params.path.clone(),
             events: prepared.events,
@@ -6342,6 +6352,7 @@ impl TaskTriggerHandler {
             Some(platform) => vec![crate::daemon::probe::ProbeTarget {
                 platform: platform.to_string(),
                 model: params.model.clone(),
+                effort: None,
             }],
             None => config
                 .clis
@@ -6349,6 +6360,7 @@ impl TaskTriggerHandler {
                 .map(|cli| crate::daemon::probe::ProbeTarget {
                     platform: cli.name.clone(),
                     model: None,
+                    effort: None,
                 })
                 .collect(),
         };
@@ -6520,8 +6532,39 @@ impl TaskTriggerHandler {
                         "used_by".to_string(),
                         serde_json::json!(loop_target.used_by),
                     );
+                    if let Some(effort) = loop_target.target.effort.as_deref() {
+                        if let Some(reason) = crate::domain::cli_config::effort_rejection_reason(
+                            config
+                                .get_cli(&loop_target.target.platform)
+                                .and_then(|c| c.effort_declaration.as_ref()),
+                            &loop_target.target.platform,
+                            effort,
+                        ) {
+                            map.insert("effort_not_applied".to_string(), serde_json::json!(reason));
+                        }
+                    }
                 }
                 value
+            })
+            .collect();
+
+        let effort_warnings: Vec<serde_json::Value> = loop_targets
+            .iter()
+            .filter_map(|lt| {
+                let effort = lt.target.effort.as_deref()?;
+                let reason = crate::domain::cli_config::effort_rejection_reason(
+                    config
+                        .get_cli(&lt.target.platform)
+                        .and_then(|c| c.effort_declaration.as_ref()),
+                    &lt.target.platform,
+                    effort,
+                )?;
+                Some(serde_json::json!({
+                    "used_by": lt.used_by,
+                    "platform": lt.target.platform,
+                    "effort": effort,
+                    "warning": reason,
+                }))
             })
             .collect();
 
@@ -6533,6 +6576,7 @@ impl TaskTriggerHandler {
                 "would_fail": crate::daemon::probe::would_fail_count(&reports),
                 "unknown": crate::daemon::probe::unknown_count(&reports),
                 "probes": probes,
+                "effort_warnings": effort_warnings,
             }))
             .unwrap_or_default(),
         )]))
@@ -11364,6 +11408,7 @@ mod tests {
         let params = LoopCompletionHookParams {
             platform: "".to_string(),
             model: None,
+            effort: None,
             prompt: "run tests".to_string(),
             timeout_minutes: None,
         };
@@ -11376,6 +11421,7 @@ mod tests {
         let params = LoopCompletionHookParams {
             platform: "   ".to_string(),
             model: None,
+            effort: None,
             prompt: "run tests".to_string(),
             timeout_minutes: None,
         };
@@ -11388,6 +11434,7 @@ mod tests {
         let params = LoopCompletionHookParams {
             platform: "claude".to_string(),
             model: None,
+            effort: None,
             prompt: "".to_string(),
             timeout_minutes: None,
         };
@@ -11400,6 +11447,7 @@ mod tests {
         let params = LoopCompletionHookParams {
             platform: "claude".to_string(),
             model: None,
+            effort: None,
             prompt: "  \t  ".to_string(),
             timeout_minutes: None,
         };
@@ -11412,6 +11460,7 @@ mod tests {
         let params = LoopCompletionHookParams {
             platform: "claude".to_string(),
             model: Some("opus-4".to_string()),
+            effort: None,
             prompt: "{{loop_name}} completed".to_string(),
             timeout_minutes: Some(10),
         };
@@ -11427,6 +11476,7 @@ mod tests {
         let params = LoopCompletionHookParams {
             platform: "  claude  ".to_string(),
             model: Some("  opus  ".to_string()),
+            effort: None,
             prompt: "  test  ".to_string(),
             timeout_minutes: None,
         };
@@ -11441,6 +11491,7 @@ mod tests {
         let params = LoopCompletionHookParams {
             platform: "claude".to_string(),
             model: Some("  ".to_string()),
+            effort: None,
             prompt: "test".to_string(),
             timeout_minutes: None,
         };
@@ -12784,6 +12835,7 @@ mod additional_tests {
         let params = LoopCompletionHookParams {
             platform: "claude".to_string(),
             model: None,
+            effort: None,
             prompt: "test".to_string(),
             timeout_minutes: None,
         };
@@ -12796,6 +12848,7 @@ mod additional_tests {
         let params = LoopCompletionHookParams {
             platform: "mimo".to_string(),
             model: None,
+            effort: None,
             prompt: "do stuff".to_string(),
             timeout_minutes: Some(45),
         };
@@ -13775,6 +13828,7 @@ mod coverage_tests {
             trigger: None,
             cli: Cli("opencode".to_string()),
             model: None,
+            effort: None,
             working_dir: None,
             enabled: true,
             enable_at: None,
@@ -14258,6 +14312,7 @@ mod coverage_tests {
         let hook = LoopCompletionHook {
             platform: "claude".into(),
             model: Some("opus-4".into()),
+            effort: None,
             prompt: "{{loop_name}} done".into(),
             timeout_minutes: Some(10),
         };
@@ -14272,6 +14327,7 @@ mod coverage_tests {
         let hook = LoopCompletionHook {
             platform: "mimo".into(),
             model: None,
+            effort: None,
             prompt: "t".into(),
             timeout_minutes: None,
         };
@@ -15255,6 +15311,7 @@ mod endpoint_tests {
                 schedule: "*/5 * * * *".to_string(),
                 cli: Some("opencode".to_string()),
                 model: None,
+                effort: None,
                 duration_minutes: None,
                 working_dir: None,
                 timeout_minutes: None,
@@ -15281,6 +15338,7 @@ mod endpoint_tests {
                 schedule: "not a cron expr!".to_string(),
                 cli: Some("opencode".to_string()),
                 model: None,
+                effort: None,
                 duration_minutes: None,
                 working_dir: None,
                 timeout_minutes: None,
@@ -15306,6 +15364,7 @@ mod endpoint_tests {
                 schedule: "*/5 * * * *".to_string(),
                 cli: Some("opencode".to_string()),
                 model: None,
+                effort: None,
                 duration_minutes: None,
                 working_dir: None,
                 timeout_minutes: None,
@@ -15333,6 +15392,7 @@ mod endpoint_tests {
                 prompt: "react to changes".to_string(),
                 cli: Some("opencode".to_string()),
                 model: None,
+                effort: None,
                 debounce_seconds: None,
                 recursive: Some(true),
                 timeout_minutes: None,
@@ -15359,6 +15419,7 @@ mod endpoint_tests {
                 prompt: "react to changes".to_string(),
                 cli: Some("opencode".to_string()),
                 model: None,
+                effort: None,
                 debounce_seconds: None,
                 recursive: None,
                 timeout_minutes: None,
@@ -15385,6 +15446,7 @@ mod endpoint_tests {
                 prompt: "react to changes".to_string(),
                 cli: Some("opencode".to_string()),
                 model: None,
+                effort: None,
                 debounce_seconds: None,
                 recursive: None,
                 timeout_minutes: None,
@@ -15404,6 +15466,7 @@ mod endpoint_tests {
             trigger,
             cli: Cli::new("opencode"),
             model: None,
+            effort: None,
             working_dir: None,
             enabled: true,
             enable_at: None,
@@ -15896,6 +15959,7 @@ mod endpoint_tests {
                 prompt: Some("updated prompt".to_string()),
                 cli: None,
                 model: None,
+                effort: None,
                 schedule: None,
                 working_dir: None,
                 duration_minutes: None,
@@ -15928,6 +15992,7 @@ mod endpoint_tests {
                 prompt: None,
                 cli: None,
                 model: None,
+                effort: None,
                 schedule: None,
                 working_dir: None,
                 duration_minutes: None,
@@ -15959,6 +16024,7 @@ mod endpoint_tests {
                 prompt: None,
                 cli: None,
                 model: None,
+                effort: None,
                 schedule: None,
                 working_dir: None,
                 duration_minutes: None,

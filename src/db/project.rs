@@ -1235,6 +1235,7 @@ mod tests {
             trigger: None,
             cli: crate::domain::models::Cli::new("opencode"),
             model: None,
+            effort: None,
             working_dir: Some(workdir.to_string()),
             enabled: true,
             enable_at: None,

@@ -607,6 +607,7 @@ pub struct Loop {
 pub struct LoopCompletionHook {
     pub platform: String,
     pub model: Option<String>,
+    pub effort: Option<String>,
     pub prompt: String,
     pub timeout_minutes: Option<u64>,
 }

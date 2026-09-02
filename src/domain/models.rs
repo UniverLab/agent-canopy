@@ -72,6 +72,7 @@ pub struct Agent {
     pub trigger: Option<Trigger>,
     pub cli: Cli,
     pub model: Option<String>,
+    pub effort: Option<String>,
     pub working_dir: Option<String>,
     pub enabled: bool,
     /// One-shot scheduled enable time. When set and `enabled` is `false`,

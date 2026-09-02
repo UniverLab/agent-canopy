@@ -700,6 +700,11 @@ impl App {
             }),
             cli,
             model,
+            effort: if dialog.effort.trim().is_empty() {
+                None
+            } else {
+                Some(dialog.effort.clone())
+            },
             working_dir: Some(working_dir),
             enabled: true,
             enable_at: None,
@@ -746,6 +751,11 @@ impl App {
             }),
             cli,
             model,
+            effort: if dialog.effort.trim().is_empty() {
+                None
+            } else {
+                Some(dialog.effort.clone())
+            },
             working_dir: None,
             enabled: true,
             enable_at: None,
@@ -860,6 +870,7 @@ fn populate_dialog_from_agent(dialog: &mut NewAgentDialog, a: &crate::domain::mo
     dialog.prompt_cursor = a.prompt.chars().count();
     dialog.prompt_scroll = 0;
     dialog.model = a.model.clone().unwrap_or_default();
+    dialog.effort = a.effort.clone().unwrap_or_default();
     dialog.working_dir = a.working_dir.clone().unwrap_or_default();
     dialog.field = 2;
 
@@ -925,6 +936,7 @@ mod tests {
             }),
             cli: Cli::new("claude"),
             model: Some("original-model".to_string()),
+            effort: None,
             working_dir: Some("/original/dir".to_string()),
             enabled: true,
             enable_at: None,
@@ -951,6 +963,7 @@ mod tests {
             }),
             cli: Cli::new("claude"),
             model: Some("original-model".to_string()),
+            effort: None,
             working_dir: None,
             enabled: true,
             enable_at: None,

@@ -442,6 +442,7 @@ mod formatting_unit_tests {
             trigger: None,
             cli: Cli("opencode".to_string()),
             model: None,
+            effort: None,
             working_dir: None,
             enabled: true,
             enable_at: None,

@@ -1436,6 +1436,7 @@ mod tests {
             }),
             cli: Cli::new("opencode"),
             model: None,
+            effort: None,
             working_dir: None,
             enabled: true,
             enable_at: None,

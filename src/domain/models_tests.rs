@@ -9,6 +9,7 @@ fn sample_agent(id: &str, trigger: Option<Trigger>) -> Agent {
         trigger,
         cli: Cli::new("opencode"),
         model: None,
+        effort: None,
         working_dir: Some("/tmp/project".to_string()),
         enabled: true,
         enable_at: None,

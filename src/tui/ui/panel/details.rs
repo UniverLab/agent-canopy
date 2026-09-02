@@ -206,6 +206,13 @@ pub fn draw_agent_details(frame: &mut Frame, area: Rect, agent: &Agent, app: &Ap
         ]));
     }
 
+    if let Some(ref effort) = agent.effort {
+        lines.push(Line::from(vec![
+            Span::styled("Effort:  ", Style::default().fg(theme.dim_text)),
+            Span::raw(effort),
+        ]));
+    }
+
     if let Some(ref dir) = agent.working_dir {
         lines.push(Line::from(vec![
             Span::styled("Dir:     ", Style::default().fg(theme.dim_text)),

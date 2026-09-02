@@ -201,6 +201,7 @@ impl Database {
                 trigger_config TEXT,
                 cli TEXT NOT NULL,
                 model TEXT,
+                effort TEXT,
                 working_dir TEXT,
                 enabled BOOLEAN NOT NULL DEFAULT 1,
                 enable_at TEXT,
@@ -756,6 +757,18 @@ impl Database {
                 [],
             )
             .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        let has_effort: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('agents') WHERE name = 'effort'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_effort {
+            conn.execute("ALTER TABLE agents ADD COLUMN effort TEXT", [])
+                .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
         }
 
         // Loops gained optional cron/watch triggers; older databases predate the

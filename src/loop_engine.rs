@@ -732,6 +732,7 @@ impl LoopEngine {
                             &strategy,
                             &prompt,
                             hook.model.as_deref(),
+                            hook.effort.as_deref(),
                             workdir,
                             timeout_minutes,
                         )
@@ -3492,6 +3493,7 @@ async fn execute_agent_node(
         .ok_or_else(|| anyhow!("Agent node '{}' is missing a platform/cli.", node.name))?;
     let cli = Cli::resolve(Some(cli_name)).map_err(anyhow::Error::msg)?;
     let model = node.config.get("model").and_then(Value::as_str);
+    let effort = node.config.get("effort").and_then(Value::as_str);
     let timeout_minutes = node
         .config
         .get("timeout_minutes")
@@ -3555,6 +3557,7 @@ async fn execute_agent_node(
                 node,
                 &resume_prompt,
                 model,
+                effort,
                 workdir,
                 timeout_minutes,
                 Some(sid),
@@ -3634,6 +3637,7 @@ async fn execute_agent_node(
         node,
         &prompt,
         model,
+        effort,
         workdir,
         timeout_minutes,
         None,
@@ -3737,6 +3741,7 @@ async fn spawn_and_wait_cli_process(
     strategy: &crate::domain::cli_strategy::CliStrategy,
     prompt: &str,
     model: Option<&str>,
+    effort: Option<&str>,
     workdir: &str,
     timeout_minutes: u64,
     session_id: Option<&str>,
@@ -3752,7 +3757,7 @@ async fn spawn_and_wait_cli_process(
             .build_resume_command(sid, prompt, model, Some(workdir))
             .map_err(|error| SpawnError::from_build(&error))?,
         None => strategy
-            .build_command_with_session(prompt, model, Some(workdir), session_id)
+            .build_command_with_session(prompt, model, Some(workdir), session_id, effort)
             .map_err(|error| SpawnError::from_build(&error))?,
     };
     // Only appended when the caller opted in (per node.config["trust_workdir"])
@@ -3811,6 +3816,20 @@ async fn spawn_and_wait_cli_process(
 /// it exceeds `infra_crash_max_seconds` by definition, so it's always a
 /// semantic fail routed through the fail edge like any other, never an
 /// infra-crash retry.
+fn effort_notice(
+    platform: &str,
+    strategy: &crate::domain::cli_strategy::CliStrategy,
+    effort: Option<&str>,
+) -> Option<serde_json::Value> {
+    let effort = effort?;
+    crate::domain::cli_config::effort_rejection_reason(
+        strategy.effort_declaration.as_ref(),
+        platform,
+        effort,
+    )
+    .map(serde_json::Value::from)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_process(
     db: &Database,
@@ -3820,6 +3839,7 @@ async fn run_agent_process(
     node: &LoopNode,
     prompt: &str,
     model: Option<&str>,
+    effort: Option<&str>,
     workdir: &str,
     timeout_minutes: u64,
     resume_session_id: Option<&str>,
@@ -3871,10 +3891,12 @@ async fn run_agent_process(
         .get("trust_workdir")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let effort_not_applied = effort_notice(cli.as_str(), strategy, effort);
     let outcome = spawn_and_wait_cli_process(
         strategy,
         prompt,
         model,
+        effort,
         workdir,
         timeout_minutes,
         session_id.as_deref(),
@@ -3898,9 +3920,24 @@ async fn run_agent_process(
     }
 
     match outcome {
-        Err(error) => Ok(agent_spawn_failure(node, cli, model, &error)),
+        Err(error) => {
+            let mut exec = agent_spawn_failure(node, cli, model, &error);
+            if let Some(notice) = &effort_not_applied {
+                if let serde_json::Value::Object(map) = &mut exec.output {
+                    map.insert("effort_not_applied".to_string(), notice.clone());
+                }
+            } else if let Some(e) = effort {
+                if let serde_json::Value::Object(map) = &mut exec.output {
+                    map.insert(
+                        "effort_applied".to_string(),
+                        serde_json::Value::String(e.to_string()),
+                    );
+                }
+            }
+            Ok(exec)
+        }
         Ok(CliProcessOutcome::TimedOut) => {
-            let output = serde_json::json!({
+            let mut output = serde_json::json!({
                 "kind": "agent",
                 "node_id": node.id,
                 "cli": cli.as_str(),
@@ -3909,6 +3946,18 @@ async fn run_agent_process(
                 "timeout_minutes": timeout_minutes,
                 "prompt_source": agent_prompt_source(&node.config),
             });
+            if let Some(notice) = &effort_not_applied {
+                if let serde_json::Value::Object(map) = &mut output {
+                    map.insert("effort_not_applied".to_string(), notice.clone());
+                }
+            } else if let Some(e) = effort {
+                if let serde_json::Value::Object(map) = &mut output {
+                    map.insert(
+                        "effort_applied".to_string(),
+                        serde_json::Value::String(e.to_string()),
+                    );
+                }
+            }
             let _ = db.update_loop_run_result(
                 run_id,
                 LoopRunStatus::Fail,
@@ -3937,7 +3986,7 @@ async fn run_agent_process(
             // than re-deriving it.
             let run = db.get_loop_run(run_id)?;
             let self_reported = self_reported_execution(run.as_ref(), node).is_some();
-            Ok(agent_finished_execution(
+            let mut exec = agent_finished_execution(
                 node,
                 cli,
                 model,
@@ -3945,7 +3994,20 @@ async fn run_agent_process(
                 &stdout,
                 &stderr,
                 self_reported,
-            ))
+            );
+            if let Some(notice) = &effort_not_applied {
+                if let serde_json::Value::Object(map) = &mut exec.output {
+                    map.insert("effort_not_applied".to_string(), notice.clone());
+                }
+            } else if let Some(e) = effort {
+                if let serde_json::Value::Object(map) = &mut exec.output {
+                    map.insert(
+                        "effort_applied".to_string(),
+                        serde_json::Value::String(e.to_string()),
+                    );
+                }
+            }
+            Ok(exec)
         }
     }
 }
@@ -4296,6 +4358,7 @@ async fn execute_router_node(
         node,
         &prompt,
         model,
+        None,
         workdir,
         timeout_minutes,
         None,
@@ -4470,6 +4533,7 @@ async fn run_completion_hook_process(
     strategy: &crate::domain::cli_strategy::CliStrategy,
     prompt: &str,
     model: Option<&str>,
+    effort: Option<&str>,
     workdir: &str,
     timeout_minutes: u64,
 ) -> HookExecution {
@@ -4477,6 +4541,7 @@ async fn run_completion_hook_process(
         strategy,
         prompt,
         model,
+        effort,
         workdir,
         timeout_minutes,
         None,
@@ -7803,6 +7868,7 @@ mod tests {
             session_resume_cmd: None,
             trust_flag: None,
             invocation_template: None,
+            effort_declaration: None,
         }
     }
 
@@ -7843,7 +7909,7 @@ mod tests {
         strategy.session_id_set_flag = Some("--session-id".to_string());
 
         run_agent_process(
-            &db, "run-sid", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+            &db, "run-sid", &cli, &strategy, &node, "prompt", None, None, "/tmp", 1, None,
         )
         .await
         .unwrap();
@@ -7869,6 +7935,7 @@ mod tests {
             &strategy,
             &node,
             "prompt",
+            None,
             None,
             "/tmp",
             1,
@@ -7946,6 +8013,7 @@ esac
             session_resume_cmd: None,
             trust_flag: None,
             invocation_template: None,
+            effort_declaration: None,
         }
     }
 
@@ -7965,7 +8033,7 @@ esac
         let cli = Cli::new("fake");
 
         let execution = run_agent_process(
-            &db, "run-cap", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+            &db, "run-cap", &cli, &strategy, &node, "prompt", None, None, "/tmp", 1, None,
         )
         .await
         .unwrap();
@@ -8001,6 +8069,7 @@ esac
             &strategy,
             &node,
             "prompt",
+            None,
             None,
             "/tmp",
             1,
@@ -8042,6 +8111,7 @@ esac
             &strategy,
             &node,
             "prompt",
+            None,
             None,
             "/tmp",
             1,
@@ -8085,6 +8155,7 @@ esac
             &strategy,
             &node,
             "prompt",
+            None,
             None,
             "/tmp",
             1,
@@ -8814,7 +8885,7 @@ echo done
         let node = sample_agent_node();
 
         let execution = run_agent_process(
-            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, None, "/tmp", 1, None,
         )
         .await
         .expect("spawn failure must not propagate as a hard error");
@@ -8842,7 +8913,7 @@ echo done
         let node = sample_agent_node();
 
         let execution = run_agent_process(
-            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, None, "/tmp", 1, None,
         )
         .await
         .unwrap();
@@ -8903,6 +8974,84 @@ echo done
         );
     }
 
+    /// CM7 pre-mortem guard: an `effort` the platform can't honour must land
+    /// in the run record, not vanish. `sample_strategy` has no
+    /// `effort_declaration`, so any effort is "not supported".
+    #[tokio::test]
+    async fn run_agent_process_records_effort_not_applied_when_unsupported() {
+        let (dir, db) = test_db();
+        let cli = Cli::new("test-cli");
+        let script = write_member_script(dir.path(), "ok.sh", "printf ok");
+        let strategy = sample_strategy(&script);
+        let node = sample_agent_node();
+
+        let execution = run_agent_process(
+            &db,
+            "run-effort",
+            &cli,
+            &strategy,
+            &node,
+            "prompt",
+            None,
+            Some("high"),
+            "/tmp",
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            execution
+                .output
+                .get("effort_not_applied")
+                .and_then(Value::as_str),
+            Some("platform 'test-cli' does not support effort"),
+            "the non-application notice must be in the run record"
+        );
+        assert!(execution.output.get("effort_applied").is_none());
+    }
+
+    /// The mirror: when the platform accepts the value, the run record says so
+    /// and carries no non-application notice.
+    #[tokio::test]
+    async fn run_agent_process_records_effort_applied_when_supported() {
+        let (dir, db) = test_db();
+        let cli = Cli::new("test-cli");
+        let script = write_member_script(dir.path(), "ok.sh", "printf ok");
+        let mut strategy = sample_strategy(&script);
+        strategy.effort_declaration = Some(crate::domain::cli_config::EffortDeclaration {
+            form: Some("--effort".to_string()),
+            values: vec!["low".to_string(), "high".to_string()],
+        });
+        let node = sample_agent_node();
+
+        let execution = run_agent_process(
+            &db,
+            "run-effort-ok",
+            &cli,
+            &strategy,
+            &node,
+            "prompt",
+            None,
+            Some("high"),
+            "/tmp",
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            execution
+                .output
+                .get("effort_applied")
+                .and_then(Value::as_str),
+            Some("high")
+        );
+        assert!(execution.output.get("effort_not_applied").is_none());
+    }
+
     /// C3: the 2026-08-13 `gitkit-composition` incident, reproduced with the
     /// stderr the harness actually printed — exit 0, empty stdout, and a
     /// warning that the workdir was untrusted so `.agents/` (MCP config) was
@@ -8927,7 +9076,7 @@ echo done
         let node = sample_agent_node();
 
         let execution = run_agent_process(
-            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, None, "/tmp", 1, None,
         )
         .await
         .unwrap();
@@ -8976,7 +9125,7 @@ echo done
         let node = sample_agent_node();
 
         let execution = run_agent_process(
-            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, None, "/tmp", 1, None,
         )
         .await
         .unwrap();
@@ -9009,7 +9158,7 @@ echo done
         let node = sample_agent_node();
 
         let execution = run_agent_process(
-            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, None, "/tmp", 1, None,
         )
         .await
         .unwrap();
@@ -9042,7 +9191,7 @@ echo done
         node.config = serde_json::json!({"trust_workdir": true});
 
         run_agent_process(
-            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, None, "/tmp", 1, None,
         )
         .await
         .unwrap();
@@ -9072,7 +9221,7 @@ echo done
         node.config = serde_json::json!({"trust_workdir": true});
 
         run_agent_process(
-            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, None, "/tmp", 1, None,
         )
         .await
         .unwrap();
@@ -9102,7 +9251,7 @@ echo done
         let node = sample_agent_node(); // config: {} — no trust_workdir opt-in
 
         run_agent_process(
-            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, None, "/tmp", 1, None,
         )
         .await
         .unwrap();
@@ -9127,7 +9276,7 @@ echo done
         let node = sample_agent_node();
 
         let execution = run_agent_process(
-            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, None, "/tmp", 1, None,
         )
         .await
         .unwrap();
@@ -9154,7 +9303,7 @@ echo done
         let node = sample_agent_node();
 
         let execution = run_agent_process(
-            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, None, "/tmp", 1, None,
         )
         .await
         .unwrap();
@@ -9330,7 +9479,7 @@ echo done
         node.config = serde_json::json!({ "require_report": true });
 
         let execution = run_agent_process(
-            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, None, "/tmp", 1, None,
         )
         .await
         .unwrap();
@@ -9385,7 +9534,7 @@ echo done
         let node = sample_agent_node();
 
         let execution = run_agent_process(
-            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, None, "/tmp", 1, None,
         )
         .await
         .expect("spawn failure must not propagate as a hard error");
@@ -9443,7 +9592,7 @@ echo done
         let node = sample_agent_node();
 
         let execution = run_agent_process(
-            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, None, "/tmp", 1, None,
         )
         .await
         .expect("spawn failure must not propagate as a hard error");
@@ -9580,6 +9729,7 @@ echo done
             &node,
             &huge_prompt,
             None,
+            None,
             "/tmp",
             1,
             None,
@@ -9624,6 +9774,7 @@ echo done
             &strategy,
             &node,
             &large_prompt,
+            None,
             None,
             "/tmp",
             1,
@@ -10844,7 +10995,7 @@ echo done
         let node = sample_agent_node();
 
         let execution = run_agent_process(
-            &db, "run-test", &cli, &strategy, &node, "prompt", None, "/tmp", 1, None,
+            &db, "run-test", &cli, &strategy, &node, "prompt", None, None, "/tmp", 1, None,
         )
         .await
         .expect("spawn failure must not propagate as a hard error");
@@ -10972,6 +11123,7 @@ echo done
             &stdin_node,
             &prompt,
             None,
+            None,
             "/tmp",
             1,
             None,
@@ -10995,6 +11147,7 @@ echo done
             &fail_strategy,
             &stdin_node,
             &prompt,
+            None,
             None,
             "/tmp",
             1,
@@ -12112,7 +12265,7 @@ echo done
         let prompt = format!("sleep 5; touch \"{}\"", marker.display());
 
         let result = run_agent_process(
-            &db, &run_id, &cli, &strategy, &node, &prompt, None, "/tmp", 0, None,
+            &db, &run_id, &cli, &strategy, &node, &prompt, None, None, "/tmp", 0, None,
         )
         .await;
         // B28: a timeout resolves as a failed `NodeExecution`, not a hard
@@ -12675,6 +12828,7 @@ echo done
         let hook = crate::domain::loops::LoopCompletionHook {
             platform: "test-cli".to_string(),
             model: None,
+            effort: None,
             prompt: format!("touch \"{}\"", marker_path),
             timeout_minutes: Some(1),
         };
@@ -12725,6 +12879,7 @@ echo done
         let hook = crate::domain::loops::LoopCompletionHook {
             platform: "test-cli".to_string(),
             model: None,
+            effort: None,
             prompt: format!("touch \"{}\"", marker_path),
             timeout_minutes: Some(1),
         };
@@ -12774,6 +12929,7 @@ echo done
         let hook = crate::domain::loops::LoopCompletionHook {
             platform: "test-cli".to_string(),
             model: None,
+            effort: None,
             prompt: format!("echo fire >> \"{}\"", marker_path),
             timeout_minutes: Some(1),
         };
@@ -13118,6 +13274,7 @@ echo done
         let hook = crate::domain::loops::LoopCompletionHook {
             platform: "test-cli".to_string(),
             model: None,
+            effort: None,
             prompt: format!("touch \"{}\"", marker_path),
             timeout_minutes: Some(1),
         };
@@ -13169,6 +13326,7 @@ echo done
         let hook = crate::domain::loops::LoopCompletionHook {
             platform: "test-cli".to_string(),
             model: None,
+            effort: None,
             prompt: format!("touch \"{}\"", marker_path),
             timeout_minutes: Some(1),
         };
@@ -13296,6 +13454,7 @@ echo done
         let hook = crate::domain::loops::LoopCompletionHook {
             platform: "test-cli".to_string(),
             model: None,
+            effort: None,
             prompt: "exit 1".to_string(),
             timeout_minutes: Some(1),
         };

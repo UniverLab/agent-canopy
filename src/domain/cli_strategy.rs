@@ -64,6 +64,7 @@ pub struct CliStrategy {
     pub trust_flag: Option<String>,
     /// Declarative argv template. See [`CliConfig::invocation_template`].
     pub invocation_template: Option<String>,
+    pub effort_declaration: Option<super::cli_config::EffortDeclaration>,
 }
 
 /// A CLI's configured `binary` could not be resolved to an executable.
@@ -200,6 +201,7 @@ impl CliStrategy {
             session_resume_cmd: cli_config.session_resume_cmd.clone(),
             trust_flag: cli_config.trust_flag.clone(),
             invocation_template: cli_config.invocation_template.clone(),
+            effort_declaration: cli_config.effort_declaration.clone(),
         }
     }
 
@@ -225,7 +227,7 @@ impl CliStrategy {
         model: Option<&str>,
         working_dir: Option<&str>,
     ) -> Result<Command> {
-        self.build_command_with_session(prompt, model, working_dir, None)
+        self.build_command_with_session(prompt, model, working_dir, None, None)
     }
 
     /// [`build_command`], additionally injecting a caller-chosen session id
@@ -240,6 +242,7 @@ impl CliStrategy {
         model: Option<&str>,
         working_dir: Option<&str>,
         session_id: Option<&str>,
+        effort: Option<&str>,
     ) -> Result<Command> {
         // Cold start: inject the set-at-spawn flag + id only when both the
         // registry flag and a caller-minted id exist.
@@ -247,7 +250,7 @@ impl CliStrategy {
             (Some(flag), Some(id)) => Some((flag, id)),
             _ => None,
         };
-        self.build_headless_command(prompt, model, working_dir, session_arg, None)
+        self.build_headless_command(prompt, model, working_dir, session_arg, None, effort)
     }
 
     /// CM5: build a headless command that points the CLI at a canopy-synthesized
@@ -263,7 +266,7 @@ impl CliStrategy {
         working_dir: Option<&str>,
         mcp_config_path: Option<&str>,
     ) -> Result<Command> {
-        self.build_headless_command(prompt, model, working_dir, None, mcp_config_path)
+        self.build_headless_command(prompt, model, working_dir, None, mcp_config_path, None)
     }
 
     /// Build a headless command that RESUMES an existing session by id (RS2).
@@ -286,7 +289,14 @@ impl CliStrategy {
                 self.binary
             )
         })?;
-        self.build_headless_command(prompt, model, working_dir, Some((flag, session_id)), None)
+        self.build_headless_command(
+            prompt,
+            model,
+            working_dir,
+            Some((flag, session_id)),
+            None,
+            None,
+        )
     }
 
     /// Whether this platform can resume a specific session by id in headless
@@ -394,6 +404,7 @@ impl CliStrategy {
         working_dir: Option<&str>,
         session_arg: Option<(&str, &str)>,
         mcp_config: Option<&str>,
+        effort: Option<&str>,
     ) -> Result<Command> {
         let resolved = resolve_binary(&self.binary)?;
         let mut cmd = Command::new(resolved);
@@ -421,7 +432,7 @@ impl CliStrategy {
                 model,
                 working_dir,
                 session_arg,
-                None, // effort: CB4 will provide this
+                effort,
                 mcp_config,
             );
 
@@ -595,6 +606,7 @@ mod tests {
             session_resume_cmd: None,
             trust_flag: None,
             invocation_template: None,
+            effort_declaration: None,
         }
     }
 
@@ -728,6 +740,7 @@ mod tests {
                 None,
                 None,
                 Some("11111111-2222-3333-4444-555555555555"),
+                None,
             )
             .unwrap();
         let cmd_str = format!("{:?}", cmd);
@@ -741,7 +754,7 @@ mod tests {
         // silently dropped, never passed as a stray argument.
         let strategy = sample_strategy();
         let cmd = strategy
-            .build_command_with_session("p", None, None, Some("sid-123"))
+            .build_command_with_session("p", None, None, Some("sid-123"), None)
             .unwrap();
         let cmd_str = format!("{:?}", cmd);
         assert!(!cmd_str.contains("sid-123"));
@@ -1041,7 +1054,7 @@ mod tests {
         s.session_id_set_flag = Some("--session-id".to_string());
 
         let cmd = s
-            .build_command_with_session("the prompt", Some("gpt-4"), None, Some("ses_123"))
+            .build_command_with_session("the prompt", Some("gpt-4"), None, Some("ses_123"), None)
             .unwrap();
         let cmd_str = format!("{:?}", cmd);
 
@@ -1065,7 +1078,7 @@ mod tests {
         s.session_id_set_flag = Some("--session-id".to_string());
 
         let cmd = s
-            .build_command_with_session("the prompt", None, None, Some("ses_456"))
+            .build_command_with_session("the prompt", None, None, Some("ses_456"), None)
             .unwrap();
         let cmd_str = format!("{:?}", cmd);
 

@@ -15,6 +15,8 @@ pub struct TaskAddParams {
     pub cli: Option<String>,
     /// Optional provider/model string.
     pub model: Option<String>,
+    /// Optional effort level (e.g. "low", "medium", "high").
+    pub effort: Option<String>,
     /// Auto-expire after N minutes from registration.
     pub duration_minutes: Option<i64>,
     /// Working directory for the CLI.
@@ -37,6 +39,8 @@ pub struct TaskWatchParams {
     pub cli: Option<String>,
     /// Optional provider/model string.
     pub model: Option<String>,
+    /// Optional effort level.
+    pub effort: Option<String>,
     /// Debounce window in seconds (default: 2).
     pub debounce_seconds: Option<u64>,
     /// Watch subdirectories (default: false).
@@ -59,6 +63,8 @@ pub struct TaskUpdateParams {
     pub cli: Option<String>,
     /// New provider/model string, or null to clear.
     pub model: Option<Option<String>>,
+    /// New effort level, or null to clear.
+    pub effort: Option<Option<String>>,
     /// New 5-field cron expression (cron agents only), e.g. `"30 * * * *"`
     /// (top of every hour at :30). Standard cron syntax: minute hour day
     /// month weekday, where `*` means "any value". Pass the value as a
@@ -397,6 +403,8 @@ pub struct LoopCompletionHookParams {
     pub platform: String,
     /// Optional model override.
     pub model: Option<String>,
+    /// Optional effort level.
+    pub effort: Option<String>,
     /// Hook prompt template. Supports {{loop_name}}, {{completed_specs}},
     /// {{workdir}}.
     pub prompt: String,

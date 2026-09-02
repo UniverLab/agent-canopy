@@ -885,6 +885,7 @@ mod tests {
             trigger: None,
             cli: Cli::new("opencode"),
             model: None,
+            effort: None,
             working_dir: None,
             enabled,
             enable_at: None,

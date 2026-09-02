@@ -28,6 +28,7 @@ struct CliRunParams<'a> {
     cli: &'a Cli,
     prompt: String,
     model: Option<&'a str>,
+    effort: Option<&'a str>,
     working_dir: Option<&'a str>,
     log_path: String,
     trigger: TriggerType,
@@ -241,6 +242,7 @@ impl Executor {
             cli: &agent.cli,
             prompt: wrapped,
             model: agent.model.as_deref(),
+            effort: agent.effort.as_deref(),
             working_dir: agent.working_dir.as_deref(),
             log_path: agent.log_path.clone(),
             trigger: ctx.trigger_type,
@@ -347,6 +349,7 @@ impl Executor {
             params.cli,
             &params.prompt,
             params.model,
+            params.effort,
             params.working_dir,
         ) {
             Ok(cmd) => cmd,
@@ -375,6 +378,31 @@ impl Executor {
             params.trigger,
         );
 
+        // CM7: a configured `effort` the platform can't honour is recorded in
+        // the agent's own run log (not just the daemon's tracing) — an option
+        // that looks applied and isn't is the failure mode this exists to
+        // prevent.
+        let effort_reason = params.effort.and_then(|e| {
+            crate::domain::cli_config::effort_rejection_reason(
+                params.cli.strategy().effort_declaration.as_ref(),
+                params.cli.as_str(),
+                e,
+            )
+        });
+        if let Some(reason) = &effort_reason {
+            tracing::warn!("agent '{}': effort not applied — {}", params.id, reason);
+        }
+        let with_effort_notice = |stderr: &[u8]| -> Vec<u8> {
+            match &effort_reason {
+                Some(reason) => {
+                    let mut out = format!("[canopy] effort not applied: {reason}\n").into_bytes();
+                    out.extend_from_slice(stderr);
+                    out
+                }
+                None => stderr.to_vec(),
+            }
+        };
+
         let started_at = Utc::now();
         let output = cmd.output().await;
 
@@ -389,7 +417,7 @@ impl Executor {
                     &started_at,
                     code,
                     &out.stdout,
-                    &out.stderr,
+                    &with_effort_notice(&out.stderr),
                 )?;
                 (code, success)
             }
@@ -402,7 +430,7 @@ impl Executor {
                     &started_at,
                     -1,
                     &[],
-                    e.to_string().as_bytes(),
+                    &with_effort_notice(e.to_string().as_bytes()),
                 )?;
                 (-1, false)
             }
@@ -427,10 +455,15 @@ fn build_cli_command(
     cli: &Cli,
     prompt: &str,
     model: Option<&str>,
+    effort: Option<&str>,
     working_dir: Option<&str>,
 ) -> Result<Command> {
     let strategy = cli.strategy();
-    let mut cmd = strategy.build_command(prompt, model, working_dir)?;
+    let mut cmd = if let Some(e) = effort {
+        strategy.build_command_with_session(prompt, model, working_dir, None, Some(e))?
+    } else {
+        strategy.build_command(prompt, model, working_dir)?
+    };
 
     // Stdin is already set by `build_command` (null for argv-mode CLIs, or
     // an open temp-file handle carrying the prompt for stdin-mode CLIs) —
