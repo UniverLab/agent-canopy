@@ -104,14 +104,13 @@ impl App {
         // worth its tokens every send, so it is never gated. The session-start
         // protocol ("[START HERE — required]", the tool-usage contract, the
         // skills list) is a one-time opening instruction: send it on the
-        // first prompt of a session, or again on a solo-mode transition.
-        let is_solo = !self.sync_available();
+        // first prompt of a session only.
         let state = self
             .session_protocol_state
             .get(&session_key)
             .cloned()
             .unwrap_or_default();
-        let should_send_protocol = !state.protocol_sent || (!state.sent_as_solo && is_solo);
+        let should_send_protocol = !state.protocol_sent;
 
         let turn_context = self.build_turn_context_block();
         let content = if should_send_protocol {

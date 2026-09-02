@@ -1023,7 +1023,6 @@ pub(crate) struct ProjectRelationDialog {
 #[derive(Clone, Default)]
 pub(crate) struct SessionProtocolState {
     pub protocol_sent: bool,
-    pub sent_as_solo: bool,
 }
 
 #[cfg(test)]

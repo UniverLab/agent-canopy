@@ -1281,7 +1281,6 @@ fn submit_prompt(app: &mut App, prompt: &str) {
         .simple_prompt_dialog
         .as_ref()
         .is_some_and(|d| d.protocol_included);
-    let is_solo = !app.sync_available();
     let workdir = app.current_workdir();
     let session_key = app.current_prompt_session_key();
 
@@ -1295,7 +1294,6 @@ fn submit_prompt(app: &mut App, prompt: &str) {
     if had_protocol {
         let state = app.session_protocol_state.entry(session_key).or_default();
         state.protocol_sent = true;
-        state.sent_as_solo = is_solo;
     }
 }
 
@@ -2236,6 +2234,37 @@ mod session_protocol_tests {
         assert!(new_turn_1.contains(FIRST_ACTION));
     }
 
+    /// The protocol is gated solely by `protocol_sent` now — the solo/sync
+    /// mode of the session no longer feeds into the decision (the
+    /// `sent_as_solo`/`sync_available` re-injection path was removed). Once
+    /// turn 1 delivers it, no later turn re-arms it, and `submit_prompt`
+    /// records the delivery on `session_protocol_state`.
+    #[test]
+    fn protocol_is_gated_only_by_protocol_sent_not_by_session_mode() {
+        let (mut app, _dir) = test_app();
+
+        app.open_simple_prompt_dialog(None);
+        assert!(
+            app.simple_prompt_dialog.as_ref().unwrap().protocol_included,
+            "turn 1 must include the protocol"
+        );
+        submit_prompt(&mut app, "do the first thing");
+
+        let key = app.current_prompt_session_key();
+        assert!(
+            app.session_protocol_state
+                .get(&key)
+                .is_some_and(|s| s.protocol_sent),
+            "submitting turn 1 must record protocol_sent"
+        );
+
+        // No per-turn condition remains that could re-inject the block.
+        let turn_2 = send_turn(&mut app, "do the second thing");
+        assert!(!turn_2.contains("[START HERE — required]"));
+        let turn_3 = send_turn(&mut app, "do the third thing");
+        assert!(!turn_3.contains("[START HERE — required]"));
+    }
+
     #[test]
     fn first_action_phrase_appears_at_most_once_across_a_ten_turn_session() {
         let (mut app, _dir) = test_app();
@@ -2254,9 +2283,10 @@ mod session_protocol_tests {
         );
     }
 
-    /// FR5: measures the assembled system-block size for a ten-turn session
-    /// before this fix (protocol block repeated every turn) against after
-    /// (protocol block sent once, per-turn context sent every turn).
+    /// FR5: measures the assembled system-block size for a ten-turn session,
+    /// comparing a hypothetical baseline where the protocol block is repeated
+    /// every turn against the actual behavior (protocol block sent once,
+    /// per-turn context sent every turn).
     #[test]
     fn ten_turn_session_sends_far_fewer_protocol_tokens_than_resending_every_turn() {
         let (mut app, _dir) = test_app();

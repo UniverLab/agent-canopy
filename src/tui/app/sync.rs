@@ -19,15 +19,6 @@ const MESSAGE_WINDOW_ITEMS_PER_STEP: usize = 8;
 const CHATTER_LIMIT: usize = 8;
 
 impl App {
-    /// Whether sync is available for the currently selected session,
-    /// regardless of whether the panel is currently visible.
-    pub(crate) fn sync_available(&self) -> bool {
-        let Some(workdir) = self.selected_activity_workdir() else {
-            return false;
-        };
-        self.live_session_count_for_sync(workdir) >= 2
-    }
-
     pub(crate) fn activity_panel_available(&self) -> bool {
         self.selected_activity_workdir().is_some()
     }
@@ -163,13 +154,6 @@ impl App {
             active_intents: summary.active_intents,
             recent_messages,
         })
-    }
-
-    fn live_session_count_for_sync(&self, workdir: &str) -> usize {
-        self.db
-            .list_active_sync_agent_ids(workdir)
-            .map(|agent_ids| agent_ids.len())
-            .unwrap_or(0)
     }
 
     fn message_window_limit_for_scroll(&self) -> usize {
