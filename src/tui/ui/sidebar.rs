@@ -422,11 +422,34 @@ fn agent_indices_by_kind(app: &App) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
 /// up below their demand scroll internally. Callers use this only when the
 /// sections can't all be shown at full height (`sum(demands) > budget`), but the
 /// function is correct for any input and always allocates at most `budget` rows.
-fn fair_section_heights(demands: &[u16], budget: u16) -> Vec<u16> {
+fn fair_section_heights(
+    demands: &[u16],
+    budget: u16,
+    focused: Option<usize>,
+    floor: u16,
+) -> Vec<u16> {
     let n = demands.len();
     let mut alloc = vec![0u16; n];
     let mut capped = vec![false; n];
     let mut remaining_budget = budget;
+
+    // Guarantee the focused section a floor before fair distribution, if it
+    // has any demand at all. This is the fix for "I can navigate them but
+    // I can't see them" on short screens: the section with the cursor must
+    // always have rows to draw into.
+    if let Some(idx) = focused {
+        if idx < n && demands[idx] > 0 && floor > 0 && budget > 0 {
+            let guaranteed = floor.min(demands[idx]).min(budget);
+            alloc[idx] = guaranteed;
+            remaining_budget = budget - guaranteed;
+            // If the focused section's demand was fully satisfied by the floor,
+            // it is done; otherwise the fair pass will allocate any additional
+            // share on top of the floor.
+            if alloc[idx] >= demands[idx] {
+                capped[idx] = true;
+            }
+        }
+    }
 
     loop {
         let active: Vec<usize> = (0..n).filter(|&i| !capped[i]).collect();
@@ -550,7 +573,13 @@ fn draw_live_body(
         card_list_demand(terminal_indices.len()),
         groups_list_demand(app.split_groups.len()),
     ];
-    let alloc = fair_section_heights(&demands, area.height);
+    let focused_idx = match app.agent_section_focus {
+        AgentSectionFocus::Interactive => Some(0),
+        AgentSectionFocus::Terminal => Some(1),
+        AgentSectionFocus::Groups => Some(2),
+        AgentSectionFocus::Brain => None,
+    };
+    let alloc = fair_section_heights(&demands, area.height, focused_idx, 6);
     let mut remaining = area;
 
     if let Some(sub) = take_top(&mut remaining, alloc[0]) {
@@ -598,7 +627,11 @@ fn draw_automation_body(
         card_list_demand(background_indices.len()),
         card_list_demand(loop_count),
     ];
-    let alloc = fair_section_heights(&demands, area.height);
+    let focused_idx = match app.automation_kind {
+        AutomationKind::Agent => Some(0),
+        AutomationKind::Loop => Some(1),
+    };
+    let alloc = fair_section_heights(&demands, area.height, focused_idx, 6);
     let mut remaining = area;
 
     if let Some(sub) = take_top(&mut remaining, alloc[0]) {
@@ -2492,7 +2525,7 @@ mod tests {
         let total: u16 = demands.iter().sum();
         assert_eq!(total, 38);
 
-        let alloc = fair_section_heights(&demands, 30);
+        let alloc = fair_section_heights(&demands, 30, None, 0);
 
         // No section is ever allocated more than it needs.
         for (got, want) in alloc.iter().zip(demands.iter()) {
@@ -2514,7 +2547,7 @@ mod tests {
         let budget = 24;
         assert!(demands.iter().sum::<u16>() > budget);
 
-        let alloc = fair_section_heights(&demands, budget);
+        let alloc = fair_section_heights(&demands, budget, None, 0);
 
         for (got, want) in alloc.iter().zip(demands.iter()) {
             assert!(got <= want, "section {got} exceeded its demand {want}");
@@ -2525,7 +2558,7 @@ mod tests {
     #[test]
     fn fair_section_heights_fits_everyone_when_budget_is_ample() {
         let demands = [needed_agents(1), needed_agents(2)];
-        let alloc = fair_section_heights(&demands, 100);
+        let alloc = fair_section_heights(&demands, 100, None, 0);
         assert_eq!(alloc[0], demands[0]);
         assert_eq!(alloc[1], demands[1]);
     }
@@ -2873,33 +2906,33 @@ mod tests {
 
     #[test]
     fn fair_section_heights_empty() {
-        assert_eq!(fair_section_heights(&[], 20), Vec::<u16>::new());
+        assert_eq!(fair_section_heights(&[], 20, None, 0), Vec::<u16>::new());
     }
 
     #[test]
     fn fair_section_heights_single_section() {
-        assert_eq!(fair_section_heights(&[10], 20), vec![10]);
+        assert_eq!(fair_section_heights(&[10], 20, None, 0), vec![10]);
     }
 
     #[test]
     fn fair_section_heights_budget_exactly_matches_demand() {
-        assert_eq!(fair_section_heights(&[5, 5, 5], 15), vec![5, 5, 5]);
+        assert_eq!(fair_section_heights(&[5, 5, 5], 15, None, 0), vec![5, 5, 5]);
     }
 
     #[test]
     fn fair_section_heights_budget_exceeds_demand() {
-        assert_eq!(fair_section_heights(&[3, 3], 20), vec![3, 3]);
+        assert_eq!(fair_section_heights(&[3, 3], 20, None, 0), vec![3, 3]);
     }
 
     #[test]
     fn fair_section_heights_budget_falls_short() {
-        let result = fair_section_heights(&[10, 10], 10);
+        let result = fair_section_heights(&[10, 10], 10, None, 0);
         assert_eq!(result.iter().sum::<u16>(), 10);
     }
 
     #[test]
     fn fair_section_heights_one_small_one_large() {
-        let result = fair_section_heights(&[2, 20], 12);
+        let result = fair_section_heights(&[2, 20], 12, None, 0);
         assert_eq!(result[0], 2);
         assert_eq!(result[1], 10);
         assert_eq!(result.iter().sum::<u16>(), 12);
@@ -2907,16 +2940,93 @@ mod tests {
 
     #[test]
     fn fair_section_heights_budget_zero() {
-        assert_eq!(fair_section_heights(&[10, 10], 0), vec![0, 0]);
+        assert_eq!(fair_section_heights(&[10, 10], 0, None, 0), vec![0, 0]);
     }
 
     #[test]
     fn fair_section_heights_many_sections() {
-        let result = fair_section_heights(&[5, 5, 5, 5, 5], 10);
+        let result = fair_section_heights(&[5, 5, 5, 5, 5], 10, None, 0);
         assert_eq!(result.iter().sum::<u16>(), 10);
         for &v in &result {
             assert!(v <= 5);
         }
+    }
+
+    #[test]
+    fn fair_section_heights_focused_section_gets_floor_on_short_screen() {
+        // Short screen: three sections, each wanting far more than a fair
+        // share of the budget. Plain fair distribution splits it roughly
+        // evenly and leaves every section below the floor needed to show
+        // the cursor -- "I can navigate them but I can't see them".
+        let demands = [needed_agents(5), needed_agents(5), needed_agents(5)];
+        let budget = 15;
+
+        // Precondition: without a focused section the section the user is
+        // looking at is starved below the floor. If this ever stops being
+        // true the test below no longer proves the floor does anything.
+        let fair = fair_section_heights(&demands, budget, None, 0);
+        assert!(
+            fair[0] < 6,
+            "precondition: fair split should starve the section, got {}",
+            fair[0]
+        );
+
+        // Focusing that section guarantees it the floor before fair
+        // distribution runs for the rest.
+        let alloc = fair_section_heights(&demands, budget, Some(0), 6);
+        assert!(
+            alloc[0] >= 6,
+            "focused section got {} rows, expected >= 6",
+            alloc[0]
+        );
+
+        // Still within budget, still nobody over their demand.
+        assert!(alloc.iter().sum::<u16>() <= budget);
+        for (got, want) in alloc.iter().zip(demands.iter()) {
+            assert!(got <= want, "section got {got} exceeded demand {want}");
+        }
+    }
+
+    #[test]
+    fn fair_section_heights_floor_respects_demand() {
+        let demands = [4, 20, 20];
+        let alloc = fair_section_heights(&demands, 30, Some(0), 6);
+        assert_eq!(alloc[0], 4);
+        assert!(alloc.iter().sum::<u16>() <= 30);
+    }
+
+    #[test]
+    fn fair_section_heights_floor_respects_budget() {
+        let demands = [20, 20];
+        let alloc = fair_section_heights(&demands, 3, Some(0), 6);
+        assert!(alloc[0] <= 3);
+        assert!(alloc.iter().sum::<u16>() <= 3);
+    }
+
+    #[test]
+    fn fair_section_heights_no_focus_unchanged() {
+        // With no focused section and a zero floor the function must
+        // behave exactly as it did before the floor was added: the small
+        // sections cap at their demand, the large one takes the rest.
+        let demands = [needed_agents(6), needed_agents(1), groups_list_demand(1)];
+        assert_eq!(fair_section_heights(&demands, 20, None, 0), vec![10, 6, 4]);
+    }
+
+    #[test]
+    fn fair_section_heights_focus_no_effect_when_budget_is_ample() {
+        // Tall screen: everything fits. The focused-section floor must not
+        // change what any section gets -- no visible difference from the
+        // pre-floor behaviour on screens with sufficient height.
+        let demands = [needed_agents(3), needed_agents(2), groups_list_demand(2)];
+        let ample = demands.iter().sum::<u16>() + 10;
+        assert_eq!(
+            fair_section_heights(&demands, ample, Some(0), 6),
+            fair_section_heights(&demands, ample, None, 0),
+        );
+        assert_eq!(
+            fair_section_heights(&demands, ample, Some(0), 6),
+            demands.to_vec(),
+        );
     }
 
     #[test]
