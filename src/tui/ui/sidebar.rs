@@ -3556,4 +3556,46 @@ mod tests {
             "graph panel must not render on Live: {text}"
         );
     }
+
+    #[test]
+    fn registered_projects_with_zero_relations_do_not_claim_graph_height() {
+        // Spec CB17: registered projects with zero relations make
+        // `refresh_project_graph` fill `trees` with one singleton per project
+        // while leaving `edges` empty. The old `!trees.is_empty()` height-claim
+        // check fired on that, stealing GRAPH_MIN_HEIGHT rows to show only
+        // "No relationships yet". The fixed criterion is the same one the
+        // drawer uses — it requires an edge — so with none the panel claims
+        // nothing and the strip goes to Brian's Brain.
+        //
+        // Guard: `knowledge_tab_with_an_edge_draws_the_graph_panel` renders
+        // with this exact (project_count, width, height, tab) and asserts the
+        // panel *does* appear once an edge is present. The only difference
+        // here is the relation count, so a pass proves the criterion — not a
+        // lack of room — is what withholds the rows.
+        let text = render_sidebar_text_with(
+            2,
+            34,
+            40,
+            &Theme::classic(),
+            SidebarLayer::Knowledge,
+            |app| {
+                assert!(
+                    !app.project_graph_trees.is_empty(),
+                    "precondition: singleton trees should be present"
+                );
+                assert!(
+                    app.project_graph_edges.is_empty(),
+                    "precondition: no relations were registered"
+                );
+            },
+        );
+        assert!(
+            !text.contains("project graph"),
+            "graph panel must not claim height with zero relations: {text}"
+        );
+        assert!(
+            !text.contains("No relationships yet"),
+            "empty message must not be drawn when panel has no content: {text}"
+        );
+    }
 }
