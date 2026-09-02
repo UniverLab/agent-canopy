@@ -641,6 +641,11 @@ pub struct LoopAddEnsembleParams {
     pub loop_id: Option<String>,
     /// Human-readable ensemble name.
     pub name: String,
+    /// Ensemble execution strategy: "parallel" (default), "cascade", or
+    /// "round_robin". Parallel runs all members concurrently and counts
+    /// passes against min_pass. Cascade tries members in order; the first
+    /// usable result wins. Round_robin rotates across members.
+    pub kind: Option<String>,
     /// The one shared prompt every member renders — supports the same
     /// placeholders as an agent node's `prompt_template`. Required unless
     /// `blueprint` supplies one.
@@ -679,6 +684,8 @@ pub struct LoopAddEnsembleParams {
 pub struct LoopUpdateEnsembleParams {
     /// Existing ensemble ID.
     pub ensemble_id: String,
+    /// New ensemble kind (parallel/cascade/round_robin), or omit to leave unchanged.
+    pub kind: Option<String>,
     /// New shared prompt, propagated to every current member.
     pub prompt_template: Option<String>,
     /// Replacement member list (2-8 entries) — added/removed/replaced by

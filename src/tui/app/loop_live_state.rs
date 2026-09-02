@@ -1056,6 +1056,8 @@ mod tests {
             timeout_minutes: 30,
             on_pass_to: "n2".to_string(),
             on_fail_to: None,
+            kind: crate::domain::loops::EnsembleKind::Parallel,
+            round_robin_index: None,
             created_at: Utc::now(),
         };
         let members: Vec<EnsembleMember> = member_nodes

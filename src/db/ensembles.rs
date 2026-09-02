@@ -11,8 +11,8 @@ use std::io::{Error as IoError, ErrorKind};
 use crate::db::Database;
 use crate::domain::blueprints::{builtin_ensemble_blueprint_specs, EnsembleBlueprint};
 use crate::domain::loops::{
-    Ensemble, EnsembleDetails, EnsembleMember, EnsembleMemberSpec, LoopEdge, LoopEdgeCondition,
-    LoopNode,
+    Ensemble, EnsembleDetails, EnsembleKind, EnsembleMember, EnsembleMemberSpec, LoopEdge,
+    LoopEdgeCondition, LoopNode,
 };
 
 impl Database {
@@ -85,8 +85,8 @@ impl Database {
         }
 
         tx.execute(
-            "INSERT INTO ensembles (id, spec_id, loop_id, name, prompt_template, join_node_id, entry_from_node, entry_condition, min_pass, straggler_timeout_minutes, timeout_minutes, on_pass_to, on_fail_to, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT INTO ensembles (id, spec_id, loop_id, name, prompt_template, join_node_id, entry_from_node, entry_condition, min_pass, straggler_timeout_minutes, timeout_minutes, on_pass_to, on_fail_to, kind, round_robin_index, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 &ensemble.id,
                 &ensemble.spec_id,
@@ -101,6 +101,8 @@ impl Database {
                 ensemble.timeout_minutes,
                 &ensemble.on_pass_to,
                 &ensemble.on_fail_to,
+                ensemble.kind.as_str(),
+                ensemble.round_robin_index,
                 ensemble.created_at.timestamp(),
             ],
         )?;
@@ -130,7 +132,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, spec_id, loop_id, name, prompt_template, join_node_id, entry_from_node, entry_condition, min_pass, straggler_timeout_minutes, timeout_minutes, on_pass_to, on_fail_to, created_at
+            "SELECT id, spec_id, loop_id, name, prompt_template, join_node_id, entry_from_node, entry_condition, min_pass, straggler_timeout_minutes, timeout_minutes, on_pass_to, on_fail_to, kind, round_robin_index, created_at
              FROM ensembles WHERE id = ?1",
         )?;
         stmt.query_row(params![ensemble_id], map_ensemble_row)
@@ -304,6 +306,31 @@ impl Database {
                 on_pass_to,
                 on_fail_to.map(|_| 1),
                 on_fail_to.flatten(),
+                ensemble_id,
+            ],
+        )?;
+        Ok(rows > 0)
+    }
+
+    pub fn update_ensemble_kind(
+        &self,
+        ensemble_id: &str,
+        kind: Option<EnsembleKind>,
+        round_robin_index: Option<Option<i64>>,
+    ) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE ensembles
+             SET kind = COALESCE(?1, kind),
+                 round_robin_index = CASE WHEN ?2 IS NULL THEN round_robin_index ELSE ?3 END
+             WHERE id = ?4",
+            params![
+                kind.map(|k| k.as_str()),
+                round_robin_index.map(|_| 1),
+                round_robin_index.flatten(),
                 ensemble_id,
             ],
         )?;
@@ -654,6 +681,17 @@ fn map_ensemble_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Ensemble> {
                 )),
             )
         })?;
+    let kind_str: String = row.get(13)?;
+    let kind = EnsembleKind::from_str(&kind_str).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            13,
+            rusqlite::types::Type::Text,
+            Box::new(IoError::new(
+                ErrorKind::InvalidData,
+                format!("Invalid ensemble kind: {kind_str}"),
+            )),
+        )
+    })?;
     Ok(Ensemble {
         id: row.get(0)?,
         spec_id: row.get(1)?,
@@ -668,7 +706,9 @@ fn map_ensemble_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Ensemble> {
         timeout_minutes: row.get(10)?,
         on_pass_to: row.get(11)?,
         on_fail_to: row.get(12)?,
-        created_at: from_timestamp(row.get(13)?)?,
+        kind,
+        round_robin_index: row.get(14)?,
+        created_at: from_timestamp(row.get(15)?)?,
     })
 }
 
@@ -833,6 +873,8 @@ mod tests {
             timeout_minutes: 30,
             on_pass_to: "arbiter".to_string(),
             on_fail_to: None,
+            kind: EnsembleKind::Parallel,
+            round_robin_index: None,
             created_at: now,
         };
         let members: Vec<EnsembleMember> = member_ids
@@ -998,6 +1040,8 @@ mod tests {
             timeout_minutes: 30,
             on_pass_to: "arbiter".to_string(),
             on_fail_to: None,
+            kind: EnsembleKind::Parallel,
+            round_robin_index: None,
             created_at: now,
         };
         let members = vec![
@@ -1141,6 +1185,8 @@ mod tests {
             timeout_minutes: 30,
             on_pass_to: "arbiter".to_string(),
             on_fail_to: None,
+            kind: EnsembleKind::Parallel,
+            round_robin_index: None,
             created_at: now,
         };
         let members = vec![EnsembleMember {
@@ -1269,6 +1315,8 @@ mod tests {
             timeout_minutes: 30,
             on_pass_to: "arbiter".to_string(),
             on_fail_to: None,
+            kind: EnsembleKind::Parallel,
+            round_robin_index: None,
             created_at: now,
         };
         let members: Vec<EnsembleMember> = member_ids
@@ -1600,6 +1648,8 @@ mod tests {
             timeout_minutes: 30,
             on_pass_to: "arbiter".to_string(),
             on_fail_to: None,
+            kind: EnsembleKind::Parallel,
+            round_robin_index: None,
             created_at: now,
         };
         let members = vec![
@@ -1724,6 +1774,8 @@ mod tests {
             timeout_minutes: 30,
             on_pass_to: "arbiter".to_string(),
             on_fail_to: None,
+            kind: EnsembleKind::Parallel,
+            round_robin_index: None,
             created_at: now,
         };
         let members = vec![EnsembleMember {
@@ -1785,5 +1837,387 @@ mod tests {
                 ("claude".to_string(), None, None),
             ]
         );
+    }
+
+    #[test]
+    fn insert_ensemble_unit_with_cascade_kind_persists_kind() {
+        let db = test_db();
+        let spec_id = "spec-1".to_string();
+        insert_spec(&db, &spec_id);
+        db.insert_loop_node(&LoopNode {
+            id: "kickoff".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "kickoff".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true", "success_condition": "exit_code_0"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "arbiter".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "arbiter".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 10,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        let now = chrono::Utc::now();
+
+        let join_node = LoopNode {
+            id: "join1".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "join".to_string(),
+            kind: LoopNodeKind::Join,
+            config: serde_json::json!({}),
+            position: 100,
+            created_at: now,
+        };
+        let member_node = LoopNode {
+            id: "m1".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "member".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "claude"}),
+            position: 50,
+            created_at: now,
+        };
+        let edge = LoopEdge {
+            id: "e1".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "kickoff".to_string(),
+            to_node: "m1".to_string(),
+            condition: LoopEdgeCondition::Always,
+        };
+        let ensemble = Ensemble {
+            id: "ens1".to_string(),
+            spec_id: Some(spec_id),
+            loop_id: None,
+            name: "Cascade".to_string(),
+            prompt_template: "draft it".to_string(),
+            join_node_id: "join1".to_string(),
+            entry_from_node: "kickoff".to_string(),
+            entry_condition: LoopEdgeCondition::Always,
+            min_pass: 1,
+            straggler_timeout_minutes: None,
+            timeout_minutes: 30,
+            on_pass_to: "arbiter".to_string(),
+            on_fail_to: None,
+            kind: EnsembleKind::Cascade,
+            round_robin_index: None,
+            created_at: now,
+        };
+        let members = vec![EnsembleMember {
+            ensemble_id: "ens1".to_string(),
+            node_id: "m1".to_string(),
+            position: 0,
+            platform: "claude".to_string(),
+            model: None,
+            prompt_override: None,
+        }];
+
+        db.insert_ensemble_unit(&ensemble, &members, &[member_node], &join_node, &[edge])
+            .unwrap();
+
+        let loaded = db.get_ensemble("ens1").unwrap().unwrap();
+        assert_eq!(loaded.kind, EnsembleKind::Cascade);
+        assert_eq!(loaded.round_robin_index, None);
+    }
+
+    #[test]
+    fn insert_ensemble_unit_with_round_robin_kind_persists_index() {
+        let db = test_db();
+        let spec_id = "spec-1".to_string();
+        insert_spec(&db, &spec_id);
+        db.insert_loop_node(&LoopNode {
+            id: "kickoff".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "kickoff".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true", "success_condition": "exit_code_0"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "arbiter".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "arbiter".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 10,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        let now = chrono::Utc::now();
+
+        let join_node = LoopNode {
+            id: "join1".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "join".to_string(),
+            kind: LoopNodeKind::Join,
+            config: serde_json::json!({}),
+            position: 100,
+            created_at: now,
+        };
+        let member_node = LoopNode {
+            id: "m1".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "member".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "claude"}),
+            position: 50,
+            created_at: now,
+        };
+        let edge = LoopEdge {
+            id: "e1".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "kickoff".to_string(),
+            to_node: "m1".to_string(),
+            condition: LoopEdgeCondition::Always,
+        };
+        let ensemble = Ensemble {
+            id: "ens1".to_string(),
+            spec_id: Some(spec_id),
+            loop_id: None,
+            name: "RoundRobin".to_string(),
+            prompt_template: "draft it".to_string(),
+            join_node_id: "join1".to_string(),
+            entry_from_node: "kickoff".to_string(),
+            entry_condition: LoopEdgeCondition::Always,
+            min_pass: 1,
+            straggler_timeout_minutes: None,
+            timeout_minutes: 30,
+            on_pass_to: "arbiter".to_string(),
+            on_fail_to: None,
+            kind: EnsembleKind::RoundRobin,
+            round_robin_index: Some(0),
+            created_at: now,
+        };
+        let members = vec![EnsembleMember {
+            ensemble_id: "ens1".to_string(),
+            node_id: "m1".to_string(),
+            position: 0,
+            platform: "claude".to_string(),
+            model: None,
+            prompt_override: None,
+        }];
+
+        db.insert_ensemble_unit(&ensemble, &members, &[member_node], &join_node, &[edge])
+            .unwrap();
+
+        let loaded = db.get_ensemble("ens1").unwrap().unwrap();
+        assert_eq!(loaded.kind, EnsembleKind::RoundRobin);
+        assert_eq!(loaded.round_robin_index, Some(0));
+    }
+
+    #[test]
+    fn update_ensemble_kind_changes_kind_and_clears_index() {
+        let db = test_db();
+        let spec_id = "spec-1".to_string();
+        insert_spec(&db, &spec_id);
+        db.insert_loop_node(&LoopNode {
+            id: "kickoff".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "kickoff".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true", "success_condition": "exit_code_0"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "arbiter".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "arbiter".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 10,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        let now = chrono::Utc::now();
+
+        let join_node = LoopNode {
+            id: "join1".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "join".to_string(),
+            kind: LoopNodeKind::Join,
+            config: serde_json::json!({}),
+            position: 100,
+            created_at: now,
+        };
+        let member_node = LoopNode {
+            id: "m1".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "member".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "claude"}),
+            position: 50,
+            created_at: now,
+        };
+        let edge = LoopEdge {
+            id: "e1".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "kickoff".to_string(),
+            to_node: "m1".to_string(),
+            condition: LoopEdgeCondition::Always,
+        };
+        let ensemble = Ensemble {
+            id: "ens1".to_string(),
+            spec_id: Some(spec_id),
+            loop_id: None,
+            name: "RR".to_string(),
+            prompt_template: "draft it".to_string(),
+            join_node_id: "join1".to_string(),
+            entry_from_node: "kickoff".to_string(),
+            entry_condition: LoopEdgeCondition::Always,
+            min_pass: 1,
+            straggler_timeout_minutes: None,
+            timeout_minutes: 30,
+            on_pass_to: "arbiter".to_string(),
+            on_fail_to: None,
+            kind: EnsembleKind::RoundRobin,
+            round_robin_index: Some(2),
+            created_at: now,
+        };
+        let members = vec![EnsembleMember {
+            ensemble_id: "ens1".to_string(),
+            node_id: "m1".to_string(),
+            position: 0,
+            platform: "claude".to_string(),
+            model: None,
+            prompt_override: None,
+        }];
+
+        db.insert_ensemble_unit(&ensemble, &members, &[member_node], &join_node, &[edge])
+            .unwrap();
+
+        db.update_ensemble_kind("ens1", Some(EnsembleKind::Cascade), Some(None))
+            .unwrap();
+
+        let loaded = db.get_ensemble("ens1").unwrap().unwrap();
+        assert_eq!(loaded.kind, EnsembleKind::Cascade);
+        assert_eq!(loaded.round_robin_index, None);
+    }
+
+    #[test]
+    fn round_robin_index_advances_and_wraps() {
+        let db = test_db();
+        let spec_id = "spec-1".to_string();
+        insert_spec(&db, &spec_id);
+        db.insert_loop_node(&LoopNode {
+            id: "kickoff".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "kickoff".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true", "success_condition": "exit_code_0"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "arbiter".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "arbiter".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 10,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        let now = chrono::Utc::now();
+
+        let join_node = LoopNode {
+            id: "join1".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "join".to_string(),
+            kind: LoopNodeKind::Join,
+            config: serde_json::json!({}),
+            position: 100,
+            created_at: now,
+        };
+        let member_node = LoopNode {
+            id: "m1".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "member".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "claude"}),
+            position: 50,
+            created_at: now,
+        };
+        let edge = LoopEdge {
+            id: "e1".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "kickoff".to_string(),
+            to_node: "m1".to_string(),
+            condition: LoopEdgeCondition::Always,
+        };
+        let ensemble = Ensemble {
+            id: "ens1".to_string(),
+            spec_id: Some(spec_id),
+            loop_id: None,
+            name: "RR".to_string(),
+            prompt_template: "draft it".to_string(),
+            join_node_id: "join1".to_string(),
+            entry_from_node: "kickoff".to_string(),
+            entry_condition: LoopEdgeCondition::Always,
+            min_pass: 1,
+            straggler_timeout_minutes: None,
+            timeout_minutes: 30,
+            on_pass_to: "arbiter".to_string(),
+            on_fail_to: None,
+            kind: EnsembleKind::RoundRobin,
+            round_robin_index: Some(0),
+            created_at: now,
+        };
+        let members = vec![EnsembleMember {
+            ensemble_id: "ens1".to_string(),
+            node_id: "m1".to_string(),
+            position: 0,
+            platform: "claude".to_string(),
+            model: None,
+            prompt_override: None,
+        }];
+
+        db.insert_ensemble_unit(&ensemble, &members, &[member_node], &join_node, &[edge])
+            .unwrap();
+
+        db.update_ensemble_kind("ens1", Some(EnsembleKind::RoundRobin), Some(Some(1)))
+            .unwrap();
+        let loaded = db.get_ensemble("ens1").unwrap().unwrap();
+        assert_eq!(loaded.round_robin_index, Some(1));
+
+        db.update_ensemble_kind("ens1", Some(EnsembleKind::RoundRobin), Some(Some(2)))
+            .unwrap();
+        let loaded = db.get_ensemble("ens1").unwrap().unwrap();
+        assert_eq!(loaded.round_robin_index, Some(2));
+
+        db.update_ensemble_kind("ens1", Some(EnsembleKind::RoundRobin), Some(Some(0)))
+            .unwrap();
+        let loaded = db.get_ensemble("ens1").unwrap().unwrap();
+        assert_eq!(loaded.round_robin_index, Some(0));
     }
 }

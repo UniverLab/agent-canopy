@@ -2,7 +2,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::domain::loops::{EnsembleDetails, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind};
+use crate::domain::loops::{
+    EnsembleDetails, EnsembleKind, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind,
+};
 
 pub const MAX_ID_LENGTH: usize = 64;
 pub const MAX_PROMPT_LENGTH: usize = 50_000;
@@ -87,10 +89,16 @@ pub fn validate_ensembles_in_graph(
         let ensemble = &details.ensemble;
         let label = format!("Ensemble '{}' ('{}')", ensemble.id, ensemble.name);
 
-        if details.members.len() < 2 {
-            return Err(format!("{label} has fewer than 2 members."));
+        let min_members = match ensemble.kind {
+            EnsembleKind::Parallel => 2,
+            EnsembleKind::Cascade | EnsembleKind::RoundRobin => 1,
+        };
+        if details.members.len() < min_members {
+            return Err(format!("{label} has fewer than {min_members} members."));
         }
-        if ensemble.min_pass < 1 || ensemble.min_pass > details.members.len() as i64 {
+        if ensemble.kind == EnsembleKind::Parallel
+            && (ensemble.min_pass < 1 || ensemble.min_pass > details.members.len() as i64)
+        {
             return Err(format!(
                 "{label} has an invalid min_pass ({}) for {} members.",
                 ensemble.min_pass,

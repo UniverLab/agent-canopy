@@ -52,7 +52,7 @@ use crate::db::Database;
 use crate::domain::blueprints::{merge_blueprint_config, validate_blueprint_deletable, Blueprint};
 use crate::domain::loops::{
     validate_router_edges_declared, validate_router_route_coverage, validate_router_routes,
-    validate_spec_description_template, ArchiveLoopOutcome, Ensemble, EnsembleMember,
+    validate_spec_description_template, ArchiveLoopOutcome, Ensemble, EnsembleKind, EnsembleMember,
     EnsembleMemberSpec, Loop, LoopDetails, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind,
     LoopNodeRun, LoopResetOutcome, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus,
     RouterRoute, SpecAdminStatusOutcome,
@@ -212,16 +212,18 @@ const ENSEMBLE_MIN_MEMBERS: usize = 2;
 const ENSEMBLE_MAX_MEMBERS: usize = 8;
 const DEFAULT_ENSEMBLE_MEMBER_TIMEOUT_MINUTES: i64 = 30;
 
-/// Validate a `loop_add_ensemble`/`loop_update_ensemble` member list: 2-8
-/// entries, each with a non-empty `platform`. Returns the normalized
-/// `(platform, model, prompt_override)` triples in the caller's order — the
-/// order consolidation and resize diffs rely on.
 fn validate_ensemble_members(
     members: &[EnsembleMemberParams],
+    kind: EnsembleKind,
 ) -> Result<Vec<EnsembleMemberSpec>, String> {
-    if members.len() < ENSEMBLE_MIN_MEMBERS || members.len() > ENSEMBLE_MAX_MEMBERS {
+    let min = match kind {
+        EnsembleKind::Parallel => ENSEMBLE_MIN_MEMBERS,
+        EnsembleKind::Cascade | EnsembleKind::RoundRobin => 1,
+    };
+    if members.len() < min || members.len() > ENSEMBLE_MAX_MEMBERS {
         return Err(format!(
-            "An ensemble must have {ENSEMBLE_MIN_MEMBERS}-{ENSEMBLE_MAX_MEMBERS} members, got {}.",
+            "A {} ensemble must have {min}-{ENSEMBLE_MAX_MEMBERS} members, got {}.",
+            kind.as_str(),
             members.len()
         ));
     }
@@ -291,6 +293,7 @@ struct EnsembleUnitSpec<'a> {
     timeout_minutes: i64,
     straggler_timeout_minutes: Option<i64>,
     start_position: i64,
+    kind: EnsembleKind,
 }
 
 /// The concrete graph pieces of one ensemble unit, all with fresh ids: the
@@ -410,6 +413,12 @@ fn build_ensemble_unit(spec: &EnsembleUnitSpec) -> BuiltEnsembleUnit {
         timeout_minutes: spec.timeout_minutes,
         on_pass_to: spec.on_pass_to.to_string(),
         on_fail_to: spec.on_fail_to.map(str::to_string),
+        kind: spec.kind,
+        round_robin_index: if spec.kind == EnsembleKind::RoundRobin {
+            Some(0)
+        } else {
+            None
+        },
         created_at: now,
     };
 
@@ -1898,8 +1907,9 @@ fn plan_ensemble_copy(
         .to_string();
 
     let members_replaced = params.members.is_some();
+    let copy_kind = source.kind;
     let members: Vec<EnsembleMemberSpec> = match &params.members {
-        Some(explicit) => validate_ensemble_members(explicit)?,
+        Some(explicit) => validate_ensemble_members(explicit, copy_kind)?,
         None => details
             .members
             .iter()
@@ -2013,6 +2023,7 @@ fn plan_ensemble_copy(
         timeout_minutes,
         straggler_timeout_minutes,
         start_position,
+        kind: copy_kind,
     });
 
     Ok(EnsembleCopyPlan {
@@ -4943,8 +4954,19 @@ impl TaskTriggerHandler {
         };
         let prompt_template = prompt_template.as_str();
 
+        let kind = match params.kind.as_deref().map(str::trim).unwrap_or("parallel") {
+            "parallel" => EnsembleKind::Parallel,
+            "cascade" => EnsembleKind::Cascade,
+            "round_robin" => EnsembleKind::RoundRobin,
+            other => {
+                return Ok(error_result(&format!(
+                "Invalid ensemble kind '{other}'. Must be one of: parallel, cascade, round_robin."
+            )))
+            }
+        };
+
         let members: Vec<EnsembleMemberSpec> = match &params.members {
-            Some(explicit) => match validate_ensemble_members(explicit) {
+            Some(explicit) => match validate_ensemble_members(explicit, kind) {
                 Ok(members) => members,
                 Err(e) => return Ok(error_result(&e)),
             },
@@ -5098,6 +5120,7 @@ impl TaskTriggerHandler {
             timeout_minutes,
             straggler_timeout_minutes: params.straggler_timeout_minutes,
             start_position,
+            kind,
         });
 
         self.db
@@ -5269,6 +5292,7 @@ impl TaskTriggerHandler {
 
         if let Err(e) = validate_at_least_one_bool(
             &[
+                params.kind.is_some(),
                 params.prompt_template.is_some(),
                 params.members.is_some(),
                 params.min_pass.is_some(),
@@ -5288,6 +5312,37 @@ impl TaskTriggerHandler {
             }
         }
 
+        let new_kind: Option<EnsembleKind> = match params.kind.as_deref().map(str::trim) {
+            Some("parallel") => Some(EnsembleKind::Parallel),
+            Some("cascade") => Some(EnsembleKind::Cascade),
+            Some("round_robin") => Some(EnsembleKind::RoundRobin),
+            Some(other) => {
+                return Ok(error_result(&format!(
+                "Invalid ensemble kind '{other}'. Must be one of: parallel, cascade, round_robin."
+            )))
+            }
+            None => None,
+        };
+        let effective_kind = new_kind.unwrap_or(details.ensemble.kind);
+
+        if let Some(kind) = new_kind {
+            let rri = if kind == EnsembleKind::RoundRobin {
+                Some(Some(details.ensemble.round_robin_index.unwrap_or(0)))
+            } else {
+                Some(None)
+            };
+            self.db
+                .update_ensemble_kind(&ensemble_id, Some(kind), rri)
+                .map_err(internal_error)?;
+            details.ensemble.kind = kind;
+            if kind == EnsembleKind::RoundRobin {
+                details.ensemble.round_robin_index =
+                    Some(details.ensemble.round_robin_index.unwrap_or(0));
+            } else {
+                details.ensemble.round_robin_index = None;
+            }
+        }
+
         let owner_nodes = match (&details.ensemble.spec_id, &details.ensemble.loop_id) {
             (Some(spec_id), None) => self.db.list_loop_nodes(spec_id).map_err(internal_error)?,
             (None, Some(loop_id)) => self
@@ -5299,7 +5354,7 @@ impl TaskTriggerHandler {
 
         // ── member list resize/replace (add/remove/replace by position) ──
         if let Some(new_members) = &params.members {
-            let members = match validate_ensemble_members(new_members) {
+            let members = match validate_ensemble_members(new_members, effective_kind) {
                 Ok(members) => members,
                 Err(e) => return Ok(error_result(&e)),
             };
@@ -7716,6 +7771,7 @@ fn ensemble_details_json(details: &crate::domain::loops::EnsembleDetails) -> ser
     serde_json::json!({
         "id": ensemble.id,
         "name": ensemble.name,
+        "kind": ensemble.kind.as_str(),
         "prompt_template": ensemble.prompt_template,
         "join_node_id": ensemble.join_node_id,
         "entry_from_node": ensemble.entry_from_node,
@@ -7726,6 +7782,7 @@ fn ensemble_details_json(details: &crate::domain::loops::EnsembleDetails) -> ser
         "timeout_minutes": ensemble.timeout_minutes,
         "on_pass_to": ensemble.on_pass_to,
         "on_fail_to": ensemble.on_fail_to,
+        "round_robin_index": ensemble.round_robin_index,
         "created_at": ensemble.created_at.to_rfc3339(),
         "members": details.members.iter().map(|member| serde_json::json!({
             "node_id": member.node_id,
@@ -8192,8 +8249,8 @@ mod tests {
     use crate::db::Database;
     use crate::domain::blueprints::Blueprint;
     use crate::domain::loops::{
-        Ensemble, EnsembleMember, Loop, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind,
-        LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus,
+        Ensemble, EnsembleKind, EnsembleMember, Loop, LoopEdge, LoopEdgeCondition, LoopNode,
+        LoopNodeKind, LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus,
     };
     use crate::domain::models::Trigger;
     use crate::domain::queues::Queue;
@@ -8299,23 +8356,23 @@ mod tests {
     #[test]
     fn validate_ensemble_members_rejects_below_minimum() {
         let members = vec![ensemble_member_params("claude")];
-        let err = validate_ensemble_members(&members).unwrap_err();
+        let err = validate_ensemble_members(&members, EnsembleKind::Parallel).unwrap_err();
         assert!(err.contains("2-8 members"), "{err}");
     }
 
     #[test]
     fn validate_ensemble_members_rejects_above_maximum() {
         let members: Vec<_> = (0..9).map(|_| ensemble_member_params("claude")).collect();
-        let err = validate_ensemble_members(&members).unwrap_err();
+        let err = validate_ensemble_members(&members, EnsembleKind::Parallel).unwrap_err();
         assert!(err.contains("2-8 members"), "{err}");
     }
 
     #[test]
     fn validate_ensemble_members_accepts_boundary_counts() {
         let two: Vec<_> = (0..2).map(|_| ensemble_member_params("claude")).collect();
-        assert!(validate_ensemble_members(&two).is_ok());
+        assert!(validate_ensemble_members(&two, EnsembleKind::Parallel).is_ok());
         let eight: Vec<_> = (0..8).map(|_| ensemble_member_params("claude")).collect();
-        assert!(validate_ensemble_members(&eight).is_ok());
+        assert!(validate_ensemble_members(&eight, EnsembleKind::Parallel).is_ok());
     }
 
     #[test]
@@ -8324,7 +8381,7 @@ mod tests {
             ensemble_member_params("claude"),
             ensemble_member_params("  "),
         ];
-        let err = validate_ensemble_members(&members).unwrap_err();
+        let err = validate_ensemble_members(&members, EnsembleKind::Parallel).unwrap_err();
         assert!(err.contains("platform"), "{err}");
     }
 
@@ -8341,7 +8398,7 @@ mod tests {
                 m
             },
         ];
-        let result = validate_ensemble_members(&members).unwrap();
+        let result = validate_ensemble_members(&members, EnsembleKind::Parallel).unwrap();
         assert_eq!(result[0].2.as_deref(), Some("review for security"));
         assert_eq!(result[1].2, None);
     }
@@ -8494,6 +8551,8 @@ mod tests {
             timeout_minutes: 30,
             on_pass_to: "arbiter".to_string(),
             on_fail_to: None,
+            kind: EnsembleKind::Parallel,
+            round_robin_index: None,
             created_at: now,
         };
         let members = vec![
@@ -10524,6 +10583,7 @@ mod tests {
             timeout_minutes: 30,
             straggler_timeout_minutes: None,
             start_position: 10,
+            kind: EnsembleKind::Parallel,
         });
         db.insert_ensemble_unit(
             &built.ensemble,
@@ -12738,7 +12798,7 @@ mod additional_tests {
                 prompt_override: None,
             },
         ];
-        let err = validate_ensemble_members(&members).unwrap_err();
+        let err = validate_ensemble_members(&members, EnsembleKind::Parallel).unwrap_err();
         assert!(err.contains("platform"), "{err}");
     }
 
@@ -12758,7 +12818,7 @@ mod additional_tests {
                 prompt_override: None,
             },
         ];
-        let result = validate_ensemble_members(&members).unwrap();
+        let result = validate_ensemble_members(&members, EnsembleKind::Parallel).unwrap();
         assert_eq!(result[0].1.as_deref(), Some("opus-4"));
         assert_eq!(result[1].1, None); // whitespace-only model becomes None
     }
@@ -13939,6 +13999,8 @@ mod coverage_tests {
                 timeout_minutes: 30,
                 on_pass_to: "arbiter".into(),
                 on_fail_to: Some("cleanup".into()),
+                kind: EnsembleKind::Parallel,
+                round_robin_index: None,
                 created_at: chrono::Utc::now(),
             },
             members: vec![
@@ -13993,6 +14055,8 @@ mod coverage_tests {
                 timeout_minutes: 45,
                 on_pass_to: "to".into(),
                 on_fail_to: None,
+                kind: EnsembleKind::Parallel,
+                round_robin_index: None,
                 created_at: chrono::Utc::now(),
             },
             members: vec![EnsembleMember {
@@ -14200,6 +14264,7 @@ mod coverage_tests {
             timeout_minutes: 30,
             straggler_timeout_minutes: Some(10),
             start_position: 1,
+            kind: EnsembleKind::Parallel,
         });
         assert_eq!(built.ensemble.on_fail_to.as_deref(), Some("cleanup"));
         assert_eq!(built.ensemble.straggler_timeout_minutes, Some(10));
@@ -14228,6 +14293,7 @@ mod coverage_tests {
             timeout_minutes: 15,
             straggler_timeout_minutes: None,
             start_position: 5,
+            kind: EnsembleKind::Parallel,
         });
         assert!(built.ensemble.on_fail_to.is_none());
         let fail_edges: Vec<_> = built
@@ -14259,6 +14325,7 @@ mod coverage_tests {
             timeout_minutes: 30,
             straggler_timeout_minutes: None,
             start_position: 10,
+            kind: EnsembleKind::Parallel,
         });
         for (i, member) in built.members.iter().enumerate() {
             assert_eq!(member.position, i as i64);
@@ -14600,7 +14667,7 @@ mod coverage_tests {
                 prompt_override: None,
             })
             .collect();
-        assert!(validate_ensemble_members(&m).is_ok());
+        assert!(validate_ensemble_members(&m, EnsembleKind::Parallel).is_ok());
     }
 
     #[test]
@@ -14612,7 +14679,7 @@ mod coverage_tests {
                 prompt_override: None,
             })
             .collect();
-        assert!(validate_ensemble_members(&m).is_ok());
+        assert!(validate_ensemble_members(&m, EnsembleKind::Parallel).is_ok());
     }
 
     #[test]
@@ -14624,7 +14691,9 @@ mod coverage_tests {
                 prompt_override: None,
             })
             .collect();
-        assert!(validate_ensemble_members(&m).unwrap_err().contains("2-8"));
+        assert!(validate_ensemble_members(&m, EnsembleKind::Parallel)
+            .unwrap_err()
+            .contains("2-8"));
     }
 
     #[test]
@@ -14641,7 +14710,7 @@ mod coverage_tests {
                 prompt_override: None,
             },
         ];
-        let result = validate_ensemble_members(&m).unwrap();
+        let result = validate_ensemble_members(&m, EnsembleKind::Parallel).unwrap();
         assert_eq!(result[0].1, None);
         assert_eq!(result[1].1, None);
     }
@@ -16334,6 +16403,7 @@ mod endpoint_tests {
             .loop_add_ensemble(Parameters(LoopAddEnsembleParams {
                 spec_id: None,
                 loop_id: Some(loop_id.clone()),
+                kind: None,
                 name: "Proposers".to_string(),
                 prompt_template: Some("draft it".to_string()),
                 blueprint: None,
@@ -17804,6 +17874,7 @@ mod endpoint_tests {
                 spec_id: Some(spec.id.clone()),
                 loop_id: None,
                 name: "Review Ensemble".to_string(),
+                kind: None,
                 prompt_template: Some("Review {{spec_name}}".to_string()),
                 members: Some(members.clone()),
                 blueprint: None,
@@ -17825,6 +17896,7 @@ mod endpoint_tests {
                 spec_id: Some(spec.id.clone()),
                 loop_id: None,
                 name: "No Prompt".to_string(),
+                kind: None,
                 prompt_template: None,
                 members: Some(members.clone()),
                 blueprint: None,
@@ -17846,6 +17918,7 @@ mod endpoint_tests {
                 spec_id: Some(spec.id.clone()),
                 loop_id: None,
                 name: "Bad Min Pass".to_string(),
+                kind: None,
                 prompt_template: Some("Review".to_string()),
                 members: Some(members.clone()),
                 blueprint: None,
@@ -17867,6 +17940,7 @@ mod endpoint_tests {
                 spec_id: Some(spec.id.clone()),
                 loop_id: None,
                 name: "Bad Entry".to_string(),
+                kind: None,
                 prompt_template: Some("Review".to_string()),
                 members: Some(members.clone()),
                 blueprint: None,
@@ -17888,6 +17962,7 @@ mod endpoint_tests {
                 spec_id: Some(spec.id),
                 loop_id: None,
                 name: "Too Few".to_string(),
+                kind: None,
                 prompt_template: Some("Review".to_string()),
                 members: Some(vec![members[0].clone()]),
                 blueprint: None,
@@ -18687,6 +18762,7 @@ mod endpoint_tests {
                 spec_id: Some(spec.id.clone()),
                 loop_id: None,
                 name: "Source Ensemble".to_string(),
+                kind: None,
                 prompt_template: Some("Review {{spec_name}}".to_string()),
                 members: Some(vec![
                     crate::daemon::params::EnsembleMemberParams {
@@ -18781,6 +18857,7 @@ mod endpoint_tests {
                 spec_id: Some(spec.id.clone()),
                 loop_id: None,
                 name: "Panel".to_string(),
+                kind: None,
                 prompt_template: Some("shared review prompt".to_string()),
                 members: Some(vec![
                     crate::daemon::params::EnsembleMemberParams {
@@ -18897,6 +18974,7 @@ mod endpoint_tests {
                 spec_id: Some(spec.id.clone()),
                 loop_id: None,
                 name: "Ensemble".to_string(),
+                kind: None,
                 prompt_template: Some("Original prompt".to_string()),
                 members: Some(vec![
                     crate::daemon::params::EnsembleMemberParams {
@@ -18927,6 +19005,7 @@ mod endpoint_tests {
         let no_op = handler
             .loop_update_ensemble(Parameters(LoopUpdateEnsembleParams {
                 ensemble_id: ensemble_id.clone(),
+                kind: None,
                 prompt_template: None,
                 members: None,
                 min_pass: None,
@@ -18944,6 +19023,7 @@ mod endpoint_tests {
         let prompt_updated = handler
             .loop_update_ensemble(Parameters(LoopUpdateEnsembleParams {
                 ensemble_id: ensemble_id.clone(),
+                kind: None,
                 prompt_template: Some("New prompt".to_string()),
                 members: None,
                 min_pass: None,
@@ -18962,6 +19042,7 @@ mod endpoint_tests {
         let grown = handler
             .loop_update_ensemble(Parameters(LoopUpdateEnsembleParams {
                 ensemble_id: ensemble_id.clone(),
+                kind: None,
                 prompt_template: None,
                 members: Some(vec![
                     crate::daemon::params::EnsembleMemberParams {
@@ -19016,6 +19097,7 @@ mod endpoint_tests {
         let shrunk = handler
             .loop_update_ensemble(Parameters(LoopUpdateEnsembleParams {
                 ensemble_id: ensemble_id.clone(),
+                kind: None,
                 prompt_template: None,
                 members: Some(vec![
                     crate::daemon::params::EnsembleMemberParams {
@@ -19045,6 +19127,7 @@ mod endpoint_tests {
         let bad_min_pass = handler
             .loop_update_ensemble(Parameters(LoopUpdateEnsembleParams {
                 ensemble_id: ensemble_id.clone(),
+                kind: None,
                 prompt_template: None,
                 members: None,
                 min_pass: Some(99),
@@ -19061,6 +19144,7 @@ mod endpoint_tests {
         let bad_straggler = handler
             .loop_update_ensemble(Parameters(LoopUpdateEnsembleParams {
                 ensemble_id: ensemble_id.clone(),
+                kind: None,
                 prompt_template: None,
                 members: None,
                 min_pass: None,
@@ -19077,6 +19161,7 @@ mod endpoint_tests {
         let rewired = handler
             .loop_update_ensemble(Parameters(LoopUpdateEnsembleParams {
                 ensemble_id: ensemble_id.clone(),
+                kind: None,
                 prompt_template: None,
                 members: None,
                 min_pass: Some(2),
@@ -19095,6 +19180,7 @@ mod endpoint_tests {
         let bad_target = handler
             .loop_update_ensemble(Parameters(LoopUpdateEnsembleParams {
                 ensemble_id: ensemble_id.clone(),
+                kind: None,
                 prompt_template: None,
                 members: None,
                 min_pass: None,
@@ -19110,6 +19196,7 @@ mod endpoint_tests {
         let missing_ensemble = handler
             .loop_update_ensemble(Parameters(LoopUpdateEnsembleParams {
                 ensemble_id: "ghost-ensemble".to_string(),
+                kind: None,
                 prompt_template: Some("x".to_string()),
                 members: None,
                 min_pass: None,
@@ -20398,5 +20485,144 @@ mod endpoint_tests {
 
         let not_found = db.resolve_loop_id_by_prefix("loop-zzzz").unwrap();
         assert_eq!(not_found, None);
+    }
+
+    #[tokio::test]
+    async fn loop_add_ensemble_with_cascade_kind_creates_single_member_ensemble() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let entry = add_agent_node(&handler, &spec.id, "Entry").await;
+        let arbiter = add_agent_node(&handler, &spec.id, "Arbiter").await;
+
+        let result = handler
+            .loop_add_ensemble(Parameters(LoopAddEnsembleParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Cascade".to_string(),
+                kind: Some("cascade".to_string()),
+                prompt_template: Some("do it".to_string()),
+                members: Some(vec![EnsembleMemberParams {
+                    platform: "claude".to_string(),
+                    model: None,
+                    prompt_override: None,
+                }]),
+                blueprint: None,
+                from_node: entry.clone(),
+                condition: "always".to_string(),
+                min_pass: None,
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: arbiter.clone(),
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !is_err(&result),
+            "cascade ensemble with 1 member should succeed: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_add_ensemble_with_parallel_kind_rejects_single_member() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let entry = add_agent_node(&handler, &spec.id, "Entry").await;
+        let arbiter = add_agent_node(&handler, &spec.id, "Arbiter").await;
+
+        let result = handler
+            .loop_add_ensemble(Parameters(LoopAddEnsembleParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Parallel".to_string(),
+                kind: Some("parallel".to_string()),
+                prompt_template: Some("do it".to_string()),
+                members: Some(vec![EnsembleMemberParams {
+                    platform: "claude".to_string(),
+                    model: None,
+                    prompt_override: None,
+                }]),
+                blueprint: None,
+                from_node: entry.clone(),
+                condition: "always".to_string(),
+                min_pass: None,
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: arbiter.clone(),
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(
+            is_err(&result),
+            "parallel ensemble with 1 member should fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_update_ensemble_can_change_kind() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let entry = add_agent_node(&handler, &spec.id, "Entry").await;
+        let arbiter = add_agent_node(&handler, &spec.id, "Arbiter").await;
+
+        let created = handler
+            .loop_add_ensemble(Parameters(LoopAddEnsembleParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Ensemble".to_string(),
+                kind: None,
+                prompt_template: Some("do it".to_string()),
+                members: Some(vec![
+                    EnsembleMemberParams {
+                        platform: "claude".to_string(),
+                        model: None,
+                        prompt_override: None,
+                    },
+                    EnsembleMemberParams {
+                        platform: "openrouter".to_string(),
+                        model: None,
+                        prompt_override: None,
+                    },
+                ]),
+                blueprint: None,
+                from_node: entry.clone(),
+                condition: "always".to_string(),
+                min_pass: None,
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: arbiter.clone(),
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        let ensemble_id = extract_id(&created, "ensemble_id");
+
+        let updated = handler
+            .loop_update_ensemble(Parameters(LoopUpdateEnsembleParams {
+                ensemble_id: ensemble_id.clone(),
+                kind: Some("cascade".to_string()),
+                prompt_template: None,
+                members: None,
+                min_pass: None,
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: None,
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !is_err(&updated),
+            "updating kind to cascade should succeed: {:?}",
+            updated
+        );
+
+        let details = db.get_ensemble_details(&ensemble_id).unwrap().unwrap();
+        assert_eq!(details.ensemble.kind, EnsembleKind::Cascade);
     }
 }

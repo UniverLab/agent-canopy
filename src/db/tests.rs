@@ -5620,3 +5620,118 @@ fn no_retired_schema_name_identifiers_remain_outside_its_migration() {
     );
 }
 // RETIRED-SCHEMA-NAME-END
+
+#[test]
+fn ensemble_kind_migration_is_idempotent_and_pre_migration_db_opens_cleanly() {
+    let tmp = NamedTempFile::new().expect("create temp file");
+    let path = tmp.path().to_path_buf();
+    std::mem::forget(tmp);
+
+    {
+        let conn = rusqlite::Connection::open(&path).expect("open raw legacy db");
+        conn.execute_batch(
+            "CREATE TABLE loops (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                workdir TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at INTEGER NOT NULL,
+                archived INTEGER NOT NULL DEFAULT 0,
+                trigger_kind TEXT,
+                trigger_schedule TEXT,
+                trigger_path TEXT,
+                trigger_events TEXT,
+                trigger_debounce_seconds INTEGER,
+                trigger_recursive INTEGER,
+                on_completed_hook_platform TEXT,
+                on_completed_hook_prompt TEXT,
+                on_completed_hook_model TEXT,
+                on_completed_hook_timeout_minutes INTEGER
+            );
+            CREATE TABLE loop_specs (
+                id TEXT PRIMARY KEY,
+                loop_id TEXT REFERENCES loops(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                description TEXT,
+                position INTEGER NOT NULL,
+                parallelizable INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER,
+                spec_start_head TEXT,
+                workdir TEXT,
+                completed_via TEXT,
+                completed_via_reason TEXT,
+                completed_via_at INTEGER,
+                spec_committed_head TEXT
+            );
+            CREATE TABLE loop_nodes (
+                id TEXT PRIMARY KEY,
+                spec_id TEXT REFERENCES loop_specs(id) ON DELETE CASCADE,
+                loop_id TEXT REFERENCES loops(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                config TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE loop_edges (
+                id TEXT PRIMARY KEY,
+                spec_id TEXT REFERENCES loop_specs(id) ON DELETE CASCADE,
+                loop_id TEXT REFERENCES loops(id) ON DELETE CASCADE,
+                from_node TEXT NOT NULL REFERENCES loop_nodes(id) ON DELETE CASCADE,
+                to_node TEXT NOT NULL REFERENCES loop_nodes(id) ON DELETE CASCADE,
+                condition TEXT NOT NULL
+            );
+            CREATE TABLE ensembles (
+                id TEXT PRIMARY KEY,
+                spec_id TEXT REFERENCES loop_specs(id) ON DELETE CASCADE,
+                loop_id TEXT REFERENCES loops(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                prompt_template TEXT NOT NULL,
+                join_node_id TEXT NOT NULL REFERENCES loop_nodes(id) ON DELETE CASCADE,
+                entry_from_node TEXT NOT NULL REFERENCES loop_nodes(id) ON DELETE CASCADE,
+                entry_condition TEXT NOT NULL,
+                min_pass INTEGER NOT NULL,
+                straggler_timeout_minutes INTEGER,
+                timeout_minutes INTEGER NOT NULL,
+                on_pass_to TEXT NOT NULL REFERENCES loop_nodes(id) ON DELETE CASCADE,
+                on_fail_to TEXT REFERENCES loop_nodes(id) ON DELETE SET NULL,
+                created_at INTEGER NOT NULL,
+                CHECK ((spec_id IS NULL) <> (loop_id IS NULL))
+            );",
+        )
+        .expect("create legacy schema");
+    }
+
+    let db = Database::new(&path).expect("open pre-ensemble-kind db, running migration");
+
+    let has_kind: bool = {
+        let conn = rusqlite::Connection::open(&path).expect("reopen");
+        conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('ensembles') WHERE name = 'kind'",
+            [],
+            |row| Ok(row.get::<_, i32>(0)? > 0),
+        )
+        .unwrap()
+    };
+    assert!(has_kind, "migration should have added 'kind' column");
+
+    let has_rri: bool = {
+        let conn = rusqlite::Connection::open(&path).expect("reopen");
+        conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('ensembles') WHERE name = 'round_robin_index'",
+            [],
+            |row| Ok(row.get::<_, i32>(0)? > 0),
+        )
+        .unwrap()
+    };
+    assert!(
+        has_rri,
+        "migration should have added 'round_robin_index' column"
+    );
+
+    drop(db);
+    let _db2 = Database::new(&path).expect("reopen after migration — idempotent");
+}

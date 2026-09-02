@@ -10,8 +10,8 @@ use crate::application::notification_service::{LoopFinishOutcome, NotificationSe
 use crate::daemon::process::KILL_GRACE;
 use crate::db::Database;
 use crate::domain::loops::{
-    EnsembleDetails, EnsembleMember, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind,
-    LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus, RouterRoute,
+    EnsembleDetails, EnsembleKind, EnsembleMember, LoopEdge, LoopEdgeCondition, LoopNode,
+    LoopNodeKind, LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus, RouterRoute,
 };
 use crate::domain::models::Cli;
 
@@ -1763,6 +1763,41 @@ impl LoopEngine {
         all_node_names: &[String],
     ) -> Result<NodeExecution> {
         let ensemble = &details.ensemble;
+        match ensemble.kind {
+            EnsembleKind::Parallel => {}
+            EnsembleKind::Cascade => {
+                return self
+                    .execute_ensemble_cascade(
+                        lp,
+                        spec,
+                        details,
+                        nodes_by_id,
+                        previous_output,
+                        iteration,
+                        workdir,
+                        enforce_commit_rights,
+                        node_outputs,
+                        all_node_names,
+                    )
+                    .await;
+            }
+            EnsembleKind::RoundRobin => {
+                return self
+                    .execute_ensemble_round_robin(
+                        lp,
+                        spec,
+                        details,
+                        nodes_by_id,
+                        previous_output,
+                        iteration,
+                        workdir,
+                        enforce_commit_rights,
+                        node_outputs,
+                        all_node_names,
+                    )
+                    .await;
+            }
+        }
         // 0 is a legitimate value (mirrors `run_agent_process`'s own
         // `timeout_minutes`) — minute-granular timeouts otherwise have no way
         // to force an immediate one in a fast test.
@@ -2087,6 +2122,551 @@ impl LoopEngine {
         })?;
 
         Ok(execution)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_ensemble_cascade(
+        &self,
+        lp: &crate::domain::loops::Loop,
+        spec: &LoopSpec,
+        details: &EnsembleDetails,
+        nodes_by_id: &HashMap<&str, &LoopNode>,
+        previous_output: Option<&Value>,
+        iteration: usize,
+        workdir: &str,
+        enforce_commit_rights: bool,
+        node_outputs: &HashMap<String, Value>,
+        all_node_names: &[String],
+    ) -> Result<NodeExecution> {
+        let ensemble = &details.ensemble;
+        let straggler_minutes = ensemble.effective_straggler_timeout_minutes().max(0) as u64;
+
+        let any_member_may_commit = details.members.iter().any(|member| {
+            nodes_by_id
+                .get(member.node_id.as_str())
+                .is_some_and(|node| node_has_commit_rights(node))
+        });
+        let commit_watch =
+            CommitRightsWatch::begin(enforce_commit_rights, any_member_may_commit, workdir).await;
+
+        let previous_output_owned = previous_output.cloned();
+
+        for member in &details.members {
+            let node = (*nodes_by_id
+                .get(member.node_id.as_str())
+                .ok_or_else(|| anyhow!("Ensemble member node '{}' not found.", member.node_id))?)
+            .clone();
+
+            let run_id = uuid::Uuid::new_v4().to_string();
+            self.db.insert_loop_run(&LoopNodeRun {
+                id: run_id.clone(),
+                loop_id: lp.id.clone(),
+                spec_id: spec.id.clone(),
+                node_id: node.id.clone(),
+                status: LoopRunStatus::Running,
+                input: previous_output.cloned(),
+                output: None,
+                started_at: chrono::Utc::now(),
+                completed_at: None,
+                iteration: iteration as i64,
+                pid: None,
+                boot_id: crate::system::boot_id(),
+                session_id: None,
+            })?;
+
+            let db = Arc::clone(&self.db);
+            let lp = lp.clone();
+            let spec = spec.clone();
+            let previous_output = previous_output.cloned();
+            let workdir = workdir.to_string();
+            let dynamic_skills = self.dynamic_skills.clone();
+            let node_outputs = node_outputs.clone();
+            let all_node_names = all_node_names.to_vec();
+
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(straggler_minutes * 60),
+                async {
+                    let (retry_limit, crash_max_secs, backoff_secs) = read_infra_config(&node);
+                    let mut attempt: u32 = 0;
+                    let mut member_run_id = run_id.clone();
+                    let mut resume_candidate: Option<String> = None;
+                    loop {
+                        let execution = execute_agent_node(
+                            &db,
+                            &lp,
+                            &spec,
+                            &node,
+                            previous_output.as_ref(),
+                            &member_run_id,
+                            &workdir,
+                            resume_candidate.as_deref(),
+                            false,
+                            dynamic_skills.as_ref(),
+                            &node_outputs,
+                            &all_node_names,
+                        )
+                        .await?;
+                        let run = db.get_loop_run(&member_run_id)?.ok_or_else(|| {
+                            anyhow!("Loop run '{}' not found after execution.", member_run_id)
+                        })?;
+                        if is_infra_crash(
+                            &node,
+                            &execution,
+                            &run,
+                            attempt,
+                            retry_limit,
+                            crash_max_secs,
+                        ) {
+                            resume_candidate = run.session_id.clone();
+                            member_run_id = begin_infra_retry(
+                                &db,
+                                &lp,
+                                &spec,
+                                &node,
+                                previous_output.as_ref(),
+                                iteration as i64,
+                                &member_run_id,
+                                &execution.output,
+                                attempt,
+                                backoff_secs,
+                            )
+                            .await?;
+                            attempt += 1;
+                            continue;
+                        }
+                        // CM3: cascade falls back to the next member only when
+                        // this one produced no verdict — a retry-exhausted
+                        // infra crash. `is_infra_crash` above is already false
+                        // here (retries spent or never eligible), so re-check
+                        // the shape directly: the `infra_crash` output marker
+                        // lives only on the *retried* rows, never the final
+                        // settled one, so keying fallback off it would make a
+                        // crashing member look like a usable fail verdict.
+                        let member_had_no_verdict =
+                            is_infra_crash_shape(&node, &execution, &run, crash_max_secs);
+                        break Ok::<_, anyhow::Error>((
+                            execution,
+                            run,
+                            member_run_id.clone(),
+                            member_had_no_verdict,
+                        ));
+                    }
+                },
+            )
+            .await;
+
+            let (execution, member_had_no_verdict) = match outcome {
+                Ok(Ok((execution, run, final_run_id, no_verdict))) => {
+                    let execution = if run.status == LoopRunStatus::Running {
+                        let _ = db.update_loop_run_result(
+                            &final_run_id,
+                            execution.status,
+                            Some(&execution.output),
+                            Some(chrono::Utc::now()),
+                        );
+                        execution
+                    } else {
+                        NodeExecution {
+                            status: run.status,
+                            output: run.output.unwrap_or_else(|| serde_json::json!({})),
+                            summary: execution.summary,
+                        }
+                    };
+                    (execution, no_verdict)
+                }
+                // A hard error inside the retry loop — the member never
+                // produced a verdict, so the cascade tries the next one.
+                Ok(Err(error)) => (
+                    NodeExecution {
+                        status: LoopRunStatus::Fail,
+                        output: serde_json::json!({ "error": error.to_string() }),
+                        summary: format!("Ensemble member '{}' failed: {error}", node.name),
+                    },
+                    true,
+                ),
+                // Straggler timeout — the member was killed before it produced
+                // a verdict, so the cascade tries the next one.
+                Err(_elapsed) => {
+                    if let Ok(Some(run)) = db.get_active_loop_run_for_node(&node.id) {
+                        terminate_run_row(&db, &run, "ensemble straggler timeout");
+                    }
+                    (
+                        NodeExecution {
+                            status: LoopRunStatus::Fail,
+                            output: serde_json::json!({
+                                "kind": "agent",
+                                "node_id": node.id,
+                                "error": "straggler timeout",
+                            }),
+                            summary: format!(
+                                "Ensemble member '{}' killed: straggler timeout after {straggler_minutes}m.",
+                                node.name
+                            ),
+                        },
+                        true,
+                    )
+                }
+            };
+
+            if !member_had_no_verdict {
+                let join_status = execution.status;
+                let join_output = serde_json::json!({
+                    "kind": "cascade",
+                    "ensemble_id": ensemble.id,
+                    "winner": {
+                        "node_id": member.node_id,
+                        "platform": member.platform,
+                        "model": member.model,
+                        "status": if join_status == LoopRunStatus::Pass { "pass" } else { "fail" },
+                        "output": execution.output,
+                    },
+                    "members_tried": details.members.iter().position(|m| m.node_id == member.node_id).unwrap_or(0) + 1,
+                    "members_total": details.members.len(),
+                });
+
+                let mut join_execution = NodeExecution {
+                    status: join_status,
+                    output: join_output,
+                    summary: format!(
+                        "Cascade ensemble '{}' {} (member '{}' at position {}).",
+                        ensemble.name,
+                        if join_status == LoopRunStatus::Pass {
+                            "passed"
+                        } else {
+                            "failed"
+                        },
+                        node.name,
+                        member.position,
+                    ),
+                };
+
+                if let Some(watch) = &commit_watch {
+                    if let Some(head_after) = watch.violation(&workdir).await {
+                        join_execution = commit_rights_failure(
+                            &format!("Ensemble '{}' (cascade member)", ensemble.name),
+                            &ensemble.join_node_id,
+                            &watch.head_before,
+                            &head_after,
+                            join_execution.output,
+                        );
+                    }
+                }
+
+                self.db.insert_loop_run(&LoopNodeRun {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    loop_id: lp.id.clone(),
+                    spec_id: spec.id.clone(),
+                    node_id: ensemble.join_node_id.clone(),
+                    status: join_execution.status,
+                    input: previous_output_owned.clone(),
+                    output: Some(join_execution.output.clone()),
+                    started_at: chrono::Utc::now(),
+                    completed_at: Some(chrono::Utc::now()),
+                    iteration: iteration as i64,
+                    pid: None,
+                    boot_id: crate::system::boot_id(),
+                    session_id: None,
+                })?;
+
+                return Ok(join_execution);
+            }
+
+            tracing::info!(
+                ensemble_id = %ensemble.id,
+                member = %node.name,
+                position = member.position,
+                "cascade member infra-crashed, trying next"
+            );
+        }
+
+        let join_output = serde_json::json!({
+            "kind": "cascade",
+            "ensemble_id": ensemble.id,
+            "error": "all members infra-crashed",
+            "members_tried": details.members.len(),
+            "members_total": details.members.len(),
+        });
+
+        let mut execution = NodeExecution {
+            status: LoopRunStatus::Fail,
+            output: join_output,
+            summary: format!(
+                "Cascade ensemble '{}' failed: all {} members infra-crashed.",
+                ensemble.name,
+                details.members.len(),
+            ),
+        };
+
+        if let Some(watch) = &commit_watch {
+            #[allow(clippy::needless_borrow)]
+            if let Some(head_after) = watch.violation(&workdir).await {
+                execution = commit_rights_failure(
+                    &format!("Ensemble '{}' (cascade)", ensemble.name),
+                    &ensemble.join_node_id,
+                    &watch.head_before,
+                    &head_after,
+                    execution.output,
+                );
+            }
+        }
+
+        self.db.insert_loop_run(&LoopNodeRun {
+            id: uuid::Uuid::new_v4().to_string(),
+            loop_id: lp.id.clone(),
+            spec_id: spec.id.clone(),
+            node_id: ensemble.join_node_id.clone(),
+            status: execution.status,
+            input: previous_output_owned.clone(),
+            output: Some(execution.output.clone()),
+            started_at: chrono::Utc::now(),
+            completed_at: Some(chrono::Utc::now()),
+            iteration: iteration as i64,
+            pid: None,
+            boot_id: crate::system::boot_id(),
+            session_id: None,
+        })?;
+
+        Ok(execution)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_ensemble_round_robin(
+        &self,
+        lp: &crate::domain::loops::Loop,
+        spec: &LoopSpec,
+        details: &EnsembleDetails,
+        nodes_by_id: &HashMap<&str, &LoopNode>,
+        previous_output: Option<&Value>,
+        iteration: usize,
+        workdir: &str,
+        enforce_commit_rights: bool,
+        node_outputs: &HashMap<String, Value>,
+        all_node_names: &[String],
+    ) -> Result<NodeExecution> {
+        let ensemble = &details.ensemble;
+        let member_count = details.members.len() as i64;
+        if member_count == 0 {
+            return Err(anyhow!(
+                "Round-robin ensemble '{}' has no members to run.",
+                ensemble.id
+            ));
+        }
+        // `details` is a per-dispatch snapshot; re-read the persisted index so
+        // a second visit to this ensemble in the same dispatch still advances
+        // rather than replaying the stale in-memory value.
+        let persisted_index = self
+            .db
+            .get_ensemble(&ensemble.id)
+            .ok()
+            .flatten()
+            .and_then(|e| e.round_robin_index)
+            .or(ensemble.round_robin_index)
+            .unwrap_or(0);
+        let current_index = persisted_index.rem_euclid(member_count);
+        let member = &details.members[current_index as usize];
+
+        let next_index = (current_index + 1).rem_euclid(member_count);
+        self.db
+            .update_ensemble_kind(&ensemble.id, None, Some(Some(next_index)))?;
+
+        let node = (*nodes_by_id
+            .get(member.node_id.as_str())
+            .ok_or_else(|| anyhow!("Ensemble member node '{}' not found.", member.node_id))?)
+        .clone();
+
+        let straggler_minutes = ensemble.effective_straggler_timeout_minutes().max(0) as u64;
+
+        let any_member_may_commit = node_has_commit_rights(&node);
+        let commit_watch =
+            CommitRightsWatch::begin(enforce_commit_rights, any_member_may_commit, workdir).await;
+
+        let previous_output_owned = previous_output.cloned();
+
+        let run_id = uuid::Uuid::new_v4().to_string();
+        self.db.insert_loop_run(&LoopNodeRun {
+            id: run_id.clone(),
+            loop_id: lp.id.clone(),
+            spec_id: spec.id.clone(),
+            node_id: node.id.clone(),
+            status: LoopRunStatus::Running,
+            input: previous_output.cloned(),
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: iteration as i64,
+            pid: None,
+            boot_id: crate::system::boot_id(),
+            session_id: None,
+        })?;
+
+        let db = Arc::clone(&self.db);
+        let lp_clone = lp.clone();
+        let spec_clone = spec.clone();
+        let previous_output = previous_output.cloned();
+        let workdir = workdir.to_string();
+        let dynamic_skills = self.dynamic_skills.clone();
+        let node_outputs = node_outputs.clone();
+        let all_node_names = all_node_names.to_vec();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(straggler_minutes * 60),
+            async {
+                let (retry_limit, crash_max_secs, backoff_secs) = read_infra_config(&node);
+                let mut attempt: u32 = 0;
+                let mut member_run_id = run_id.clone();
+                let mut resume_candidate: Option<String> = None;
+                loop {
+                    let execution = execute_agent_node(
+                        &db,
+                        &lp_clone,
+                        &spec_clone,
+                        &node,
+                        previous_output.as_ref(),
+                        &member_run_id,
+                        &workdir,
+                        resume_candidate.as_deref(),
+                        false,
+                        dynamic_skills.as_ref(),
+                        &node_outputs,
+                        &all_node_names,
+                    )
+                    .await?;
+                    let run = db.get_loop_run(&member_run_id)?.ok_or_else(|| {
+                        anyhow!("Loop run '{}' not found after execution.", member_run_id)
+                    })?;
+                    if is_infra_crash(
+                        &node,
+                        &execution,
+                        &run,
+                        attempt,
+                        retry_limit,
+                        crash_max_secs,
+                    ) {
+                        resume_candidate = run.session_id.clone();
+                        member_run_id = begin_infra_retry(
+                            &db,
+                            &lp_clone,
+                            &spec_clone,
+                            &node,
+                            previous_output.as_ref(),
+                            iteration as i64,
+                            &member_run_id,
+                            &execution.output,
+                            attempt,
+                            backoff_secs,
+                        )
+                        .await?;
+                        attempt += 1;
+                        continue;
+                    }
+                    break Ok::<_, anyhow::Error>((execution, run, member_run_id.clone()));
+                }
+            },
+        )
+        .await;
+
+        let execution = match outcome {
+            Ok(Ok((execution, run, final_run_id))) => {
+                if run.status == LoopRunStatus::Running {
+                    let _ = db.update_loop_run_result(
+                        &final_run_id,
+                        execution.status,
+                        Some(&execution.output),
+                        Some(chrono::Utc::now()),
+                    );
+                    execution
+                } else {
+                    NodeExecution {
+                        status: run.status,
+                        output: run.output.unwrap_or_else(|| serde_json::json!({})),
+                        summary: execution.summary,
+                    }
+                }
+            }
+            Ok(Err(error)) => NodeExecution {
+                status: LoopRunStatus::Fail,
+                output: serde_json::json!({ "error": error.to_string() }),
+                summary: format!("Ensemble member '{}' failed: {error}", node.name),
+            },
+            Err(_elapsed) => {
+                if let Ok(Some(run)) = db.get_active_loop_run_for_node(&node.id) {
+                    terminate_run_row(&db, &run, "ensemble straggler timeout");
+                }
+                NodeExecution {
+                    status: LoopRunStatus::Fail,
+                    output: serde_json::json!({
+                        "kind": "agent",
+                        "node_id": node.id,
+                        "error": "straggler timeout",
+                    }),
+                    summary: format!(
+                        "Ensemble member '{}' killed: straggler timeout after {straggler_minutes}m.",
+                        node.name
+                    ),
+                }
+            }
+        };
+
+        let join_status = execution.status;
+        let join_output = serde_json::json!({
+            "kind": "round_robin",
+            "ensemble_id": ensemble.id,
+            "member": {
+                "node_id": member.node_id,
+                "platform": member.platform,
+                "model": member.model,
+                "position": member.position,
+                "status": if join_status == LoopRunStatus::Pass { "pass" } else { "fail" },
+                "output": execution.output,
+            },
+            "next_index": next_index,
+        });
+
+        let mut join_execution = NodeExecution {
+            status: join_status,
+            output: join_output,
+            summary: format!(
+                "Round-robin ensemble '{}' {} (member '{}' at position {}).",
+                ensemble.name,
+                if join_status == LoopRunStatus::Pass {
+                    "passed"
+                } else {
+                    "failed"
+                },
+                node.name,
+                member.position,
+            ),
+        };
+
+        if let Some(watch) = &commit_watch {
+            if let Some(head_after) = watch.violation(&workdir).await {
+                join_execution = commit_rights_failure(
+                    &format!("Ensemble '{}' (round-robin member)", ensemble.name),
+                    &ensemble.join_node_id,
+                    &watch.head_before,
+                    &head_after,
+                    join_execution.output,
+                );
+            }
+        }
+
+        self.db.insert_loop_run(&LoopNodeRun {
+            id: uuid::Uuid::new_v4().to_string(),
+            loop_id: lp.id.clone(),
+            spec_id: spec.id.clone(),
+            node_id: ensemble.join_node_id.clone(),
+            status: join_execution.status,
+            input: previous_output_owned,
+            output: Some(join_execution.output.clone()),
+            started_at: chrono::Utc::now(),
+            completed_at: Some(chrono::Utc::now()),
+            iteration: iteration as i64,
+            pid: None,
+            boot_id: crate::system::boot_id(),
+            session_id: None,
+        })?;
+
+        Ok(join_execution)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9075,6 +9655,8 @@ echo done
                 timeout_minutes: 30,
                 on_pass_to: "arbiter".to_string(),
                 on_fail_to: None,
+                kind: crate::domain::loops::EnsembleKind::Parallel,
+                round_robin_index: None,
                 created_at: chrono::Utc::now(),
             },
             members: member_node_ids
@@ -12717,6 +13299,8 @@ echo done
             timeout_minutes: 5,
             on_pass_to: on_pass_to.to_string(),
             on_fail_to: on_fail_to.map(str::to_string),
+            kind: crate::domain::loops::EnsembleKind::Parallel,
+            round_robin_index: None,
             created_at: now,
         };
         let ensemble_members: Vec<EnsembleMember> = members
@@ -13184,6 +13768,8 @@ echo done
             timeout_minutes: 5,
             on_pass_to: "on-pass".to_string(),
             on_fail_to: None,
+            kind: crate::domain::loops::EnsembleKind::Parallel,
+            round_robin_index: None,
             created_at: now,
         };
         let ensemble_members: Vec<EnsembleMember> = overrides
@@ -13444,6 +14030,8 @@ echo done
             timeout_minutes: 5,
             on_pass_to: "done".to_string(),
             on_fail_to: None,
+            kind: crate::domain::loops::EnsembleKind::Parallel,
+            round_robin_index: None,
             created_at: now,
         };
         let ensemble_members: Vec<EnsembleMember> = members
@@ -13478,6 +14066,337 @@ echo done
             .collect();
         runs.sort_by_key(|r| r.started_at);
         runs
+    }
+
+    /// CM3: like [`insert_infra_ensemble`] but for the non-parallel kinds.
+    /// Sets `ensemble.kind` (and `round_robin_index: Some(0)` for round-robin)
+    /// and wires the join to BOTH a pass and a fail terminal so a test can
+    /// observe which verdict the ensemble routed on. `infra_backoff_seconds:
+    /// 0` keeps the retry path fast.
+    fn insert_kind_ensemble(
+        db: &Database,
+        spec_id: &str,
+        kind: crate::domain::loops::EnsembleKind,
+        members: &[(&str, &str)],
+    ) {
+        let now = chrono::Utc::now();
+        db.insert_loop_node(&LoopNode {
+            id: "kickoff".to_string(),
+            spec_id: Some(spec_id.to_string()),
+            loop_id: None,
+            name: "kickoff".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({ "command": "printf ok", "success_condition": "exit_code_0" }),
+            position: 1,
+            created_at: now,
+        })
+        .unwrap();
+
+        let member_nodes: Vec<LoopNode> = members
+            .iter()
+            .enumerate()
+            .map(|(i, (node_id, platform))| LoopNode {
+                id: node_id.to_string(),
+                spec_id: Some(spec_id.to_string()),
+                loop_id: None,
+                name: format!("member-{}", i + 1),
+                kind: LoopNodeKind::Agent,
+                config: serde_json::json!({
+                    "platform": platform,
+                    "prompt_template": "ignored by the member's test script",
+                    "timeout_minutes": 5,
+                    "infra_backoff_seconds": 0,
+                }),
+                position: 2 + i as i64,
+                created_at: now,
+            })
+            .collect();
+
+        let join_node = LoopNode {
+            id: "join1".to_string(),
+            spec_id: Some(spec_id.to_string()),
+            loop_id: None,
+            name: "join".to_string(),
+            kind: LoopNodeKind::Join,
+            config: serde_json::json!({ "ensemble_id": "ens1" }),
+            position: 50,
+            created_at: now,
+        };
+
+        let mut edges = Vec::new();
+        for (node_id, _) in members {
+            edges.push(LoopEdge {
+                id: format!("kickoff->{node_id}"),
+                spec_id: Some(spec_id.to_string()),
+                loop_id: None,
+                from_node: "kickoff".to_string(),
+                to_node: node_id.to_string(),
+                condition: LoopEdgeCondition::Always,
+            });
+            edges.push(LoopEdge {
+                id: format!("{node_id}->join1"),
+                spec_id: Some(spec_id.to_string()),
+                loop_id: None,
+                from_node: node_id.to_string(),
+                to_node: "join1".to_string(),
+                condition: LoopEdgeCondition::Always,
+            });
+        }
+        for (i, (term, cond)) in [
+            ("done-pass", LoopEdgeCondition::Pass),
+            ("done-fail", LoopEdgeCondition::Fail),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            db.insert_loop_node(&LoopNode {
+                id: term.to_string(),
+                spec_id: Some(spec_id.to_string()),
+                loop_id: None,
+                name: term.to_string(),
+                kind: LoopNodeKind::Check,
+                config: serde_json::json!({ "command": "printf ok", "success_condition": "exit_code_0" }),
+                position: 100 + i as i64,
+                created_at: now,
+            })
+            .unwrap();
+            edges.push(LoopEdge {
+                id: format!("join1->{term}"),
+                spec_id: Some(spec_id.to_string()),
+                loop_id: None,
+                from_node: "join1".to_string(),
+                to_node: term.to_string(),
+                condition: cond,
+            });
+        }
+
+        let ensemble = crate::domain::loops::Ensemble {
+            id: "ens1".to_string(),
+            spec_id: Some(spec_id.to_string()),
+            loop_id: None,
+            name: "Switched Ensemble".to_string(),
+            prompt_template: "ignored by the member's test script".to_string(),
+            join_node_id: "join1".to_string(),
+            entry_from_node: "kickoff".to_string(),
+            entry_condition: LoopEdgeCondition::Always,
+            min_pass: 1,
+            straggler_timeout_minutes: Some(1),
+            timeout_minutes: 5,
+            on_pass_to: "done-pass".to_string(),
+            on_fail_to: Some("done-fail".to_string()),
+            kind,
+            round_robin_index: if kind == crate::domain::loops::EnsembleKind::RoundRobin {
+                Some(0)
+            } else {
+                None
+            },
+            created_at: now,
+        };
+        let ensemble_members: Vec<EnsembleMember> = members
+            .iter()
+            .enumerate()
+            .map(|(i, (node_id, platform))| EnsembleMember {
+                ensemble_id: "ens1".to_string(),
+                node_id: node_id.to_string(),
+                position: i as i64,
+                platform: platform.to_string(),
+                model: None,
+                prompt_override: None,
+            })
+            .collect();
+
+        db.insert_ensemble_unit(
+            &ensemble,
+            &ensemble_members,
+            &member_nodes,
+            &join_node,
+            &edges,
+        )
+        .unwrap();
+    }
+
+    /// CM3: cascade tries members in order and, when the first produces no
+    /// verdict (a retry-exhausted infra crash — `exit 1`), falls back to the
+    /// next one. The fallback member's pass becomes the ensemble's verdict.
+    #[tokio::test]
+    async fn cascade_falls_back_to_next_member_when_first_produces_no_verdict() {
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        let fake_home = setup_multi_cli_home(&[
+            (
+                "m-crash",
+                &write_member_script(dir.path(), "crash.sh", "exit 1"),
+            ),
+            (
+                "m-ok",
+                &write_member_script(dir.path(), "ok.sh", "printf ok"),
+            ),
+        ]);
+        insert_kind_ensemble(
+            &db,
+            &spec_id,
+            crate::domain::loops::EnsembleKind::Cascade,
+            &[("m-crash", "m-crash"), ("m-ok", "m-ok")],
+        );
+
+        let _home = HomeGuard::set(fake_home.path());
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        drop(_home);
+
+        let join = join_run(&db, &spec_id, "join1");
+        assert_eq!(
+            join.status,
+            LoopRunStatus::Pass,
+            "fallback member passed -> cascade passes"
+        );
+        let out = join.output.as_ref().unwrap();
+        assert_eq!(out["kind"], "cascade");
+        assert_eq!(out["winner"]["node_id"], "m-ok");
+        assert_eq!(out["members_tried"], 2);
+
+        assert!(
+            !member_runs(&db, &spec_id, "m-ok").is_empty(),
+            "the fallback member must actually run"
+        );
+        assert_eq!(
+            member_runs(&db, &spec_id, "m-crash").len(),
+            3,
+            "first member exhausts its infra-retry budget (attempts 0,1,2) before fallback"
+        );
+    }
+
+    /// CM3 / CM2: a member that returns a *negative verdict* (here `exit 0`
+    /// with empty stdout -> `no_output` Fail) is a usable result — cascade
+    /// accepts it and never runs the next member. Only "no verdict" triggers
+    /// fallback.
+    #[tokio::test]
+    async fn cascade_stops_on_negative_verdict_without_trying_next_member() {
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        let fake_home = setup_multi_cli_home(&[
+            (
+                "m-noout",
+                &write_member_script(dir.path(), "noout.sh", "exit 0"),
+            ),
+            (
+                "m-ok",
+                &write_member_script(dir.path(), "ok.sh", "printf ok"),
+            ),
+        ]);
+        insert_kind_ensemble(
+            &db,
+            &spec_id,
+            crate::domain::loops::EnsembleKind::Cascade,
+            &[("m-noout", "m-noout"), ("m-ok", "m-ok")],
+        );
+
+        let _home = HomeGuard::set(fake_home.path());
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        drop(_home);
+
+        let join = join_run(&db, &spec_id, "join1");
+        assert_eq!(
+            join.status,
+            LoopRunStatus::Fail,
+            "the first member's negative verdict is the ensemble's verdict"
+        );
+        let out = join.output.as_ref().unwrap();
+        assert_eq!(out["kind"], "cascade");
+        assert_eq!(out["winner"]["node_id"], "m-noout");
+        assert_eq!(out["members_tried"], 1);
+        assert!(
+            member_runs(&db, &spec_id, "m-ok").is_empty(),
+            "cascade must not run the next member after a usable verdict"
+        );
+    }
+
+    /// CM3: round-robin runs exactly one member per invocation, rotating
+    /// through them in position order and wrapping — the persisted
+    /// `round_robin_index` advances each time and survives across runs.
+    #[tokio::test]
+    async fn round_robin_spreads_invocations_across_members_in_order() {
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        let fake_home = setup_multi_cli_home(&[
+            (
+                "rr-a",
+                &write_member_script(dir.path(), "a.sh", "printf ok"),
+            ),
+            (
+                "rr-b",
+                &write_member_script(dir.path(), "b.sh", "printf ok"),
+            ),
+            (
+                "rr-c",
+                &write_member_script(dir.path(), "c.sh", "printf ok"),
+            ),
+        ]);
+        insert_kind_ensemble(
+            &db,
+            &spec_id,
+            crate::domain::loops::EnsembleKind::RoundRobin,
+            &[("rr-a", "rr-a"), ("rr-b", "rr-b"), ("rr-c", "rr-c")],
+        );
+
+        let _home = HomeGuard::set(fake_home.path());
+        let expected = ["rr-a", "rr-b", "rr-c", "rr-a"];
+        for (i, want) in expected.iter().enumerate() {
+            db.update_loop_spec_status(&spec_id, LoopSpecStatus::Pending, None, None)
+                .unwrap();
+            db.update_loop_status(&loop_id, LoopStatus::Draft, None, None)
+                .unwrap();
+            engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+
+            let join = join_run(&db, &spec_id, "join1");
+            let out = join.output.as_ref().unwrap();
+            assert_eq!(out["kind"], "round_robin");
+            assert_eq!(
+                out["member"]["node_id"], *want,
+                "invocation {i} must run member {want}"
+            );
+            let ens = db.get_ensemble("ens1").unwrap().unwrap();
+            assert_eq!(
+                ens.round_robin_index,
+                Some(((i as i64) + 1) % 3),
+                "the persisted index advances after invocation {i}"
+            );
+            for other in ["rr-a", "rr-b", "rr-c"].iter().filter(|m| *m != want) {
+                assert!(
+                    member_runs(&db, &spec_id, other).len() <= i,
+                    "invocation {i} must not also run {other}"
+                );
+            }
+        }
+        drop(_home);
+    }
+
+    /// CM3: the default (parallel/quorum) kind is unchanged — every member
+    /// runs and the join emits the `quorum` shape against `min_pass`.
+    #[tokio::test]
+    async fn parallel_ensemble_join_output_unchanged() {
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        let fake_home = setup_multi_cli_home(&[
+            ("p-a", &write_member_script(dir.path(), "a.sh", "printf ok")),
+            ("p-b", &write_member_script(dir.path(), "b.sh", "printf ok")),
+        ]);
+        insert_kind_ensemble(
+            &db,
+            &spec_id,
+            crate::domain::loops::EnsembleKind::Parallel,
+            &[("p-a", "p-a"), ("p-b", "p-b")],
+        );
+
+        let _home = HomeGuard::set(fake_home.path());
+        engine.run_loop(loop_id.clone(), None, None).await.unwrap();
+        drop(_home);
+
+        let join = join_run(&db, &spec_id, "join1");
+        assert_eq!(join.status, LoopRunStatus::Pass);
+        let out = join.output.as_ref().unwrap();
+        assert_eq!(
+            out["kind"], "quorum",
+            "parallel keeps the quorum join shape"
+        );
+        assert_eq!(out["passed"], 2);
+        assert!(!member_runs(&db, &spec_id, "p-a").is_empty());
+        assert!(!member_runs(&db, &spec_id, "p-b").is_empty());
     }
 
     /// A crashed member (fast nonzero exit, no self-report) is retried in

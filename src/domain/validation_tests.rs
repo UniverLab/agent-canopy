@@ -158,6 +158,8 @@ mod ensemble_graph {
             timeout_minutes: 30,
             on_pass_to: "arbiter".to_string(),
             on_fail_to: None,
+            kind: crate::domain::loops::EnsembleKind::Parallel,
+            round_robin_index: None,
             created_at: Utc::now(),
         };
         let members = vec![
@@ -232,6 +234,67 @@ mod ensemble_graph {
         details[0].ensemble.min_pass = 5;
         let err = validate_ensembles_in_graph(&details, &nodes, &edges).unwrap_err();
         assert!(err.contains("invalid min_pass"));
+    }
+
+    fn single_member_fixture(
+        kind: crate::domain::loops::EnsembleKind,
+    ) -> (Vec<EnsembleDetails>, Vec<LoopNode>, Vec<LoopEdge>) {
+        let ensemble = Ensemble {
+            id: "ens1".to_string(),
+            spec_id: Some("spec".to_string()),
+            loop_id: None,
+            name: "Solo".to_string(),
+            prompt_template: "{{spec_content}}".to_string(),
+            join_node_id: "join1".to_string(),
+            entry_from_node: "kickoff".to_string(),
+            entry_condition: LoopEdgeCondition::Always,
+            min_pass: 1,
+            straggler_timeout_minutes: None,
+            timeout_minutes: 30,
+            on_pass_to: "sink".to_string(),
+            on_fail_to: None,
+            kind,
+            round_robin_index: None,
+            created_at: Utc::now(),
+        };
+        let members = vec![EnsembleMember {
+            ensemble_id: "ens1".to_string(),
+            node_id: "m1".to_string(),
+            position: 0,
+            platform: "claude".to_string(),
+            model: None,
+            prompt_override: None,
+        }];
+        let details = vec![EnsembleDetails { ensemble, members }];
+        let nodes = vec![node("kickoff"), node("m1"), node("join1"), node("sink")];
+        let edges = vec![
+            edge("kickoff", "m1", LoopEdgeCondition::Always),
+            edge("m1", "join1", LoopEdgeCondition::Always),
+            edge("join1", "sink", LoopEdgeCondition::Pass),
+        ];
+        (details, nodes, edges)
+    }
+
+    #[test]
+    fn cascade_ensemble_with_one_member_passes_graph_validation() {
+        let (details, nodes, edges) =
+            single_member_fixture(crate::domain::loops::EnsembleKind::Cascade);
+        assert!(validate_ensembles_in_graph(&details, &nodes, &edges).is_ok());
+    }
+
+    #[test]
+    fn round_robin_ensemble_with_one_member_passes_graph_validation() {
+        let (details, nodes, edges) =
+            single_member_fixture(crate::domain::loops::EnsembleKind::RoundRobin);
+        assert!(validate_ensembles_in_graph(&details, &nodes, &edges).is_ok());
+    }
+
+    #[test]
+    fn parallel_ensemble_with_one_member_still_rejected() {
+        let (details, nodes, edges) =
+            single_member_fixture(crate::domain::loops::EnsembleKind::Parallel);
+        let err = validate_ensembles_in_graph(&details, &nodes, &edges).unwrap_err();
+        assert!(err.contains("fewer than 2 members"));
     }
 }
 

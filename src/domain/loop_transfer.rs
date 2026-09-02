@@ -23,8 +23,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::domain::loops::{
-    Ensemble, EnsembleDetails, EnsembleMember, Loop, LoopEdge, LoopEdgeCondition, LoopNode,
-    LoopNodeKind,
+    Ensemble, EnsembleDetails, EnsembleKind, EnsembleMember, Loop, LoopEdge, LoopEdgeCondition,
+    LoopNode, LoopNodeKind,
 };
 use crate::domain::validation::{
     validate_ensembles_in_graph, validate_loop_graph, GraphEdgeView, GraphNodeView,
@@ -91,6 +91,8 @@ pub struct LoopExportEnsembleMember {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LoopExportEnsemble {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     pub prompt_template: String,
     pub entry_from_node: String,
     pub entry_condition: LoopEdgeCondition,
@@ -233,6 +235,11 @@ pub fn build_export_document(
 
         export_ensembles.push(LoopExportEnsemble {
             name: ensemble.name.clone(),
+            kind: if ensemble.kind == EnsembleKind::Parallel {
+                None
+            } else {
+                Some(ensemble.kind.as_str().to_string())
+            },
             prompt_template: ensemble.prompt_template.clone(),
             entry_from_node: resolve_name(&ensemble.entry_from_node)?,
             entry_condition: ensemble.entry_condition.clone(),
@@ -487,11 +494,20 @@ pub fn build_import_plan(
 
     let mut ensembles = Vec::with_capacity(document.ensembles.len());
     for doc_ensemble in &document.ensembles {
-        if doc_ensemble.members.len() < ENSEMBLE_MIN_MEMBERS
+        let import_kind = doc_ensemble
+            .kind
+            .as_deref()
+            .and_then(EnsembleKind::from_str)
+            .unwrap_or(EnsembleKind::Parallel);
+        let min_members = match import_kind {
+            EnsembleKind::Parallel => ENSEMBLE_MIN_MEMBERS,
+            EnsembleKind::Cascade | EnsembleKind::RoundRobin => 1,
+        };
+        if doc_ensemble.members.len() < min_members
             || doc_ensemble.members.len() > ENSEMBLE_MAX_MEMBERS
         {
             return Err(format!(
-                "Ensemble '{}' must have {ENSEMBLE_MIN_MEMBERS}-{ENSEMBLE_MAX_MEMBERS} members, got {}.",
+                "Ensemble '{}' must have {min_members}-{ENSEMBLE_MAX_MEMBERS} members, got {}.",
                 doc_ensemble.name,
                 doc_ensemble.members.len()
             ));
@@ -619,6 +635,12 @@ pub fn build_import_plan(
             });
         }
 
+        let import_kind = doc_ensemble
+            .kind
+            .as_deref()
+            .and_then(EnsembleKind::from_str)
+            .unwrap_or(EnsembleKind::Parallel);
+
         ensembles.push(LoopImportEnsemblePlan {
             ensemble: Ensemble {
                 id: ensemble_id,
@@ -634,6 +656,12 @@ pub fn build_import_plan(
                 timeout_minutes: doc_ensemble.timeout_minutes,
                 on_pass_to,
                 on_fail_to,
+                kind: import_kind,
+                round_robin_index: if import_kind == EnsembleKind::RoundRobin {
+                    Some(0)
+                } else {
+                    None
+                },
                 created_at: now,
             },
             members,
@@ -1029,6 +1057,8 @@ mod tests {
             timeout_minutes: 30,
             on_pass_to: on_pass_to.to_string(),
             on_fail_to: None,
+            kind: EnsembleKind::Parallel,
+            round_robin_index: None,
             created_at: Utc::now(),
         };
         let members = member_ids
@@ -1261,6 +1291,7 @@ mod tests {
             edges: vec![],
             ensembles: vec![LoopExportEnsemble {
                 name: "solo".to_string(),
+                kind: None,
                 prompt_template: "go".to_string(),
                 entry_from_node: "kickoff".to_string(),
                 entry_condition: LoopEdgeCondition::Always,

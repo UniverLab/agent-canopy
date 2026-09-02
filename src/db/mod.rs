@@ -1216,6 +1216,36 @@ impl Database {
             .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
         }
 
+        let has_ensemble_kind: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('ensembles') WHERE name = 'kind'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_ensemble_kind {
+            conn.execute(
+                "ALTER TABLE ensembles ADD COLUMN kind TEXT NOT NULL DEFAULT 'parallel'",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        let has_round_robin_index: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('ensembles') WHERE name = 'round_robin_index'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_round_robin_index {
+            conn.execute(
+                "ALTER TABLE ensembles ADD COLUMN round_robin_index INTEGER",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
         Self::set_schema_version(&conn)?;
 
         Ok(())

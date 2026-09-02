@@ -277,6 +277,7 @@ mod tests {
             edges: vec![],
             ensembles: vec![LoopExportEnsemble {
                 name: "Proposers".to_string(),
+                kind: None,
                 prompt_template: "draft it".to_string(),
                 entry_from_node: "kickoff".to_string(),
                 entry_condition: LoopEdgeCondition::Always,

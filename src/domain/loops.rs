@@ -875,6 +875,44 @@ pub struct LoopDetails {
 /// engine's existing graph-walking code needs only the ensemble-aware
 /// fan-out/fan-in added in `loop_engine`.
 ///
+/// The execution strategy for an ensemble — how members are selected and
+/// how the ensemble's own pass/fail is determined from their results.
+///
+/// - `Parallel`: every member runs concurrently; the join waits for all and
+///   counts passes against `min_pass`. The original (and default) type.
+/// - `Cascade`: members are tried in `position` order; the first one that
+///   produces a usable result (not an infra crash) wins and the rest never
+///   run. Quota savings is the reason this type exists.
+/// - `RoundRobin`: invocations rotate across members by position, spreading
+///   quota consumption. Requires persistent state (`round_robin_index`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnsembleKind {
+    #[default]
+    Parallel,
+    Cascade,
+    RoundRobin,
+}
+
+impl EnsembleKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EnsembleKind::Parallel => "parallel",
+            EnsembleKind::Cascade => "cascade",
+            EnsembleKind::RoundRobin => "round_robin",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "parallel" => Some(EnsembleKind::Parallel),
+            "cascade" => Some(EnsembleKind::Cascade),
+            "round_robin" => Some(EnsembleKind::RoundRobin),
+            _ => None,
+        }
+    }
+}
+
 /// Exactly one of `spec_id`/`loop_id` is set — same invariant as
 /// [`LoopNode`]/[`LoopEdge`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -908,6 +946,8 @@ pub struct Ensemble {
     /// matching outgoing edge).
     pub on_pass_to: String,
     pub on_fail_to: Option<String>,
+    pub kind: EnsembleKind,
+    pub round_robin_index: Option<i64>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -1130,6 +1170,8 @@ Task:
             timeout_minutes: 30,
             on_pass_to: "arbiter".to_string(),
             on_fail_to: None,
+            kind: super::EnsembleKind::Parallel,
+            round_robin_index: None,
             created_at: chrono::Utc::now(),
         };
         assert_eq!(ensemble.effective_straggler_timeout_minutes(), 30);
