@@ -11,6 +11,46 @@ use crate::daemon::process::{
 use crate::db::Database;
 use crate::domain::db_paths::database_path;
 
+/// Human-readable name for display in doctor messages.
+impl crate::rag::embedding_client::EmbeddingProvider {
+    pub fn name(&self) -> &'static str {
+        match self {
+            crate::rag::embedding_client::EmbeddingProvider::OpenAi => "OpenAI",
+            crate::rag::embedding_client::EmbeddingProvider::Gemini => "Gemini",
+            crate::rag::embedding_client::EmbeddingProvider::Local => "Local",
+        }
+    }
+}
+
+/// CB19: classify the embeddings_model config before doctor prints or
+/// walks API-key / ONNX paths. Pure so unit tests can assert the
+/// "not configured" vs "configured but unrunnable" distinction without
+/// spinning up a full `run_doctor` (those black-box tests stay `#[ignore]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EmbeddingsConfigDiagnosis {
+    /// Empty model string — nothing is configured to judge.
+    NotConfigured,
+    /// A provider is named in config but this binary cannot serve it.
+    ProviderUnavailable { provider_name: &'static str },
+    /// Model string is non-empty and either maps to an available provider
+    /// or is unrecognized (caller continues into key / support checks).
+    Configured,
+}
+
+pub(crate) fn diagnose_embeddings_config(model: &str) -> EmbeddingsConfigDiagnosis {
+    if model.is_empty() {
+        return EmbeddingsConfigDiagnosis::NotConfigured;
+    }
+    match crate::rag::embedding_client::provider_for_model(model) {
+        Some(p) if !crate::rag::embedding_client::provider_available(p) => {
+            EmbeddingsConfigDiagnosis::ProviderUnavailable {
+                provider_name: p.name(),
+            }
+        }
+        Some(_) | None => EmbeddingsConfigDiagnosis::Configured,
+    }
+}
+
 /// Print doctor's "verified" line — the ✓ glyph reserved for a check that
 /// actually exercised the capability it reports on (opened the database,
 /// opened the vector store, confirmed a resolved binary is executable,
@@ -331,37 +371,48 @@ pub(crate) async fn run_doctor() -> Result<()> {
     let config = crate::domain::canopy_config::CanopyConfig::load(&canopy_dir);
 
     // declaration: names the configured model string; whether it's actually
-    // usable is what the branches below (API key presence, local-embeddings
+    // usable is what the branches below (API key presence, provider
     // capability) exist to verify. A config string is not a capability, so
     // this is informational, not a tick.
-    if config.embeddings_model.is_empty() {
-        println!(" \x1b[31m✗\x1b[0m Embeddings model not configured (run 'canopy setup')");
-        issues.push("Configure embeddings model via 'canopy setup'".to_string());
-    } else {
-        println!(
-            " \x1b[90m–\x1b[0m Embeddings model: {}",
-            config.embeddings_model
-        );
+    match diagnose_embeddings_config(&config.embeddings_model) {
+        EmbeddingsConfigDiagnosis::NotConfigured => {
+            println!(" \x1b[31m✗\x1b[0m Embeddings model not configured (run 'canopy setup')");
+            issues.push("Configure embeddings model via 'canopy setup'".to_string());
+        }
+        EmbeddingsConfigDiagnosis::ProviderUnavailable { provider_name } => {
+            println!(
+                " \x1b[90m–\x1b[0m Embeddings model: {}",
+                config.embeddings_model
+            );
+            println!(" \x1b[31m✗\x1b[0m Provider '{provider_name}' is not available in this build");
+            issues.push(format!(
+                "The configured provider ({provider_name}) requires a build with 'local-embeddings'. \
+                 Either reinstall with that feature, or re-run setup and choose a cloud provider."
+            ));
+            // Capability gap is the verdict — skip API-key / ONNX checks that
+            // would only confuse ("no API key required" for a provider this
+            // binary cannot run).
+        }
+        EmbeddingsConfigDiagnosis::Configured => {
+            println!(
+                " \x1b[90m–\x1b[0m Embeddings model: {}",
+                config.embeddings_model
+            );
 
-        // Check that the required API key is present (local models need none).
-        let api_key_info = match crate::rag::embedding_client::provider_for_model(
-            &config.embeddings_model,
-        ) {
-            Some(crate::rag::embedding_client::EmbeddingProvider::OpenAi) => {
-                Some(("OPENAI_API_KEY", std::env::var("OPENAI_API_KEY").is_ok()))
-            }
-            Some(crate::rag::embedding_client::EmbeddingProvider::Gemini) => {
-                Some(("GEMINI_API_KEY", std::env::var("GEMINI_API_KEY").is_ok()))
-            }
-            // capability: `provider_available` checks whether this binary
-            // was built with the `local-embeddings` feature, not just
-            // whether the model name string looks local — a released
-            // binary without the feature must not claim "no API key
-            // required" for a capability it doesn't have.
-            Some(crate::rag::embedding_client::EmbeddingProvider::Local) => {
-                if crate::rag::embedding_client::provider_available(
-                    crate::rag::embedding_client::EmbeddingProvider::Local,
-                ) {
+            let provider =
+                crate::rag::embedding_client::provider_for_model(&config.embeddings_model);
+
+            // Check that the required API key is present (local models need none).
+            let api_key_info = match provider {
+                Some(crate::rag::embedding_client::EmbeddingProvider::OpenAi) => {
+                    Some(("OPENAI_API_KEY", std::env::var("OPENAI_API_KEY").is_ok()))
+                }
+                Some(crate::rag::embedding_client::EmbeddingProvider::Gemini) => {
+                    Some(("GEMINI_API_KEY", std::env::var("GEMINI_API_KEY").is_ok()))
+                }
+                Some(crate::rag::embedding_client::EmbeddingProvider::Local) => {
+                    // Configured + Local means this build can run it
+                    // (ProviderUnavailable would have caught the other case).
                     #[cfg(all(feature = "local-embeddings", target_os = "linux"))]
                     match crate::rag::ort_runtime::ort_runtime_path() {
                         Some(path) => {
@@ -412,41 +463,35 @@ pub(crate) async fn run_doctor() -> Result<()> {
                             success("Local model — no API key required");
                         }
                     }
-                } else {
+                    None
+                }
+                None => {
+                    // provider_for_model returned None - unknown model
                     println!(
-                        " \x1b[31m✗\x1b[0m Local embeddings unavailable — {}",
-                        crate::rag::embedding_client::LOCAL_EMBEDDINGS_UNAVAILABLE_REASON
+                        " \x1b[31m✗\x1b[0m Model '{}' is not supported. Run 'canopy setup' to pick a compatible model.",
+                        config.embeddings_model
                     );
                     issues.push(
-                        "This canopy build cannot run local embedding models. Run 'canopy setup' \
-                         to switch to a cloud provider, or install a build with the \
-                         'local-embeddings' feature."
-                            .to_string(),
+                        "Run 'canopy setup' and select a supported embedding model".to_string(),
                     );
+                    None
                 }
-                None
-            }
-            None => {
-                println!(
-                    " \x1b[31m✗\x1b[0m Model '{}' is not supported. Run 'canopy setup' to pick a compatible model.",
-                    config.embeddings_model
-                );
-                issues
-                    .push("Run 'canopy setup' and select a supported embedding model".to_string());
-                None
-            }
-        };
+            };
 
-        // declaration: an env var being set doesn't prove it's a valid
-        // credential — only a real API call could confirm that, which is
-        // too expensive for an interactive check. This reports presence,
-        // not validity.
-        if let Some((key_var, present)) = api_key_info {
-            if present {
-                success(format!("API key {key_var} is set"));
-            } else {
-                println!(" \x1b[31m✗\x1b[0m {key_var} is NOT set — indexing will fail silently");
-                issues.push("Export the required API key before starting the daemon".to_string());
+            // declaration: an env var being set doesn't prove it's a valid
+            // credential — only a real API call could confirm that, which is
+            // too expensive for an interactive check. This reports presence,
+            // not validity.
+            if let Some((key_var, present)) = api_key_info {
+                if present {
+                    success(format!("API key {key_var} is set"));
+                } else {
+                    println!(
+                        " \x1b[31m✗\x1b[0m {key_var} is NOT set — indexing will fail silently"
+                    );
+                    issues
+                        .push("Export the required API key before starting the daemon".to_string());
+                }
             }
         }
     }
@@ -1746,10 +1791,11 @@ mod tests {
     }
 
     /// A local embeddings model configured on a binary built WITHOUT the
-    /// 'local-embeddings' feature — the exact defect this module fixes: the
-    /// old code printed a green "no API key required" line by reading
+    /// 'local-embeddings' feature — the CB19 defect's doctor side: the old
+    /// code printed a green "no API key required" line by reading
     /// configuration only. Doctor must now check capability and report red
-    /// with the reason, plus an actionable issue.
+    /// with the reason, plus an actionable issue naming the cloud-provider
+    /// alternative the setup wizard offers.
     #[tokio::test]
     #[ignore]
     #[cfg(not(feature = "local-embeddings"))]
@@ -1772,9 +1818,12 @@ mod tests {
             !output.contains("Local model — no API key required"),
             "must not claim a capability this build does not have:\n{output}"
         );
-        assert!(output.contains("Local embeddings unavailable"));
-        assert!(output.contains("without the 'local-embeddings' feature"));
-        assert!(output.contains("cannot run local embedding models"));
+        assert!(
+            output.contains("not available in this build"),
+            "must name the capability gap, got:\n{output}"
+        );
+        assert!(output.contains("requires a build with 'local-embeddings'"));
+        assert!(output.contains("choose a cloud provider"));
     }
 
     /// The same configuration on a binary built WITH the 'local-embeddings'
@@ -1858,6 +1907,106 @@ mod tests {
         assert!(output.contains("Local model download failed"));
         assert!(output.contains("connection reset"));
         assert!(output.contains("canopy rag model retry"));
+    }
+
+    /// CB19: "no embedding provider configured" must read differently from
+    /// "the configured provider can't run on this build". An empty model
+    /// string reports "not configured" and must NOT mention build
+    /// availability — there is nothing configured whose availability could
+    /// be judged.
+    #[tokio::test]
+    #[ignore]
+    async fn run_doctor_reports_no_provider_configured_separately_from_unavailable() {
+        let home = tempfile::tempdir().unwrap();
+        let canopy_dir = home.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+
+        let config = CanopyConfig {
+            embeddings_model: String::new(),
+            ..Default::default()
+        };
+        config.save(&canopy_dir).unwrap();
+
+        let (result, output) = run_doctor_captured(home.path()).await;
+
+        assert!(result.is_ok());
+        assert!(
+            output.contains("Embeddings model not configured"),
+            "empty model must report 'not configured', got:\n{output}"
+        );
+        assert!(
+            !output.contains("not available in this build"),
+            "nothing is configured, so availability must not be mentioned:\n{output}"
+        );
+    }
+
+    /// CB19: a configured provider this binary cannot run (local model on
+    /// a build without `local-embeddings`) reports "not available in this
+    /// build" with a remediation naming the setup wizard's cloud-provider
+    /// alternative — never the bare "not configured" line.
+    #[tokio::test]
+    #[ignore]
+    #[cfg(not(feature = "local-embeddings"))]
+    async fn run_doctor_reports_configured_provider_not_available_in_build() {
+        let home = tempfile::tempdir().unwrap();
+        let canopy_dir = home.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+
+        let config = CanopyConfig {
+            embeddings_model: "baai/bge-small-en-v1.5".to_string(),
+            ..Default::default()
+        };
+        config.save(&canopy_dir).unwrap();
+
+        let (result, output) = run_doctor_captured(home.path()).await;
+
+        assert!(result.is_ok());
+        assert!(output.contains("Embeddings model: baai/bge-small-en-v1.5"));
+        assert!(
+            output.contains("not available in this build"),
+            "must distinguish 'configured but unrunnable' from 'not configured', got:\n{output}"
+        );
+        assert!(
+            !output.contains("Embeddings model not configured"),
+            "a configured model must not read as unconfigured:\n{output}"
+        );
+    }
+
+    /// CB19: a remote provider with no API key exported reports the missing
+    /// key — and must NOT report "not available in this build", since remote
+    /// providers are compiled into every binary.
+    #[tokio::test]
+    #[ignore]
+    async fn run_doctor_reports_remote_provider_without_key() {
+        let home = tempfile::tempdir().unwrap();
+        let canopy_dir = home.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+
+        let config = CanopyConfig {
+            embeddings_model: "text-embedding-3-small".to_string(),
+            ..Default::default()
+        };
+        config.save(&canopy_dir).unwrap();
+
+        let prev_key = std::env::var("OPENAI_API_KEY").ok();
+        unsafe { std::env::remove_var("OPENAI_API_KEY") };
+
+        let (result, output) = run_doctor_captured(home.path()).await;
+
+        if let Some(v) = prev_key {
+            unsafe { std::env::set_var("OPENAI_API_KEY", v) };
+        }
+
+        assert!(result.is_ok());
+        assert!(output.contains("Embeddings model: text-embedding-3-small"));
+        assert!(
+            output.contains("OPENAI_API_KEY is NOT set"),
+            "missing key must be reported, got:\n{output}"
+        );
+        assert!(
+            !output.contains("not available in this build"),
+            "remote providers are always available — only the key is missing:\n{output}"
+        );
     }
 
     /// A LanceDB directory that exists on disk but is not a valid store
@@ -2132,6 +2281,63 @@ mod tests {
              (2 occurrences expected: one per helper's println!) — a new direct \
              occurrence means some check is printing a tick without going through \
              the shared helper"
+        );
+    }
+
+    // ── CB19: diagnose_embeddings_config (non-ignored) ───────────
+
+    #[test]
+    fn diagnose_empty_model_is_not_configured() {
+        // "no provider configured" must be a distinct verdict from
+        // "configured but this build can't run it" — empty string is the
+        // former, and must never collapse into ProviderUnavailable.
+        assert_eq!(
+            diagnose_embeddings_config(""),
+            EmbeddingsConfigDiagnosis::NotConfigured
+        );
+    }
+
+    #[test]
+    fn diagnose_remote_model_is_configured_on_every_build() {
+        // Remote providers are compiled into every binary — a cloud model
+        // string is always Configured, never ProviderUnavailable.
+        assert_eq!(
+            diagnose_embeddings_config("text-embedding-3-small"),
+            EmbeddingsConfigDiagnosis::Configured
+        );
+        assert_eq!(
+            diagnose_embeddings_config("gemini-embedding-001"),
+            EmbeddingsConfigDiagnosis::Configured
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "local-embeddings"))]
+    fn diagnose_local_model_unavailable_without_feature() {
+        assert_eq!(
+            diagnose_embeddings_config("baai/bge-small-en-v1.5"),
+            EmbeddingsConfigDiagnosis::ProviderUnavailable {
+                provider_name: "Local"
+            }
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "local-embeddings")]
+    fn diagnose_local_model_configured_with_feature() {
+        assert_eq!(
+            diagnose_embeddings_config("baai/bge-small-en-v1.5"),
+            EmbeddingsConfigDiagnosis::Configured
+        );
+    }
+
+    #[test]
+    fn diagnose_unknown_model_is_still_configured() {
+        // Unknown ids fall through to the "not supported" path in doctor,
+        // but they are not "not configured" and not a build-capability gap.
+        assert_eq!(
+            diagnose_embeddings_config("totally-unknown-embedding-model"),
+            EmbeddingsConfigDiagnosis::Configured
         );
     }
 }
