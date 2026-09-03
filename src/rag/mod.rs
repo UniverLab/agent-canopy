@@ -5,5 +5,6 @@ pub mod model_acquisition;
 pub mod ort_runtime;
 pub mod ragignore;
 pub mod rate_limiter;
+pub(crate) mod size_report;
 pub mod status;
 pub mod vector_store;

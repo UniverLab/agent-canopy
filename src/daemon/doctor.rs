@@ -530,51 +530,62 @@ pub(crate) async fn run_doctor() -> Result<()> {
         issues.push("Add personal RAG directories via 'canopy setup'".to_string());
     } else {
         let max_bytes = config.rag_max_file_bytes();
-        let mut total_files: usize = 0;
-        let mut oversize_files: usize = 0;
+        let cap_mb = max_bytes as f64 / (1024.0 * 1024.0);
+
+        // Per-directory existence is reported line-by-line; the size
+        // accounting below is delegated to the shared scan so doctor and
+        // `canopy rag report` describe the same corpus with the same
+        // ragignore/extension rules.
         for dir in &config.rag_personal_dirs {
-            let path = std::path::Path::new(dir);
-            if path.exists() {
-                let indexable_entries: Vec<_> = walkdir::WalkDir::new(path)
-                    .follow_links(false)
-                    .into_iter()
-                    .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.file_type().is_file()
-                            && crate::rag::chunker::detect_lang(&e.path().to_string_lossy())
-                                .is_some()
-                    })
-                    .collect();
-                let file_count = indexable_entries.len();
-                let dir_oversize = indexable_entries
-                    .iter()
-                    .filter(|e| e.metadata().is_ok_and(|m| m.len() > max_bytes))
-                    .count();
-                // capability: walks the directory and counts what's
-                // actually indexable there, not just that the path exists.
-                success(format!("RAG dir: {dir} ({file_count} indexable file(s))"));
-                total_files += file_count;
-                oversize_files += dir_oversize;
+            if std::path::Path::new(dir).exists() {
+                success(format!("RAG dir: {dir}"));
             } else {
                 println!(" \x1b[31m✗\x1b[0m RAG dir missing: {dir}");
                 issues.push("Personal RAG directory not found on disk".to_string());
             }
         }
-        if total_files == 0 && !config.rag_personal_dirs.is_empty() {
-            println!(
-                " \x1b[33m⚠\x1b[0m No indexable files found (.md, .mdx, .pdf) in RAG directories"
-            );
-        }
-        if oversize_files > 0 {
-            let cap_mb = max_bytes as f64 / (1024.0 * 1024.0);
-            println!(
-                " \x1b[33m⚠\x1b[0m {oversize_files} configured file(s) exceed the {cap_mb:.0} MB \
-                 indexing limit (config.toml: rag_max_file_mb) and are skipped"
-            );
-            issues.push(format!(
-                "Some configured files exceed the {cap_mb:.0} MB indexing limit and are skipped — \
-                 see 'canopy rag report', or raise rag_max_file_mb in config.toml"
-            ));
+
+        // capability: walks the configured roots with the ingestion filters
+        // and counts by filesystem metadata only — never opening a file.
+        match crate::rag::size_report::scan(&canopy_dir, &config.rag_personal_dirs, max_bytes) {
+            Ok(scan) => {
+                let total_files = scan.indexable_files.len();
+                let oversize_files = scan.oversize_files.len();
+                if total_files == 0 {
+                    println!(
+                        " \x1b[33m⚠\x1b[0m No indexable files found (.md, .mdx, .pdf) in RAG directories"
+                    );
+                } else {
+                    success(format!("RAG corpus: {total_files} indexable file(s)"));
+                }
+                // Printed even at zero — a silent exclusion is exactly the bug.
+                let icon = if oversize_files > 0 {
+                    "\x1b[33m⚠\x1b[0m"
+                } else {
+                    "\x1b[90m–\x1b[0m"
+                };
+                println!(
+                    " {icon} {}",
+                    crate::rag::size_report::exclusion_summary(oversize_files, max_bytes)
+                );
+                if oversize_files > 0 {
+                    issues.push(format!(
+                        "{oversize_files} configured file(s) exceed the {cap_mb:.0} MB indexing \
+                         limit and are skipped — see 'canopy rag report', or raise \
+                         rag_max_file_mb in config.toml"
+                    ));
+                }
+            }
+            Err(err) => {
+                println!(
+                    " \x1b[33m⚠\x1b[0m Could not scan RAG directories for size exclusions: {err:#}"
+                );
+                issues.push(
+                    "Failed to scan personal RAG directories for size exclusions — resolve the \
+                     error above so the exclusion count is trustworthy"
+                        .to_string(),
+                );
+            }
         }
     }
 
@@ -1623,6 +1634,12 @@ mod tests {
         assert!(output.contains("API key OPENAI_API_KEY is set"));
         assert!(output.contains("RAG dir:"));
         assert!(output.contains("1 indexable file(s)"));
+        // CB20: the size-exclusion count is stated even when it is zero, so a
+        // clean corpus is a positive fact rather than an unexamined silence.
+        assert!(
+            output.contains("Size exclusions: 0 file(s) exceed the 10 MB"),
+            "healthy home must still report a zero exclusion count:\n{output}"
+        );
         assert!(output.contains("ragignore:"));
         assert!(output.contains("Vector store:"));
         assert!(output.contains("Indexed chunks: 1"));
@@ -1713,6 +1730,12 @@ mod tests {
         assert!(output.contains("RAG dir missing:"));
         assert!(output.contains("RAG dir:"));
         assert!(output.contains("configured file(s) exceed the 10 MB"));
+        // CB20: the exclusion count and the effective limit are visible in the
+        // report body, not only in the remediation suggestions.
+        assert!(
+            output.contains("Size exclusions: 1 file(s) exceed the 10 MB"),
+            "degraded home must surface the size-exclusion count in the report body:\n{output}"
+        );
         assert!(output.contains("Suggestions:"));
     }
 

@@ -816,7 +816,10 @@ impl IngestionManager {
         if meta.len() > max_bytes {
             let size_mb = meta.len() as f64 / (1024.0 * 1024.0);
             let cap_mb = max_bytes as f64 / (1024.0 * 1024.0);
-            tracing::info!(
+            // WARN, not DEBUG/INFO: a file dropped from the index is a fact the
+            // operator must be able to see — the same visibility `canopy doctor`
+            // and `canopy rag report` now give the aggregate count (CB20).
+            tracing::warn!(
                 "Personal RAG: skipping '{source_path}' — {size_mb:.1} MB exceeds the \
                  {cap_mb:.0} MB indexing limit (config.toml: rag_max_file_mb)"
             );
@@ -1976,6 +1979,32 @@ mod tests {
         let events = mgr.db().rag_events_for_file(&source_path).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "skipped_oversize");
+    }
+
+    /// The size-based discard must announce itself at a visible level — a
+    /// DEBUG/INFO-only drop is the exact bug CB20 exists to kill (81 of ~270
+    /// PDFs vanished with nothing above DEBUG to show for it). The repo has no
+    /// tracing-capture harness, so this pins the log level at the source: a
+    /// future edit cannot quietly demote the call without failing here.
+    #[test]
+    fn oversize_skip_is_logged_at_warn() {
+        let source = include_str!("ingestion.rs");
+        let production_code = source
+            .split("mod tests {")
+            .next()
+            .expect("ingestion.rs always contains the literal \"mod tests {\"");
+        let marker = "MB exceeds the";
+        let idx = production_code
+            .find(marker)
+            .expect("the oversize-skip log message must still exist");
+        let call_start = production_code[..idx]
+            .rfind("tracing::")
+            .expect("the oversize-skip message must be emitted through a tracing macro");
+        assert!(
+            production_code[call_start..].starts_with("tracing::warn!"),
+            "the oversize-skip discard must be logged at WARN, not DEBUG/INFO — found: {:?}",
+            &production_code[call_start..call_start + 20.min(production_code.len() - call_start)]
+        );
     }
 }
 

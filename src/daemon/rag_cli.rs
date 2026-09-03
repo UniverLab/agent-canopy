@@ -182,14 +182,40 @@ async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<
             .push(ev);
     }
 
+    // ── Size-based exclusions ────────────────────────────────────────
+    // Recomputed from filesystem metadata (never file contents), not read
+    // from the ledger: a large file that was never ingested has no event,
+    // and the ledger goes stale after a config/path/ragignore change. This
+    // is the authoritative *current* count for the report.
+    let max_bytes = config.rag_max_file_bytes();
+    let size_scan = crate::rag::size_report::scan(data_dir, &config.rag_personal_dirs, max_bytes)?;
+    let scan_oversize: std::collections::HashSet<String> = size_scan
+        .oversize_files
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+
     // Build a unified set of all known files
     let mut all_files: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     all_files.extend(chunk_counts.keys().cloned());
     all_files.extend(events_by_file.keys().cloned());
     all_files.extend(queued_paths.iter().map(|s| s.to_string()));
+    // A configured-but-never-indexed oversize file has no chunk, event, or
+    // queue row — without this it would be invisible in the report, which is
+    // the whole failure CB20 addresses.
+    all_files.extend(scan_oversize.iter().cloned());
 
     if all_files.is_empty() {
-        println!("No RAG data found. Make sure the daemon is running and RAG dirs are configured.");
+        println!("\n\x1b[1m── Canopy RAG Report ──────────────────────────────────────────\x1b[0m");
+        let cap_mb = max_bytes as f64 / (1024.0 * 1024.0);
+        println!(" Limit:  {cap_mb:.0} MB per file (config.toml: rag_max_file_mb)");
+        println!(
+            " {}",
+            crate::rag::size_report::exclusion_summary(0, max_bytes)
+        );
+        println!(
+            "\n No indexed RAG data found yet. Make sure the daemon is running and RAG dirs are configured."
+        );
         return Ok(());
     }
 
@@ -207,15 +233,19 @@ async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<
         crate::rag::status::read_acquisition_state(db, config.embeddings_model.trim()),
     );
 
-    // A file's *current* oversize status is whatever its latest event says —
-    // if it later shrank and got indexed, the newer "indexed" event wins.
+    // A file's *current* oversize status: the fresh metadata scan is
+    // authoritative, and a stale "skipped_oversize" event still flags a file
+    // the scan could not see (e.g. a root later unconfigured). If it shrank
+    // and got re-indexed, the scan omits it and the newer "indexed" event
+    // wins, so it is not flagged.
     let is_oversize = |file: &str| -> bool {
-        events_by_file
-            .get(file)
-            .and_then(|events| events.first())
-            .is_some_and(|e| e.event_type == "skipped_oversize")
+        scan_oversize.contains(file)
+            || events_by_file
+                .get(file)
+                .and_then(|events| events.first())
+                .is_some_and(|e| e.event_type == "skipped_oversize")
     };
-    let oversize_count = all_files.iter().filter(|f| is_oversize(f)).count();
+    let oversize_count = size_scan.oversize_files.len();
 
     println!("\n\x1b[1m── Canopy RAG Report ──────────────────────────────────────────\x1b[0m");
     println!(
@@ -259,16 +289,22 @@ async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<
         chunk_counts.len(),
         total_chunks
     );
-    let cap_mb = config.rag_max_file_bytes() as f64 / (1024.0 * 1024.0);
+    let cap_mb = max_bytes as f64 / (1024.0 * 1024.0);
     println!(" Limit:  {cap_mb:.0} MB per file (config.toml: rag_max_file_mb)");
+    // Adjacent to the limit and always printed, even at zero: an excluded
+    // file is a visible fact, not an absence nobody notices (CB20).
+    let excl_icon = if oversize_count > 0 {
+        "\x1b[33m⚠\x1b[0m"
+    } else {
+        " "
+    };
+    println!(
+        " {excl_icon}{}",
+        crate::rag::size_report::exclusion_summary(oversize_count, max_bytes)
+    );
     if !queue_items.is_empty() {
         let queued = queue_items.iter().filter(|q| q.status == "queued").count();
         println!(" Queue:  {} queued, {} indexing", queued, processing_items);
-    }
-    if oversize_count > 0 {
-        println!(
-            " \x1b[33m⚠\x1b[0m Oversize: {oversize_count} file(s) skipped — exceed the {cap_mb:.0} MB indexing limit"
-        );
     }
 
     println!("\n\x1b[1m── Files ──────────────────────────────────────────────────────\x1b[0m");
