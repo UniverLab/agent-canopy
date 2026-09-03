@@ -591,6 +591,14 @@ fn handle_loop_live_panel_mouse(app: &mut App, mouse: &MouseEvent) -> bool {
             scroll_loop_spec_strip(app, -1);
             true
         }
+        MouseEventKind::ScrollUp => {
+            app.loop_live_view_scroll_step(-3);
+            true
+        }
+        MouseEventKind::ScrollDown => {
+            app.loop_live_view_scroll_step(3);
+            true
+        }
         _ => false,
     }
 }

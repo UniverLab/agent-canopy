@@ -1300,7 +1300,7 @@ fn draw_agent_list(
     draw_scroll_indicators(frame, area, scroll.has_up, scroll.has_down, theme);
 }
 
-fn draw_scroll_indicators(
+pub(crate) fn draw_scroll_indicators(
     frame: &mut Frame,
     area: Rect,
     has_up: bool,

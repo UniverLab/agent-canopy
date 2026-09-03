@@ -26,6 +26,7 @@ use crate::tui::app::loop_live_state::{
     EnsembleLiveInfo, LoopLiveState, NodeRunInfo, SpecQueueEntry,
 };
 use crate::tui::app::types::App;
+use crate::tui::ui::sidebar::draw_scroll_indicators;
 
 pub(crate) fn draw_loop_live_view(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     if area.width == 0 || area.height == 0 {
@@ -63,11 +64,14 @@ pub(crate) fn draw_loop_live_view(frame: &mut Frame, area: Rect, app: &mut App, 
             theme,
             selected_spec_id: selected_spec_id.as_deref(),
             spec_scroll,
+            scroll: app.loop_live_view_scroll,
         },
     );
 
     app.loop_spec_strip_click_map = result.click_map;
     app.loop_spec_strip_capacity = result.capacity;
+    app.loop_live_view_total_lines = result.total_lines;
+    app.loop_live_view_scroll = result.clamped_scroll;
 }
 
 /// Everything the pure renderer needs, gathered by [`draw_loop_live_view`]
@@ -88,6 +92,7 @@ struct LiveViewContext<'a> {
     selected_spec_id: Option<&'a str>,
     /// First visible index into `state.spec_queue` for the marker strip.
     spec_scroll: usize,
+    scroll: u16,
 }
 
 /// What [`render_loop_live_view`] hands back to its `App`-owning caller:
@@ -96,6 +101,8 @@ struct LiveViewContext<'a> {
 struct LiveViewRenderResult {
     click_map: Vec<(String, u16, u16, u16)>,
     capacity: usize,
+    total_lines: u16,
+    clamped_scroll: u16,
 }
 
 fn render_loop_live_view(
@@ -122,20 +129,25 @@ fn render_loop_live_view(
         "Graph",
         Style::default().fg(ctx.theme.dim_text),
     )));
-    if state.effective_nodes.is_empty() {
+    let graph_start_line = lines.len() as u16;
+    let graph_result = if state.effective_nodes.is_empty() {
         lines.push(Line::from(Span::styled(
             "  (no nodes yet)",
             Style::default().fg(ctx.theme.dim_text),
         )));
+        None
     } else {
-        lines.extend(graph_lines(
+        let result = graph_lines(
             state,
             ctx.highlighted_node_id,
             ctx.follow,
             area.width,
             ctx.theme,
-        ));
-    }
+        );
+        let offset = result.highlighted_offset;
+        lines.extend(result.lines);
+        Some(offset)
+    };
     lines.push(Line::from(""));
     lines.extend(footer_lines(
         state,
@@ -146,7 +158,33 @@ fn render_loop_live_view(
         ctx.theme,
     ));
 
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    let total_lines = lines.len() as u16;
+    let max_scroll = total_lines.saturating_sub(area.height);
+    let clamped_from_input = ctx.scroll.min(max_scroll);
+    let scroll = if ctx.follow {
+        if let Some(offset) = graph_result.flatten() {
+            let abs_offset = graph_start_line + offset;
+            ensure_visible(abs_offset, 3, clamped_from_input, area.height)
+        } else {
+            clamped_from_input
+        }
+    } else {
+        clamped_from_input
+    };
+    let clamped_scroll = scroll.min(max_scroll);
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((clamped_scroll, 0)),
+        area,
+    );
+
+    let has_up = clamped_scroll > 0;
+    let has_down = total_lines > area.height && clamped_scroll < max_scroll;
+    if has_up || has_down {
+        draw_scroll_indicators(frame, area, has_up, has_down, ctx.theme);
+    }
 
     LiveViewRenderResult {
         click_map: strip
@@ -157,6 +195,23 @@ fn render_loop_live_view(
             })
             .collect(),
         capacity: strip.capacity,
+        total_lines,
+        clamped_scroll,
+    }
+}
+
+fn ensure_visible(start: u16, span: u16, scroll: u16, height: u16) -> u16 {
+    let end = start.saturating_add(span);
+    let view_end = scroll.saturating_add(height);
+    if height == 0 {
+        return scroll;
+    }
+    if start < scroll {
+        start
+    } else if end > view_end {
+        end.saturating_sub(height)
+    } else {
+        scroll
     }
 }
 
@@ -604,13 +659,18 @@ fn collapse_ensemble_targets(
 /// member; every other member and the join itself are skipped as individual
 /// boxes. Fan-out edges into an ensemble's members are likewise collapsed to
 /// one edge (see [`collapse_ensemble_targets`]).
+struct GraphLinesResult<'a> {
+    lines: Vec<Line<'a>>,
+    highlighted_offset: Option<u16>,
+}
+
 fn graph_lines(
     state: &LoopLiveState,
     highlighted_node_id: Option<&str>,
     follow: bool,
     area_width: u16,
     theme: &Theme,
-) -> Vec<Line<'static>> {
+) -> GraphLinesResult<'static> {
     let mut outgoing: HashMap<&str, Vec<(&LoopNode, LoopEdgeCondition)>> = HashMap::new();
     for edge in &state.effective_edges {
         if let Some(target) = state
@@ -641,6 +701,7 @@ fn graph_lines(
 
     let nodes = &state.effective_nodes;
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut highlighted_offset: Option<u16> = None;
     let mut rendered_ensembles: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (idx, node) in nodes.iter().enumerate() {
         // The join is folded into its ensemble's collapsed box (rendered at
@@ -658,6 +719,9 @@ fn graph_lines(
                 .iter()
                 .any(|m| Some(m.node_id.as_str()) == highlighted_node_id)
                 || highlighted_node_id == Some(ensemble.join_node_id.as_str());
+            if is_highlighted && highlighted_offset.is_none() {
+                highlighted_offset = Some(lines.len() as u16);
+            }
             lines.extend(ensemble_box_lines(
                 ensemble,
                 is_highlighted,
@@ -680,6 +744,9 @@ fn graph_lines(
         }
 
         let is_highlighted = highlighted_node_id == Some(node.id.as_str());
+        if is_highlighted && highlighted_offset.is_none() {
+            highlighted_offset = Some(lines.len() as u16);
+        }
         lines.extend(node_box_lines(node, is_highlighted, follow, inner, theme));
 
         if let Some(edges) = outgoing.get(node.id.as_str()) {
@@ -694,7 +761,10 @@ fn graph_lines(
             lines.push(Line::from(""));
         }
     }
-    lines
+    GraphLinesResult {
+        lines,
+        highlighted_offset,
+    }
 }
 
 fn format_elapsed(started_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
@@ -952,6 +1022,7 @@ mod tests {
                     theme: &Theme::classic(),
                     selected_spec_id: None,
                     spec_scroll: 0,
+                    scroll: 0,
                 },
             );
         });
@@ -1009,6 +1080,7 @@ mod tests {
                     theme: &Theme::classic(),
                     selected_spec_id: None,
                     spec_scroll: 0,
+                    scroll: 0,
                 },
             );
         });
@@ -1049,6 +1121,7 @@ mod tests {
                     theme: &Theme::classic(),
                     selected_spec_id: Some("s3"),
                     spec_scroll: 0,
+                    scroll: 0,
                 },
             );
         });
@@ -1102,6 +1175,7 @@ mod tests {
                     theme: &Theme::classic(),
                     selected_spec_id: None,
                     spec_scroll: 0,
+                    scroll: 0,
                 },
             );
         });
@@ -1135,6 +1209,7 @@ mod tests {
                         theme: &Theme::classic(),
                         selected_spec_id: None,
                         spec_scroll: 0,
+                        scroll: 0,
                     },
                 ));
             })
@@ -1193,6 +1268,7 @@ mod tests {
             theme: &Theme::classic(),
             selected_spec_id: None,
             spec_scroll: 0,
+            scroll: 0,
         };
         render_to_text(1, 5, |frame, area| {
             render_loop_live_view(frame, area, &ctx);
@@ -1232,6 +1308,7 @@ mod tests {
                     theme: &Theme::classic(),
                     selected_spec_id: None,
                     spec_scroll: 0,
+                    scroll: 0,
                 },
             );
         });
@@ -1370,6 +1447,7 @@ mod tests {
                     theme: &Theme::classic(),
                     selected_spec_id: None,
                     spec_scroll: 0,
+                    scroll: 0,
                 },
             );
         });
@@ -1504,6 +1582,7 @@ mod tests {
                     theme: &Theme::classic(),
                     selected_spec_id: None,
                     spec_scroll: 0,
+                    scroll: 0,
                 },
             );
         });
@@ -1616,5 +1695,200 @@ mod tests {
             session_id: None,
         })
         .unwrap();
+    }
+
+    fn many_nodes(count: usize) -> Vec<LoopNode> {
+        (0..count)
+            .map(|i| LoopNode {
+                id: format!("m{i}"),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                name: format!("Node {i}"),
+                kind: LoopNodeKind::Agent,
+                config: json!({}),
+                position: i as i64,
+                created_at: Utc::now(),
+            })
+            .collect()
+    }
+
+    fn many_edges(count: usize) -> Vec<LoopEdge> {
+        (0..count.saturating_sub(1))
+            .map(|i| LoopEdge {
+                id: format!("me{i}"),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                from_node: format!("m{i}"),
+                to_node: format!("m{}", i + 1),
+                condition: LoopEdgeCondition::Pass,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn graph_taller_than_panel_is_clipped_with_indicators() {
+        let mut state = running_state();
+        state.effective_nodes = many_nodes(12);
+        state.effective_edges = many_edges(12);
+        state.current_node_id = Some("m0".to_string());
+
+        let node_info = NodeRunInfo::default();
+
+        // At top, only ▼ should show.
+        let text_top = render_to_text(80, 15, |frame, area| {
+            render_loop_live_view(
+                frame,
+                area,
+                &LiveViewContext {
+                    state: &state,
+                    follow: false,
+                    highlighted_node_id: Some("m0"),
+                    node_info: &node_info,
+                    blocked: false,
+                    now: Utc::now(),
+                    theme: &Theme::classic(),
+                    selected_spec_id: None,
+                    spec_scroll: 0,
+                    scroll: 0,
+                },
+            );
+        });
+        assert!(
+            !text_top.contains('▲'),
+            "no ▲ when at top, but got:\n{text_top}"
+        );
+        assert!(
+            text_top.contains('▼'),
+            "expected ▼ when content overflows below at top:\n{text_top}"
+        );
+
+        // Scrolled mid-way, both indicators.
+        let text_mid = render_to_text(80, 15, |frame, area| {
+            render_loop_live_view(
+                frame,
+                area,
+                &LiveViewContext {
+                    state: &state,
+                    follow: false,
+                    highlighted_node_id: Some("m0"),
+                    node_info: &node_info,
+                    blocked: false,
+                    now: Utc::now(),
+                    theme: &Theme::classic(),
+                    selected_spec_id: None,
+                    spec_scroll: 0,
+                    scroll: 10,
+                },
+            );
+        });
+        assert!(
+            text_mid.contains('▲'),
+            "expected ▲ when scrolled down:\n{text_mid}"
+        );
+        assert!(
+            text_mid.contains('▼'),
+            "expected ▼ when not at bottom:\n{text_mid}"
+        );
+    }
+
+    #[test]
+    fn graph_that_fits_has_no_indicators() {
+        let state = running_state();
+        let node_info = NodeRunInfo::default();
+        let text = render_to_text(80, 60, |frame, area| {
+            render_loop_live_view(
+                frame,
+                area,
+                &LiveViewContext {
+                    state: &state,
+                    follow: true,
+                    highlighted_node_id: state.current_node_id.as_deref(),
+                    node_info: &node_info,
+                    blocked: false,
+                    now: Utc::now(),
+                    theme: &Theme::classic(),
+                    selected_spec_id: None,
+                    spec_scroll: 0,
+                    scroll: 0,
+                },
+            );
+        });
+        assert!(!text.contains('▲'), "no ▲ when graph fits:\n{text}");
+        assert!(!text.contains('▼'), "no ▼ when graph fits:\n{text}");
+    }
+
+    #[test]
+    fn scroll_clamped_to_valid_range() {
+        let mut state = running_state();
+        state.effective_nodes = many_nodes(12);
+        state.effective_edges = many_edges(12);
+        let node_info = NodeRunInfo::default();
+        let backend = TestBackend::new(80, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut clamped = None;
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let result = render_loop_live_view(
+                    frame,
+                    area,
+                    &LiveViewContext {
+                        state: &state,
+                        follow: false,
+                        highlighted_node_id: None,
+                        node_info: &node_info,
+                        blocked: false,
+                        now: Utc::now(),
+                        theme: &Theme::classic(),
+                        selected_spec_id: None,
+                        spec_scroll: 0,
+                        scroll: 1000,
+                    },
+                );
+                clamped = Some((result.clamped_scroll, result.total_lines));
+            })
+            .unwrap();
+        let (clamped_scroll, total_lines) = clamped.unwrap();
+        let max = total_lines.saturating_sub(15);
+        assert_eq!(
+            clamped_scroll, max,
+            "scroll must clamp to total_lines - height ({max}), got {clamped_scroll} with total {total_lines}"
+        );
+    }
+
+    #[test]
+    fn auto_follow_keeps_highlighted_node_visible() {
+        let mut state = running_state();
+        state.effective_nodes = many_nodes(15);
+        state.effective_edges = many_edges(15);
+        state.current_node_id = Some("m14".to_string());
+        let node_info = NodeRunInfo {
+            status: Some(LoopRunStatus::Running),
+            ..NodeRunInfo::default()
+        };
+        // Render with scroll=0 but follow=true — the highlighted last node
+        // must be auto-scrolled into the 15-row viewport.
+        let text = render_to_text(80, 15, |frame, area| {
+            render_loop_live_view(
+                frame,
+                area,
+                &LiveViewContext {
+                    state: &state,
+                    follow: true,
+                    highlighted_node_id: Some("m14"),
+                    node_info: &node_info,
+                    blocked: false,
+                    now: Utc::now(),
+                    theme: &Theme::classic(),
+                    selected_spec_id: None,
+                    spec_scroll: 0,
+                    scroll: 0,
+                },
+            );
+        });
+        assert!(
+            text.contains("Node 14"),
+            "auto-follow must keep highlighted node visible, missing Node 14 in:\n{text}"
+        );
     }
 }

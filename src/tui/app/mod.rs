@@ -129,6 +129,8 @@ impl App {
             loop_spec_strip_scroll: 0,
             loop_spec_strip_capacity: 0,
             loop_spec_strip_click_map: Vec::new(),
+            loop_live_view_scroll: 0,
+            loop_live_view_total_lines: 0,
             loop_autorun_dialog: None,
             loop_action_pending: false,
             loop_action_rx: None,
@@ -1001,6 +1003,7 @@ impl App {
             self.loop_live_focus = LoopLiveFocus::Graph;
             self.loop_spec_strip_selected = None;
             self.loop_spec_strip_scroll = 0;
+            self.loop_live_view_scroll = 0;
             return;
         }
 
@@ -1026,6 +1029,7 @@ impl App {
             self.loop_live_focus = LoopLiveFocus::Graph;
             self.loop_spec_strip_selected = None;
             self.loop_spec_strip_scroll = 0;
+            self.loop_live_view_scroll = 0;
         } else {
             self.clamp_loop_selection();
         }
@@ -1097,6 +1101,28 @@ impl App {
     pub fn loop_graph_reset_follow(&mut self) {
         self.loop_graph_follow = true;
         self.loop_graph_selected_node = None;
+    }
+
+    /// Step the live view's vertical scroll by `dir` lines (positive = down
+    /// into content, negative = back toward top). Clamps to the valid range
+    /// using the last-rendered total line count. No-op when no loop is
+    /// selected.
+    pub fn loop_live_view_scroll_step(&mut self, dir: i32) {
+        let new = if dir > 0 {
+            self.loop_live_view_scroll
+                .saturating_add(dir.unsigned_abs() as u16)
+        } else {
+            self.loop_live_view_scroll
+                .saturating_sub(dir.unsigned_abs() as u16)
+        };
+        self.loop_live_view_scroll = new.min(self.loop_live_view_max_scroll());
+    }
+
+    /// Maximum valid scroll value given the last-rendered total line count
+    /// and panel height. Returns 0 when the content fits entirely.
+    pub fn loop_live_view_max_scroll(&self) -> u16 {
+        self.loop_live_view_total_lines
+            .saturating_sub(self.last_panel_inner.1)
     }
 
     /// Toggle plain-arrow-key ownership between the graph and the spec
@@ -6352,5 +6378,37 @@ mod tests {
             serde_json::json!({"command": "true"}),
             "the invalid config must never reach the DB"
         );
+    }
+
+    #[test]
+    fn loop_live_view_scroll_step_clamps_at_zero() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.loop_live_view_scroll = 0;
+        app.loop_live_view_total_lines = 50;
+        app.last_panel_inner = (80, 20);
+        app.loop_live_view_scroll_step(-10);
+        assert_eq!(app.loop_live_view_scroll, 0, "scroll must not go below 0");
+    }
+
+    #[test]
+    fn loop_live_view_scroll_step_clamps_at_max() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.loop_live_view_total_lines = 50;
+        app.last_panel_inner = (80, 20);
+        app.loop_live_view_scroll = 30;
+        app.loop_live_view_scroll_step(10);
+        assert_eq!(
+            app.loop_live_view_scroll, 30,
+            "scroll must not exceed total_lines - height (30)"
+        );
+        app.loop_live_view_scroll = 10;
+        app.loop_live_view_scroll_step(5);
+        assert_eq!(app.loop_live_view_scroll, 15);
+        app.loop_live_view_scroll_step(100);
+        assert_eq!(app.loop_live_view_scroll, 30);
     }
 }

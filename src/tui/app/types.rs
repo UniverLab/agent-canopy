@@ -815,6 +815,13 @@ pub struct App {
     /// Mouse hit-test cells for the marker strip, populated during draw:
     /// `(spec id, row, col_start, col_end)` — mirrors `sidebar_tab_click_map`.
     pub(crate) loop_spec_strip_click_map: Vec<(String, u16, u16, u16)>,
+    /// Vertical scroll offset (in text lines) for the live loop view's main
+    /// content area. Clamped to `[0, total_lines - panel_height]` on every
+    /// render. Reset to 0 whenever the selected loop changes.
+    pub(crate) loop_live_view_scroll: u16,
+    /// Total number of content lines rendered on the last frame — used to
+    /// clamp `loop_live_view_scroll`. Populated by `render_loop_live_view`.
+    pub(crate) loop_live_view_total_lines: u16,
     /// Open autorun-scheduling input for the loop currently focused in the
     /// live view — `None` when not open. See
     /// [`crate::tui::app::dialog::LoopAutorunDialog`].
