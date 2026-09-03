@@ -205,6 +205,11 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         && app.automation_kind == crate::tui::app::AutomationKind::Loop;
 
     match code {
+        // CT3: an open tail dialog intercepts Esc first — dismissing a
+        // diagnostic viewer never touches the run or the graph state below.
+        KeyCode::Esc if on_loop && app.node_tail_dialog_active() => {
+            app.close_node_tail_dialog();
+        }
         // A spec-strip selection intercepts Esc first (back to the graph
         // sub-focus, selection cleared); manual node inspection in the
         // graph intercepts a following Esc to return to auto-follow; only
@@ -256,6 +261,24 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
             if !(on_loop && app.loop_live_focus == LoopLiveFocus::Graph) =>
         {
             app.select_prev();
+        }
+        // CT3: while the tail dialog is open, Up/Down scroll its output
+        // instead of driving graph navigation underneath.
+        KeyCode::Down if on_loop && app.node_tail_dialog_active() => {
+            app.node_tail_scroll(true);
+        }
+        KeyCode::Up if on_loop && app.node_tail_dialog_active() => {
+            app.node_tail_scroll(false);
+        }
+        // CT3: `t` toggles the live tail for the highlighted node. Opens
+        // only for a currently-running node (no empty panes); closing is a
+        // pure viewer dismiss. Guarded against Ctrl+T (context transfer).
+        KeyCode::Char('t') if on_loop && !modifiers.contains(KeyModifiers::CONTROL) => {
+            if app.node_tail_dialog_active() {
+                app.close_node_tail_dialog();
+            } else if let Some(node_id) = app.loop_graph_highlighted_node_id().map(str::to_string) {
+                let _ = app.open_node_tail_dialog(&node_id);
+            }
         }
         // Graph navigation: Right = child (forward along edges, pass first),
         // Left = parent (back along incoming), Up/Down = sibling in DFS order.
@@ -1419,6 +1442,67 @@ mod preview_key_tests {
         let mut app = app_on_loop(crate::domain::loops::LoopStatus::Running);
         handle_preview_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE).unwrap();
         assert!(!app.loop_reset_confirm);
+    }
+
+    // ── CT3: tail dialog key bindings ──────────────────────────────
+
+    fn app_with_open_tail() -> App {
+        let mut app = app_on_loop(crate::domain::loops::LoopStatus::Running);
+        app.node_tail_dialog = Some(crate::tui::app::dialog::NodeTailDialog {
+            run_id: "run1".to_string(),
+            node_id: "node1".to_string(),
+            node_name: "Node node1".to_string(),
+            stdout_lines: vec!["out".to_string()],
+            stderr_lines: Vec::new(),
+            status: crate::domain::loops::LoopRunStatus::Running,
+            timed_out: false,
+            started_at: chrono::Utc::now(),
+            scroll: 0,
+        });
+        app
+    }
+
+    #[test]
+    fn preview_t_closes_open_tail_dialog() {
+        let mut app = app_with_open_tail();
+        handle_preview_key(&mut app, KeyCode::Char('t'), KeyModifiers::NONE).unwrap();
+        assert!(!app.node_tail_dialog_active());
+    }
+
+    #[test]
+    fn preview_esc_closes_open_tail_dialog() {
+        let mut app = app_with_open_tail();
+        handle_preview_key(&mut app, KeyCode::Esc, KeyModifiers::NONE).unwrap();
+        assert!(!app.node_tail_dialog_active());
+    }
+
+    #[test]
+    fn preview_t_with_no_highlighted_node_is_a_noop() {
+        // No live state, so nothing is highlighted: `t` must not open a
+        // dialog, panic, or disturb the loop view.
+        let mut app = app_on_loop(crate::domain::loops::LoopStatus::Running);
+        handle_preview_key(&mut app, KeyCode::Char('t'), KeyModifiers::NONE).unwrap();
+        assert!(!app.node_tail_dialog_active());
+    }
+
+    #[test]
+    fn preview_ctrl_t_still_opens_context_transfer_not_tail() {
+        // Guard against the plain-`t` arm swallowing Ctrl+T: with no live
+        // state the tail cannot open, and the Ctrl+T arm must run instead
+        // (no-op here without an interactive agent, but crucially not a
+        // tail dialog).
+        let mut app = app_on_loop(crate::domain::loops::LoopStatus::Running);
+        handle_preview_key(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL).unwrap();
+        assert!(!app.node_tail_dialog_active());
+    }
+
+    #[test]
+    fn preview_up_down_scroll_open_tail_instead_of_graph() {
+        let mut app = app_with_open_tail();
+        handle_preview_key(&mut app, KeyCode::Up, KeyModifiers::NONE).unwrap();
+        assert_eq!(app.node_tail_dialog.as_ref().unwrap().scroll, 3);
+        handle_preview_key(&mut app, KeyCode::Down, KeyModifiers::NONE).unwrap();
+        assert_eq!(app.node_tail_dialog.as_ref().unwrap().scroll, 0);
     }
 
     #[test]

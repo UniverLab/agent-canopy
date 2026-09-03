@@ -1334,6 +1334,39 @@ impl Database {
             .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
         }
 
+        // CT3: live tailing of check-node output. Chunks of stdout/stderr are
+        // appended while the node runs so the TUI can poll them; the final
+        // truncated tails are cached on `loop_runs` at completion for an
+        // instant post-completion view. Additive and idempotent.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS loop_run_output (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL REFERENCES loop_runs(id) ON DELETE CASCADE,
+                stream TEXT NOT NULL CHECK (stream IN ('stdout','stderr')),
+                chunk TEXT NOT NULL,
+                ts INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_loop_run_output_run_ts
+                ON loop_run_output(run_id, ts ASC);
+            CREATE INDEX IF NOT EXISTS idx_loop_run_output_run_stream_id
+                ON loop_run_output(run_id, stream, id DESC);",
+        )
+        .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        for column in ["stdout_tail", "stderr_tail"] {
+            let has_column: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('loop_runs') WHERE name = ?1",
+                    [column],
+                    |row| Ok(row.get::<_, i32>(0)? > 0),
+                )
+                .unwrap_or(false);
+            if !has_column {
+                let sql = format!("ALTER TABLE loop_runs ADD COLUMN {column} TEXT");
+                conn.execute(&sql, [])
+                    .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+            }
+        }
+
         Self::set_schema_version(&conn)?;
 
         Ok(())

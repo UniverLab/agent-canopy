@@ -3236,7 +3236,7 @@ async fn execute_check_node(
 
     let mut process = shell_command(&command);
     process.current_dir(workdir);
-    let child = process
+    let mut child = process
         .spawn()
         .with_context(|| format!("Check node '{}' failed to spawn.", node.name))?;
     let pid = child.id();
@@ -3244,50 +3244,116 @@ async fn execute_check_node(
         let _ = db.set_loop_run_pid(run_id, pid as i64, crate::system::boot_id().as_deref());
     }
 
-    let timeout_result = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_seconds),
-        child.wait_with_output(),
-    )
-    .await;
+    // CT3: stream piped stdout/stderr into `loop_run_output` while the node
+    // runs so the TUI tail dialog can follow it live. `shell_command` above
+    // always pipes both streams, so these takes cannot fail on either
+    // platform; the expect messages say where to look if that ever changes.
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .expect("shell_command pipes check-node stdout");
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .expect("shell_command pipes check-node stderr");
+    let stdout_buf = Arc::new(std::sync::Mutex::new(String::new()));
+    let stderr_buf = Arc::new(std::sync::Mutex::new(String::new()));
+    let stdout_handle = spawn_check_output_reader(
+        stdout_pipe,
+        run_id.to_string(),
+        "stdout",
+        db.clone(),
+        stdout_buf.clone(),
+    );
+    let stderr_handle = spawn_check_output_reader(
+        stderr_pipe,
+        run_id.to_string(),
+        "stderr",
+        db.clone(),
+        stderr_buf.clone(),
+    );
 
-    let output = match timeout_result {
-        Ok(result) => result?,
-        Err(_elapsed) => {
-            if let Some(pid) = pid {
-                crate::daemon::process::terminate_process_group_async(pid as i64, KILL_GRACE);
-            }
-            let output = serde_json::json!({
-                "kind": "check",
-                "loop_id": lp.id,
-                "spec_id": spec.id,
-                "node_id": node.id,
-                "command": command,
-                "error": "timed out",
-                "timeout_seconds": timeout_seconds,
-            });
-            let _ = db.update_loop_run_result(
-                run_id,
-                LoopRunStatus::Fail,
-                Some(&output),
-                Some(chrono::Utc::now()),
-            );
-            // B28: a timeout is a check fail, not a hard error — it must
-            // route through the fail edge like any other check failure,
-            // never abort the whole spec.
-            return Ok(NodeExecution {
-                status: LoopRunStatus::Fail,
-                output,
-                summary: format!(
-                    "Check node '{}' timed out after {timeout_seconds}s.",
-                    node.name
-                ),
-            });
-        }
+    // The timeout covers the child AND the pipe drain. A forked grandchild
+    // that inherits the pipes (e.g. `( sleep 60 ) &`) keeps them open past
+    // the shell's own exit — `wait_with_output` used to block on that EOF
+    // inside the same timeout, so the drain must live inside it too.
+    // Without this bound the reader join below would hang and the process
+    // group would never be reaped (see
+    // `process_group_children_die_with_parent`).
+    let execution = async {
+        let status = child.wait().await?;
+        // Bounded drain: normally the pipes close with the child and the
+        // join below guarantees the DB has every byte before the success
+        // condition is evaluated. `false` means a daemonized descendant
+        // still holds the pipes — handled exactly like a timeout (kill the
+        // group, keep the partial output).
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let _ = stdout_handle.await;
+            let _ = stderr_handle.await;
+        })
+        .await
+        .is_ok();
+        Ok::<_, std::io::Error>((status, drained))
     };
+    let timeout_result =
+        tokio::time::timeout(std::time::Duration::from_secs(timeout_seconds), execution).await;
 
-    let exit_code = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let locked_stdout =
+        |buf: &Arc<std::sync::Mutex<String>>| buf.lock().map(|g| g.clone()).unwrap_or_default();
+
+    // `None` status = the timeout fired (reader handles were dropped with
+    // the future; the detached readers exit on pipe close after the kill
+    // below, and the buffers below already hold everything streamed).
+    let (status_opt, drained) = match timeout_result {
+        Ok(result) => {
+            let (status, drained) = result?;
+            (Some(status), drained)
+        }
+        Err(_elapsed) => (None, false),
+    };
+    if status_opt.is_none() || !drained {
+        if let Some(pid) = pid {
+            crate::daemon::process::terminate_process_group_async(pid as i64, KILL_GRACE);
+        }
+        let partial_stdout = locked_stdout(&stdout_buf);
+        let partial_stderr = locked_stdout(&stderr_buf);
+        let (stdout_snap, _) = truncate_check_output(partial_stdout.trim().to_string());
+        let (stderr_snap, _) = truncate_check_output(partial_stderr.trim().to_string());
+        let _ = db.set_loop_run_tail_snapshot(run_id, Some(&stdout_snap), Some(&stderr_snap));
+        let output = serde_json::json!({
+            "kind": "check",
+            "loop_id": lp.id,
+            "spec_id": spec.id,
+            "node_id": node.id,
+            "command": command,
+            "error": "timed out",
+            "timeout_seconds": timeout_seconds,
+            "stdout": stdout_snap,
+            "stderr": stderr_snap,
+        });
+        let _ = db.update_loop_run_result(
+            run_id,
+            LoopRunStatus::Fail,
+            Some(&output),
+            Some(chrono::Utc::now()),
+        );
+        // B28: a timeout is a check fail, not a hard error — it must
+        // route through the fail edge like any other check failure,
+        // never abort the whole spec.
+        return Ok(NodeExecution {
+            status: LoopRunStatus::Fail,
+            output,
+            summary: format!(
+                "Check node '{}' timed out after {timeout_seconds}s.",
+                node.name
+            ),
+        });
+    }
+
+    let status = status_opt.expect("timeout arm returned above");
+    let exit_code = status.code().unwrap_or(-1);
+    let stdout = locked_stdout(&stdout_buf).trim().to_string();
+    let stderr = locked_stdout(&stderr_buf).trim().to_string();
 
     // Evaluate the success condition against the *full* captured output —
     // the `output_contains` / `output_not_contains` conditions must see
@@ -3322,6 +3388,10 @@ async fn execute_check_node(
     if truncated {
         output_json["truncated"] = serde_json::Value::Bool(true);
     }
+
+    // CT3: cache the final tails for the post-completion dialog view. Best
+    // effort — a snapshot failure must never fail the node itself.
+    let _ = db.set_loop_run_tail_snapshot(run_id, Some(&stdout), Some(&stderr));
 
     Ok(NodeExecution {
         status: if passed {
@@ -5694,6 +5764,38 @@ fn shell_command(command: &str) -> Command {
     process.stdout(std::process::Stdio::piped());
     process.stderr(std::process::Stdio::piped());
     process
+}
+
+/// CT3: background reader for one piped check-node stream. Appends every
+/// chunk to `loop_run_output` (the TUI tail dialog polls it) and mirrors it
+/// into `buffer` so the completion path can evaluate the success condition
+/// and snapshot the tails without a DB round-trip. Ends when the child
+/// closes the pipe; I/O or DB errors end this task, never the node.
+fn spawn_check_output_reader(
+    stream: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    run_id: String,
+    stream_name: &'static str,
+    db: Database,
+    buffer: Arc<std::sync::Mutex<String>>,
+) -> tokio::task::JoinHandle<()> {
+    use tokio::io::AsyncReadExt as _;
+    let mut stream = Box::pin(stream);
+    tokio::spawn(async move {
+        let mut buf = [0u8; 8192];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    if let Ok(mut guard) = buffer.lock() {
+                        guard.push_str(&chunk);
+                    }
+                    let _ = db.append_loop_run_output(&run_id, stream_name, &chunk);
+                }
+                Err(_) => break,
+            }
+        }
+    })
 }
 
 const CHECK_OUTPUT_MAX_BYTES: usize = 64 * 1024;
@@ -17380,6 +17482,208 @@ echo done
         assert!(
             stdout.len() <= 64 * 1024 + 100,
             "truncated stdout must be bounded, got len {}",
+            stdout.len()
+        );
+    }
+
+    // ── CT3: live tailing — streaming, timeout, zero-output, truncation ──
+
+    #[tokio::test]
+    async fn check_node_streams_stdout_and_stderr_to_live_tail() {
+        // The live tail must hold output *while the node still runs*: poll
+        // mid-run and require the early line before the run completes.
+        // Without the reader tasks the chunk table stays empty until the
+        // completion snapshot, so this fails with the feature removed.
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-check-stream".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "stream-check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "echo 'STREAM_EARLY_OUT'; echo 'STREAM_EARLY_ERR' >&2; sleep 3; exit 0",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let run_loop = engine.run_loop(loop_id.clone(), None, None, None, None);
+        tokio::pin!(run_loop);
+        // Poll the future without awaiting it yet: drive one step so the
+        // check node spawns, then observe the live tail from this thread.
+        let mut saw_early = false;
+        for _ in 0..100 {
+            if tokio::time::timeout(std::time::Duration::from_millis(100), &mut run_loop)
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+            if let Some(run) = runs.iter().find(|r| r.node_id == "node-check-stream") {
+                let (stdout, stderr) = db.get_loop_run_tail(&run.id, 1000).unwrap();
+                if stdout.contains("STREAM_EARLY_OUT") && stderr.contains("STREAM_EARLY_ERR") {
+                    saw_early = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            saw_early,
+            "live tail must show streamed output while the node still runs"
+        );
+        run_loop.await.unwrap();
+
+        // Post-completion the snapshot keeps serving the tail.
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        let run = runs
+            .iter()
+            .find(|r| r.node_id == "node-check-stream")
+            .unwrap();
+        assert_eq!(run.status, LoopRunStatus::Pass);
+        let (stdout, stderr) = db.get_loop_run_tail(&run.id, 1000).unwrap();
+        assert!(stdout.contains("STREAM_EARLY_OUT"), "got: {stdout}");
+        assert!(stderr.contains("STREAM_EARLY_ERR"), "got: {stderr}");
+        let out = run.output.as_ref().unwrap();
+        assert_eq!(out["stdout"].as_str().unwrap(), "STREAM_EARLY_OUT");
+        assert_eq!(out["stderr"].as_str().unwrap(), "STREAM_EARLY_ERR");
+    }
+
+    #[tokio::test]
+    async fn check_node_timeout_marks_tail_timed_out_with_partial_output() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-check-hang".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "hang-check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "echo 'PARTIAL_BEFORE_HANG'; sleep 30",
+                "success_condition": "exit_code_0",
+                "timeout_seconds": 1
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        engine
+            .run_loop(loop_id.clone(), None, None, None, None)
+            .await
+            .unwrap();
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        let run = runs
+            .iter()
+            .find(|r| r.node_id == "node-check-hang")
+            .unwrap();
+        assert_eq!(run.status, LoopRunStatus::Fail);
+        let out = run.output.as_ref().unwrap();
+        assert_eq!(out["error"], serde_json::json!("timed out"));
+        // Partial output captured before the kill must be visible in the
+        // timeout record — a silent timeout shows nothing.
+        assert!(
+            out["stdout"]
+                .as_str()
+                .unwrap()
+                .contains("PARTIAL_BEFORE_HANG"),
+            "timeout output must carry partial stdout, got: {:?}",
+            out["stdout"]
+        );
+        let (stdout, _) = db.get_loop_run_tail(&run.id, 1000).unwrap();
+        assert!(
+            stdout.contains("PARTIAL_BEFORE_HANG"),
+            "live tail must keep partial output after timeout, got: {stdout}"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_node_zero_output_hang_leaves_empty_tail() {
+        // A node that produces nothing before the timeout (the resilience
+        // silence case): the tail is empty AND the run is marked timed out,
+        // so the dialog can render "no output" + timeout banner instead of
+        // an ambiguous blank.
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-check-silent".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "silent-check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "sleep 30",
+                "success_condition": "exit_code_0",
+                "timeout_seconds": 1
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        engine
+            .run_loop(loop_id.clone(), None, None, None, None)
+            .await
+            .unwrap();
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        let run = runs
+            .iter()
+            .find(|r| r.node_id == "node-check-silent")
+            .unwrap();
+        assert_eq!(run.status, LoopRunStatus::Fail);
+        let (stdout, stderr) = db.get_loop_run_tail(&run.id, 1000).unwrap();
+        assert_eq!(stdout, "");
+        assert_eq!(stderr, "");
+    }
+
+    #[tokio::test]
+    async fn check_node_large_output_tail_snapshot_stays_bounded() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-check-flood".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "flood-check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "head -c 100000 /dev/zero | tr '\\0' 'B'; printf 'FLOOD_TAIL'; exit 0",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        engine
+            .run_loop(loop_id.clone(), None, None, None, None)
+            .await
+            .unwrap();
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        let run = runs
+            .iter()
+            .find(|r| r.node_id == "node-check-flood")
+            .unwrap();
+        assert_eq!(run.status, LoopRunStatus::Pass);
+        let (stdout, _) = db.get_loop_run_tail(&run.id, 1000).unwrap();
+        assert!(
+            stdout.contains("FLOOD_TAIL"),
+            "tail must keep the newest bytes, got len {}",
+            stdout.len()
+        );
+        // Snapshot path reuses the 64KB truncation: the served tail must
+        // stay bounded even though 100KB streamed through the chunk table.
+        assert!(
+            stdout.len() <= 64 * 1024 + 100,
+            "served tail must be bounded, got len {}",
             stdout.len()
         );
     }

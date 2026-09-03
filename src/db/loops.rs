@@ -1515,6 +1515,104 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// CT3: append one live-output chunk for a running check node. Called
+    /// from the engine's stdout/stderr reader tasks; `stream` must be
+    /// `stdout` or `stderr` (enforced by the table CHECK constraint).
+    pub fn append_loop_run_output(&self, run_id: &str, stream: &str, chunk: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        conn.execute(
+            "INSERT INTO loop_run_output (run_id, stream, chunk) VALUES (?1, ?2, ?3)",
+            params![run_id, stream, chunk],
+        )?;
+        Ok(())
+    }
+
+    /// CT3: live tail for the tail dialog. Reads each stream's chunks
+    /// newest-first and stops once it has [`TAIL_MAX_BYTES`] of that stream,
+    /// so a node that has emitted gigabytes still costs only a few dozen row
+    /// reads per poll (NFR: following a very chatty node must not block the
+    /// TUI or consume unbounded memory). Keeps the last `max_lines` lines of
+    /// each stream; when neither stream has any chunks (after completion when
+    /// only the snapshot remains, or a zero-output hang) falls back to the
+    /// `loop_runs.stdout_tail`/`stderr_tail` snapshot columns.
+    pub fn get_loop_run_tail(&self, run_id: &str, max_lines: usize) -> Result<(String, String)> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+
+        // Pull one stream's trailing chunks in reverse insertion order,
+        // stopping as soon as we hold enough bytes to satisfy the byte cap
+        // that `take_last_bytes` would apply anyway. Bounds the scan to
+        // O(TAIL_MAX_BYTES) regardless of how much total output exists.
+        let read_stream_tail = |stream: &str| -> Result<(String, bool)> {
+            let mut stmt = conn.prepare(
+                "SELECT chunk FROM loop_run_output
+                 WHERE run_id = ?1 AND stream = ?2
+                 ORDER BY id DESC",
+            )?;
+            let mut rows = stmt.query(params![run_id, stream])?;
+            let mut parts: Vec<String> = Vec::new();
+            let mut bytes = 0usize;
+            let mut any = false;
+            while let Some(row) = rows.next()? {
+                any = true;
+                let chunk: String = row.get(0)?;
+                bytes += chunk.len();
+                parts.push(chunk);
+                if bytes >= TAIL_MAX_BYTES {
+                    break;
+                }
+            }
+            parts.reverse();
+            Ok((parts.concat(), any))
+        };
+
+        let (stdout_buf, any_stdout) = read_stream_tail("stdout")?;
+        let (stderr_buf, any_stderr) = read_stream_tail("stderr")?;
+
+        if !any_stdout && !any_stderr {
+            let (snap_out, snap_err): (Option<String>, Option<String>) = conn
+                .query_row(
+                    "SELECT stdout_tail, stderr_tail FROM loop_runs WHERE id = ?1",
+                    params![run_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap_or((None, None));
+            return Ok((
+                take_last_lines(snap_out.as_deref().unwrap_or(""), max_lines),
+                take_last_lines(snap_err.as_deref().unwrap_or(""), max_lines),
+            ));
+        }
+        Ok((
+            take_last_lines(take_last_bytes(&stdout_buf), max_lines),
+            take_last_lines(take_last_bytes(&stderr_buf), max_lines),
+        ))
+    }
+
+    /// CT3: cache the final truncated per-stream tails on the run row at
+    /// completion, so the dialog can show post-completion output without
+    /// scanning the chunk table.
+    pub fn set_loop_run_tail_snapshot(
+        &self,
+        run_id: &str,
+        stdout_tail: Option<&str>,
+        stderr_tail: Option<&str>,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        conn.execute(
+            "UPDATE loop_runs SET stdout_tail = ?1, stderr_tail = ?2 WHERE id = ?3",
+            params![stdout_tail, stderr_tail, run_id],
+        )?;
+        Ok(())
+    }
+
     /// Record one firing of a loop's `on_completed` hook (N2), started as
     /// `Running` before the process is spawned — mirrors [`Self::insert_loop_run`]'s
     /// pattern of a row that exists before the child does, so a crash mid-spawn
@@ -2064,6 +2162,37 @@ fn validate_single_target(spec_id: Option<&str>, loop_id: Option<&str>) -> Resul
         )),
         _ => Ok(()),
     }
+}
+
+/// CT3: byte bound for one served tail stream — mirrors the engine's
+/// 64KB check-output truncation so a chunk flood (e.g. one 100KB line)
+/// can never blow the TUI's memory through the line cap alone.
+const TAIL_MAX_BYTES: usize = 64 * 1024;
+
+/// CT3: keep the last [`TAIL_MAX_BYTES`] bytes of `text` on a char
+/// boundary. Applied before the line cap so giant single lines are
+/// bounded too.
+fn take_last_bytes(text: &str) -> &str {
+    if text.len() <= TAIL_MAX_BYTES {
+        return text;
+    }
+    let mut start = text.len() - TAIL_MAX_BYTES;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
+/// CT3: keep the last `max_lines` lines of `text`. Line-oriented (not
+/// byte-oriented) so the dialog's on-screen cap bounds memory without
+/// splitting a line; `max_lines == 0` yields an empty string.
+fn take_last_lines(text: &str, max_lines: usize) -> String {
+    if max_lines == 0 || text.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
 }
 
 fn map_loop_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Loop> {
@@ -2730,5 +2859,109 @@ mod tests {
         assert_eq!(all_ids.len(), 2);
         assert!(all_ids.contains(&"node-spec".to_string()));
         assert!(all_ids.contains(&"node-loop".to_string()));
+    }
+
+    // ── CT3: live tail storage ──────────────────────────────────────
+
+    fn tail_test_run(db: &Database, run_id: &str) {
+        use crate::domain::loops::LoopRunStatus;
+        db.insert_loop(&sample_loop("tail-loop")).unwrap();
+        db.insert_loop_spec(&crate::domain::loops::LoopSpec {
+            id: "tail-spec".to_string(),
+            loop_id: Some("tail-loop".to_string()),
+            name: "Tail spec".to_string(),
+            description: None,
+            position: 0,
+            parallelizable: false,
+            status: crate::domain::loops::LoopSpecStatus::Running,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+        db.insert_loop_node(&crate::domain::loops::LoopNode {
+            id: "tail-node".to_string(),
+            spec_id: Some("tail-spec".to_string()),
+            loop_id: None,
+            name: "Tail node".to_string(),
+            kind: crate::domain::loops::LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true"}),
+            position: 0,
+            created_at: Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_run(&crate::domain::loops::LoopNodeRun {
+            id: run_id.to_string(),
+            loop_id: "tail-loop".to_string(),
+            spec_id: "tail-spec".to_string(),
+            node_id: "tail-node".to_string(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn append_and_get_loop_run_tail_returns_chunks_in_order() {
+        let db = test_db();
+        tail_test_run(&db, "run-tail-1");
+        db.append_loop_run_output("run-tail-1", "stdout", "out-a\n")
+            .unwrap();
+        db.append_loop_run_output("run-tail-1", "stderr", "err-a\n")
+            .unwrap();
+        db.append_loop_run_output("run-tail-1", "stdout", "out-b\n")
+            .unwrap();
+
+        let (stdout, stderr) = db.get_loop_run_tail("run-tail-1", 1000).unwrap();
+        assert_eq!(stdout, "out-a\nout-b");
+        assert_eq!(stderr, "err-a");
+    }
+
+    #[test]
+    fn get_loop_run_tail_caps_lines_to_max() {
+        let db = test_db();
+        tail_test_run(&db, "run-tail-2");
+        for i in 0..10 {
+            db.append_loop_run_output("run-tail-2", "stdout", &format!("line {i}\n"))
+                .unwrap();
+        }
+        let (stdout, _) = db.get_loop_run_tail("run-tail-2", 3).unwrap();
+        assert_eq!(stdout, "line 7\nline 8\nline 9");
+    }
+
+    #[test]
+    fn set_loop_run_tail_snapshot_serves_post_completion_tail() {
+        let db = test_db();
+        tail_test_run(&db, "run-tail-3");
+        // Zero-output hang: no chunks at all — the snapshot is the only
+        // source, and an empty one must read back as empty, not error.
+        db.set_loop_run_tail_snapshot("run-tail-3", Some("final out"), Some(""))
+            .unwrap();
+        let (stdout, stderr) = db.get_loop_run_tail("run-tail-3", 1000).unwrap();
+        assert_eq!(stdout, "final out");
+        assert_eq!(stderr, "");
+    }
+
+    #[test]
+    fn append_loop_run_output_rejects_unknown_stream() {
+        let db = test_db();
+        tail_test_run(&db, "run-tail-4");
+        assert!(
+            db.append_loop_run_output("run-tail-4", "stdin", "x")
+                .is_err(),
+            "CHECK constraint must reject streams other than stdout/stderr"
+        );
     }
 }

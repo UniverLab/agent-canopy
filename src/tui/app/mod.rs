@@ -132,6 +132,7 @@ impl App {
             loop_live_view_scroll: 0,
             loop_live_view_total_lines: 0,
             loop_autorun_dialog: None,
+            node_tail_dialog: None,
             loop_action_pending: false,
             loop_action_rx: None,
             loop_action_message: None,
@@ -252,6 +253,7 @@ impl App {
         self.poll_playground_search();
         self.refresh_playground_search()?;
         self.poll_loop_action();
+        self.poll_node_tail_dialog();
         self.dismiss_loop_action_message();
         if let Some(dialog) = self.simple_prompt_dialog.as_mut() {
             dialog.tick_at_picker();

@@ -69,6 +69,12 @@ pub(crate) fn draw_loop_live_view(frame: &mut Frame, area: Rect, app: &mut App, 
     app.loop_spec_strip_capacity = result.capacity;
     app.loop_live_view_total_lines = result.total_lines;
     app.loop_live_view_scroll = result.clamped_scroll;
+
+    // CT3: live-tail overlay renders last so it sits above the graph and
+    // detail content. Viewer only — no input state is touched here.
+    if let Some(dialog) = app.node_tail_dialog.as_ref() {
+        super::super::dialogs::draw_node_tail_dialog(frame, area, dialog, theme, Utc::now());
+    }
 }
 
 /// Everything the pure renderer needs, gathered by [`draw_loop_live_view`]

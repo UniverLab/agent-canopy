@@ -14,6 +14,7 @@ pub mod loop_control;
 pub mod loop_editor;
 pub mod loop_form;
 pub mod new_agent_dialog;
+pub mod node_tail;
 pub mod pickers;
 pub mod rag_transfer;
 pub mod section_picker;
@@ -28,6 +29,7 @@ pub use loop_control::{draw_loop_action_message, draw_loop_autorun_dialog};
 pub use loop_editor::draw_loop_editor_dialog;
 pub use loop_form::draw_loop_form_dialog;
 pub use new_agent_dialog::draw_new_agent_dialog;
+pub(crate) use node_tail::draw_node_tail_dialog;
 pub use pickers::{draw_split_picker, draw_suggestion_picker};
 pub use rag_transfer::draw_rag_transfer_modal;
 pub use simple_modals::{

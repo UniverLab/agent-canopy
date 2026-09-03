@@ -826,6 +826,10 @@ pub struct App {
     /// live view — `None` when not open. See
     /// [`crate::tui::app::dialog::LoopAutorunDialog`].
     pub(crate) loop_autorun_dialog: Option<crate::tui::app::dialog::LoopAutorunDialog>,
+    /// CT3 live-tail viewer for a running check node. Diagnostic-only: all
+    /// reads, so dismissing it can never affect execution. `Some` while
+    /// open (including after the node finishes, showing the final banner).
+    pub(crate) node_tail_dialog: Option<crate::tui::app::dialog::NodeTailDialog>,
     /// True while a loop-control dispatch (`loop_run`/`loop_pause`/
     /// `loop_continue`/`loop_reset`/`loop_schedule_autorun`) is in flight on
     /// `loop_action_rx` — guards against a second dispatch racing the first.

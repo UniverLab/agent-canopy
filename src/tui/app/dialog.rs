@@ -8,6 +8,7 @@ pub mod launchpad;
 pub mod loop_control;
 pub mod loop_form;
 pub mod new_agent;
+pub mod node_tail;
 pub mod prompt;
 
 pub use at_picker::*;
@@ -16,4 +17,5 @@ pub use launchpad::*;
 pub(crate) use loop_control::*;
 pub use loop_form::*;
 pub use new_agent::*;
+pub(crate) use node_tail::*;
 pub use prompt::*;
