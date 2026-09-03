@@ -284,7 +284,10 @@ fn render_graph_panel(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 /// (C26 decision 1 — projects aren't the subject on Live/Automation), and
 /// only when there's an edge to draw (C26 decision 2 — a workspace of
 /// unrelated projects still fills `project_graph_trees` with one singleton
-/// per project, which is not "content").
+/// per project, which is not "content"). CT1 moves the graph into the
+/// right panel's Knowledge face, so while that face is showing the sidebar
+/// stops rendering it there — one home for the graph, never two.
+#[cfg(test)]
 fn graph_has_content(edge_count: usize, is_knowledge_tab: bool) -> bool {
     is_knowledge_tab && edge_count > 0
 }
@@ -294,10 +297,11 @@ fn render_brain_or_graph(
     area: Rect,
     app: &App,
     theme: &Theme,
-    is_knowledge_tab: bool,
+    _is_knowledge_tab: bool,
 ) {
-    let graph_has_content = graph_has_content(app.project_graph_edges.len(), is_knowledge_tab);
-    match split_brain_or_graph(area, graph_has_content) {
+    // CT1: the project-relations graph belongs exclusively to the right
+    // panel's Knowledge face. Keep this sidebar region for Brian's Brain.
+    match split_brain_or_graph(area, false) {
         BrainOrGraphLayout::Neither => {}
         BrainOrGraphLayout::GraphOnly(graph_area) => {
             render_graph_panel(frame, graph_area, app, theme);
@@ -1710,7 +1714,7 @@ fn graph_edge_row_budget(inner_height: u16, edge_count: usize) -> usize {
     edge_count.min(inner_height as usize)
 }
 
-fn draw_project_graph(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+pub(crate) fn draw_project_graph(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     if app.project_graph_trees.is_empty() || app.project_graph_edges.is_empty() {
         let msg = if app.projects.len() <= 1 {
             "No relationships yet. Press Enter on a project to link."
@@ -3506,7 +3510,7 @@ mod tests {
     }
 
     #[test]
-    fn knowledge_tab_with_an_edge_draws_the_graph_panel() {
+    fn knowledge_tab_does_not_draw_graph_in_sidebar() {
         let text = render_sidebar_text_with(
             2,
             34,
@@ -3525,12 +3529,8 @@ mod tests {
             },
         );
         assert!(
-            text.contains("project graph"),
-            "graph panel title missing: {text}"
-        );
-        assert!(
-            text.contains("project0") && text.contains("project1"),
-            "edge label missing: {text}"
+            !text.contains("project graph"),
+            "project graph belongs to the right-panel Knowledge face: {text}"
         );
     }
 

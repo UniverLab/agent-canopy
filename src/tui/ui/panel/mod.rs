@@ -27,7 +27,7 @@ pub use details::{draw_agent_details, draw_group_details};
 pub(crate) use home::draw_brians_brain;
 pub use log_fallback::draw_log_text;
 use loop_live::draw_loop_live_view;
-pub(crate) use sync::draw_activity_panel;
+pub(crate) use sync::draw_panel_face;
 use vt100::render_vt_screen;
 #[allow(unused_imports)]
 pub use warp::compact_cwd;

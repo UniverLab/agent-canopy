@@ -121,6 +121,13 @@ pub struct CanopyConfig {
 
     #[serde(default)]
     pub announcements_enabled: bool,
+
+    /// Pinned right-panel face (`"activity"`, `"knowledge"` or `"loop"`).
+    /// `None` means automatic mode (the default; a fresh install is
+    /// unpinned). Stored as a plain string — rather than the TUI's
+    /// `PanelFace` enum — so this domain crate never depends on the TUI.
+    #[serde(default)]
+    pub pinned_panel_face: Option<String>,
 }
 
 /// Highest per-file indexing cap a user may configure, in MB. Text/PDF
@@ -414,6 +421,7 @@ impl Default for CanopyConfig {
             rag_max_file_mb: default_rag_max_file_mb(),
             rag_vector_cache_entries: default_rag_vector_cache_entries(),
             announcements_enabled: false,
+            pinned_panel_face: None,
         }
     }
 }
@@ -830,6 +838,40 @@ mod tests {
 
         let loaded = CanopyConfig::load(&canopy_dir);
         assert!(!loaded.announcements_enabled);
+    }
+
+    #[test]
+    fn pinned_panel_face_defaults_to_none_for_automatic_mode() {
+        let config = CanopyConfig::default();
+        assert_eq!(config.pinned_panel_face, None);
+    }
+
+    #[test]
+    fn pinned_panel_face_round_trips_via_config_toml() {
+        let dir = TempDir::new().unwrap();
+        let canopy_dir = dir.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+
+        let config = CanopyConfig {
+            pinned_panel_face: Some("knowledge".to_string()),
+            ..CanopyConfig::default()
+        };
+        config.save(&canopy_dir).unwrap();
+
+        let loaded = CanopyConfig::load(&canopy_dir);
+        assert_eq!(loaded.pinned_panel_face.as_deref(), Some("knowledge"));
+    }
+
+    #[test]
+    fn config_without_pinned_panel_face_field_stays_unpinned() {
+        let dir = TempDir::new().unwrap();
+        let canopy_dir = dir.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        let toml = r#"embeddings_model = "intfloat/multilingual-e5-base""#;
+        std::fs::write(canopy_dir.join("config.toml"), toml).unwrap();
+
+        let loaded = CanopyConfig::load(&canopy_dir);
+        assert_eq!(loaded.pinned_panel_face, None);
     }
 
     #[test]

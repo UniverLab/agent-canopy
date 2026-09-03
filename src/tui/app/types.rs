@@ -109,6 +109,43 @@ pub enum AutomationKind {
     Loop,
 }
 
+/// The right panel's faces (CT1): one panel, three views. Activity is the
+/// resting face when nothing else applies; Knowledge shows activity moved
+/// under it plus the project-relations graph; Loop shows a read-only view
+/// of the running loop.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PanelFace {
+    #[default]
+    Activity,
+    Knowledge,
+    Loop,
+}
+
+impl PanelFace {
+    pub const ALL: [PanelFace; 3] = [PanelFace::Activity, PanelFace::Knowledge, PanelFace::Loop];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PanelFace::Activity => "activity",
+            PanelFace::Knowledge => "knowledge",
+            PanelFace::Loop => "loop",
+        }
+    }
+
+    /// Parse the persisted config string. Unknown values map to `None` so a
+    /// config written by a newer binary never breaks this one — the panel
+    /// just stays in automatic mode.
+    pub fn from_str(value: &str) -> Option<PanelFace> {
+        match value {
+            "activity" => Some(PanelFace::Activity),
+            "knowledge" => Some(PanelFace::Knowledge),
+            "loop" => Some(PanelFace::Loop),
+            _ => None,
+        }
+    }
+}
+
 /// Tabs shown inside a project once it's entered (`Focus::Agent` while
 /// `SidebarLayer::Knowledge` is active) — everything project-scoped lives
 /// here instead of as top-level sidebar siblings.
@@ -923,6 +960,45 @@ pub struct App {
     pub(crate) sync_scroll_offset: u16,
     /// Last rendered area of the activity panel (used for mouse hit-testing).
     pub(crate) last_sync_area: Option<ratatui::layout::Rect>,
+
+    // CT1 multi-face right panel: the switching rule lives in
+    // `crate::tui::app::panel_face` — these are its inputs and outputs.
+    /// Currently visible face. Only ever changed by the panel-face tick or
+    /// by an explicit pin/pick — never as a side effect of rendering — so
+    /// switching faces can't flicker or force a full-screen redraw.
+    pub(crate) panel_face: PanelFace,
+    /// The face pinned from the picker (`None` = automatic mode).
+    pub(crate) panel_pinned: Option<PanelFace>,
+    /// Event-driven face with its 10-second dwell deadline. A newer event
+    /// replaces it and restarts the dwell; events never queue.
+    pub(crate) panel_dwell_face: Option<PanelFace>,
+    pub(crate) panel_dwell_until: Option<std::time::Instant>,
+    /// Human-readable reason for the current dwell (`"new knowledge"`,
+    /// `"backlog changed"`). Shown in the title while the dwell holds.
+    pub(crate) panel_dwell_reason: Option<String>,
+    /// Reason for the last automatic switch (`"loop running"`, `"new
+    /// knowledge"`, …). Rendered as a badge so a face never appears
+    /// unexplained. `None` after a manual pin/pick.
+    pub(crate) panel_last_reason: Option<String>,
+    /// Whether the face picker overlay is open, and its cursor.
+    pub(crate) panel_picker_open: bool,
+    pub(crate) panel_picker_idx: usize,
+    /// True while the mouse is pressed/dragging inside the panel or the
+    /// panel was clicked into (keyboard focus claimed by the panel).
+    /// While set, any pending automatic switch is dropped, not deferred.
+    pub(crate) panel_focused: bool,
+    /// Set by a mouse-wheel scroll over the panel; consumed (cleared) by
+    /// the next panel-face tick, which drops the pending switch with it.
+    pub(crate) panel_interacting: bool,
+    /// Baselines for event detection: knowledge-entry and backlog counts
+    /// at the last tick. A change fires a Knowledge event.
+    pub(crate) panel_last_knowledge_count: usize,
+    pub(crate) panel_last_backlog_count: usize,
+    /// Loop-running state at the last tick (the STATE input).
+    pub(crate) panel_last_loop_running: bool,
+    /// False until the first tick has seeded the baselines above, so the
+    /// initial data load never fires a spurious event.
+    pub(crate) panel_baselines_init: bool,
 
     // RAG pause state (synced from daemon_state table)
     pub(crate) rag_paused: bool,

@@ -77,16 +77,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         body
     };
 
-    let activity_state = app.activity_panel_state();
-    let activity_width = app.activity_panel_layout_width(body_area.width, activity_state.is_some());
-    let (panel_area, sync_area) = if let Some(activity_state) = activity_state.as_ref() {
+    // CT1 multi-face right panel: the visible face decides, and the face
+    // decides whether there is anything to show. The layout width rule is
+    // unchanged — only which content fills the panel moved.
+    let panel_visible = app.panel_face_visible();
+    let activity_width = app.activity_panel_layout_width(body_area.width, panel_visible);
+    let (panel_area, sync_area) = if panel_visible {
         if activity_width > 0 {
             let [panel, sync] = Layout::horizontal([
                 Constraint::Min(body_area.width.saturating_sub(activity_width)),
                 Constraint::Length(activity_width),
             ])
             .areas(body_area);
-            panel::draw_activity_panel(frame, sync, activity_state, app.sync_scroll_offset, &theme);
+            panel::draw_panel_face(frame, sync, app, &theme);
             app.last_sync_area = Some(sync);
             (panel, Some(sync))
         } else {
@@ -206,6 +209,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         dialogs::draw_split_picker(frame, app, &theme);
     }
 
+    if app.panel_picker_open {
+        draw_panel_picker(frame, app, &theme);
+    }
+
     if app.suggestion_picker.is_some() {
         dialogs::draw_suggestion_picker(frame, app, panel_area, &theme);
     }
@@ -265,6 +272,79 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 // ── Shared helpers ──────────────────────────────────────────────
+
+/// CT1 face picker: pin any panel face, or back to automatic. Rendered as a
+/// small centered overlay like the split picker — keyboard only (↑↓/jk,
+/// Enter, Esc), so it never steals or needs the mouse.
+fn draw_panel_picker(frame: &mut Frame, app: &App, theme: &Theme) {
+    use crate::tui::app::panel_face::PANEL_PICKER_OPTIONS;
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, Paragraph};
+
+    let rows: Vec<(String, bool)> = PANEL_PICKER_OPTIONS
+        .iter()
+        .map(|option| {
+            let name = option.map_or("automatic", |face| face.label()).to_string();
+            let pinned = *option == app.panel_pinned;
+            let label = if pinned {
+                format!("{name}  · pinned")
+            } else {
+                name
+            };
+            (label, pinned)
+        })
+        .collect();
+    let width = rows
+        .iter()
+        .map(|(label, _)| label.chars().count())
+        .max()
+        .unwrap_or(9)
+        .max(22) as u16
+        + 6;
+    let height = rows.len() as u16 + 4;
+    let area = centered_rect(40, height, frame.area());
+    let area = Rect::new(
+        area.x,
+        area.y,
+        width.min(frame.area().width.saturating_sub(2)),
+        height.min(frame.area().height.saturating_sub(2)),
+    );
+
+    let block = Block::default()
+        .title(" panel face · F6 ")
+        .borders(borders_for(theme))
+        .border_style(Style::default().fg(theme.header_color));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height < 3 {
+        return;
+    }
+
+    let mut lines = vec![Line::from(Span::styled(
+        "Enter pins · Esc closes",
+        Style::default().fg(theme.dim_text),
+    ))];
+    for (idx, (label, _)) in rows.iter().enumerate() {
+        let selected = idx == app.panel_picker_idx;
+        let (style, marker) = if selected {
+            (
+                Style::default()
+                    .bg(theme.selected_bg)
+                    .add_modifier(Modifier::BOLD),
+                "›",
+            )
+        } else {
+            (Style::default(), " ")
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker, style.fg(theme.header_color)),
+            Span::raw(" "),
+            Span::styled(label.clone(), style.fg(Color::White)),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
 
 /// Create a centered rect of given percentage width and fixed height.
 pub(crate) fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {

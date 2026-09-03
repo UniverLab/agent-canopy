@@ -134,6 +134,10 @@ mod loop_editor;
 mod loop_form;
 
 pub fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
+    if app.panel_picker_open {
+        handle_panel_picker_key(app, code);
+        return Ok(());
+    }
     if dismiss_legend(app, code) || handle_global_key(app, code, modifiers) {
         return Ok(());
     }
@@ -222,6 +226,12 @@ fn handle_global_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> b
         return true;
     }
 
+    // CT1 multi-face panel picker: pin any face, or back to automatic.
+    if code == KeyCode::F(6) {
+        app.open_panel_picker();
+        return true;
+    }
+
     if code == KeyCode::Char('f')
         && modifiers.contains(KeyModifiers::CONTROL)
         && matches!(app.focus, Focus::Agent)
@@ -283,6 +293,40 @@ fn dispatch_focus_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> 
 
 // ── Mouse: scroll wheel + Shift+Click to copy selection ─────────────
 
+/// CT1 face picker keys: ↑↓/jk move, Enter pins the highlighted row
+/// (Automatic unpins back to the switching rule), Esc closes.
+fn handle_panel_picker_key(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => app.move_panel_picker(false),
+        KeyCode::Down | KeyCode::Char('j') => app.move_panel_picker(true),
+        KeyCode::Enter => app.confirm_panel_picker(),
+        KeyCode::Esc => app.close_panel_picker(),
+        _ => {}
+    }
+}
+
+/// A left-click inside the right panel claims its focus (automatic switches
+/// are dropped while focused); a left-click anywhere else releases it.
+fn handle_panel_mouse(app: &mut App, mouse: &MouseEvent) -> bool {
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return false;
+    }
+    let Some(sync_area) = app.last_sync_area else {
+        if app.panel_focused {
+            app.on_panel_clicked(false);
+        }
+        return false;
+    };
+    if rect_contains_point(sync_area, mouse.column, mouse.row) {
+        app.on_panel_clicked(true);
+        return true;
+    }
+    if app.panel_focused {
+        app.on_panel_clicked(false);
+    }
+    false
+}
+
 fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
     // The prompt builder is a modal overlay: it owns the mouse while open.
     // Left-clicks on the tab bar switch the active tab; everything else is
@@ -293,6 +337,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) -> Result<()> {
     }
 
     if handle_sidebar_mouse(app, &mouse) {
+        return Ok(());
+    }
+
+    if handle_panel_mouse(app, &mouse) {
         return Ok(());
     }
 
@@ -815,6 +863,9 @@ fn handle_sync_panel_scroll(app: &mut App, mouse: &MouseEvent, dir: i32) -> bool
         return false;
     }
 
+    // Scrolling the panel counts as interacting with it: the pending
+    // automatic switch (if any) is dropped, not deferred.
+    app.on_panel_scrolled();
     if dir > 0 {
         app.sync_scroll_offset = app.sync_scroll_offset.saturating_sub(3);
     } else {

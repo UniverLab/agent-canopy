@@ -3,6 +3,7 @@ mod data;
 pub mod dialog;
 mod gamification;
 pub(crate) mod loop_live_state;
+pub(crate) mod panel_face;
 mod project_graph;
 mod sync;
 
@@ -40,7 +41,7 @@ pub use terminal_search::TerminalSearch;
 pub(crate) use types::ContextTransferSource;
 pub(crate) use types::LoopLiveFocus;
 pub use types::{
-    AgentEntry, AgentSectionFocus, App, AutomationKind, Focus, ProjectTab, SidebarLayer,
+    AgentEntry, AgentSectionFocus, App, AutomationKind, Focus, PanelFace, ProjectTab, SidebarLayer,
 };
 use types::{LoopSidebarMeta, RagTransferModal, SidebarStepMemory};
 
@@ -202,6 +203,20 @@ impl App {
             agents_rag_focused: false,
             sync_scroll_offset: 0,
             last_sync_area: None,
+            panel_face: PanelFace::Activity,
+            panel_pinned: App::load_panel_pinned_face(&canopy_config.pinned_panel_face),
+            panel_dwell_face: None,
+            panel_dwell_until: None,
+            panel_dwell_reason: None,
+            panel_last_reason: None,
+            panel_picker_open: false,
+            panel_picker_idx: 0,
+            panel_focused: false,
+            panel_interacting: false,
+            panel_last_knowledge_count: 0,
+            panel_last_backlog_count: 0,
+            panel_last_loop_running: false,
+            panel_baselines_init: false,
             session_protocol_state: HashMap::new(),
             active_sandbox: None,
             project_relation_dialog: None,
@@ -255,6 +270,9 @@ impl App {
         self.poll_loop_action();
         self.poll_node_tail_dialog();
         self.dismiss_loop_action_message();
+        // CT1 multi-face panel: recompute the visible face from the
+        // switching rule after every data refresh above has run.
+        self.tick_panel_face();
         if let Some(dialog) = self.simple_prompt_dialog.as_mut() {
             dialog.tick_at_picker();
         }

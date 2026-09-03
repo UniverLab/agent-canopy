@@ -17,6 +17,7 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Them
             let mut h = vec![("↑↓", "select"), ("n", "new")];
             if activity_available {
                 h.push(("F3", "activity"));
+                h.push(("F6", "panel"));
             }
             h.push(("Shift+←→", "panels"));
             h.push(("F10", "preview"));
@@ -87,6 +88,7 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Them
                 h.push(("n", "new"));
                 if activity_available {
                     h.push(("F3", "activity"));
+                    h.push(("F6", "panel"));
                 }
                 h.push(("Esc", "home"));
                 h
@@ -167,6 +169,7 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Them
                 }
                 if activity_available {
                     h.push(("F3", "activity"));
+                    h.push(("F6", "panel"));
                 }
                 h.push(("Ctrl+N", "new"));
                 if !child_claimed {
@@ -183,6 +186,7 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Them
                 }
                 if activity_available {
                     h.push(("F3", "activity"));
+                    h.push(("F6", "panel"));
                 }
                 h.push(("Ctrl+N", "new"));
                 h.push(("F1", "legend"));
