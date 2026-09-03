@@ -583,11 +583,17 @@ fn handle_loop_live_panel_mouse(app: &mut App, mouse: &MouseEvent) -> bool {
                 None => false,
             }
         }
-        MouseEventKind::ScrollUp if loop_spec_strip_row(app) == Some(mouse.row) => {
+        MouseEventKind::ScrollUp
+            if loop_spec_strip_row_range(app)
+                .is_some_and(|(lo, hi)| mouse.row >= lo && mouse.row <= hi) =>
+        {
             scroll_loop_spec_strip(app, 1);
             true
         }
-        MouseEventKind::ScrollDown if loop_spec_strip_row(app) == Some(mouse.row) => {
+        MouseEventKind::ScrollDown
+            if loop_spec_strip_row_range(app)
+                .is_some_and(|(lo, hi)| mouse.row >= lo && mouse.row <= hi) =>
+        {
             scroll_loop_spec_strip(app, -1);
             true
         }
@@ -612,12 +618,23 @@ fn loop_spec_strip_at(app: &App, row: u16, col: u16) -> Option<String> {
         .map(|(id, _, _, _)| id.clone())
 }
 
-/// The screen row the marker strip's chips are rendered on, if any are
+/// The screen row range the marker strip's chips are rendered on, if any are
 /// currently visible (empty when there's no spec queue to show).
-fn loop_spec_strip_row(app: &App) -> Option<u16> {
-    app.loop_spec_strip_click_map
-        .first()
-        .map(|&(_, row, _, _)| row)
+fn loop_spec_strip_row_range(app: &App) -> Option<(u16, u16)> {
+    if app.loop_spec_strip_click_map.is_empty() {
+        return None;
+    }
+    let min_row = app
+        .loop_spec_strip_click_map
+        .iter()
+        .map(|&(_, r, _, _)| r)
+        .min()?;
+    let max_row = app
+        .loop_spec_strip_click_map
+        .iter()
+        .map(|&(_, r, _, _)| r)
+        .max()?;
+    Some((min_row, max_row))
 }
 
 fn scroll_loop_spec_strip(app: &mut App, dir: i32) {

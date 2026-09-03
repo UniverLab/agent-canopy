@@ -120,6 +120,7 @@ fn render_loop_live_view(
         ctx.selected_spec_id,
         ctx.spec_scroll,
         area.width,
+        area.height,
         ctx.theme,
     );
     lines.extend(strip.lines);
@@ -190,8 +191,13 @@ fn render_loop_live_view(
         click_map: strip
             .click_map
             .into_iter()
-            .map(|(spec_id, col_start, col_end)| {
-                (spec_id, chip_row, area.x + col_start, area.x + col_end)
+            .map(|(spec_id, row_offset, col_start, col_end)| {
+                (
+                    spec_id,
+                    chip_row + row_offset,
+                    area.x + col_start,
+                    area.x + col_end,
+                )
             })
             .collect(),
         capacity: strip.capacity,
@@ -299,25 +305,29 @@ const SPEC_CHIP_WIDTH: u16 = 4;
 /// truncate — wide enough for three-digit spec counts on either side.
 const SPEC_STRIP_RANGE_SUFFIX_WIDTH: u16 = 14;
 
-/// The marker strip's rendered lines, its click map (spec id + column span,
-/// relative to the line's own start — the caller translates to absolute
-/// screen coordinates), and how many chips fit in the given width.
+/// The marker strip's rendered lines, its click map (spec id + row offset +
+/// column span, relative to the strip's own origin — the caller translates
+/// to absolute screen coordinates), and how many chips fit in the given
+/// width.
 struct SpecStripLayout {
     lines: Vec<Line<'static>>,
-    click_map: Vec<(String, u16, u16)>,
+    click_map: Vec<(String, u16, u16, u16)>,
     capacity: usize,
+    #[allow(dead_code)]
+    chip_line_count: usize,
 }
 
-/// Lay out the spec marker strip: a compact row of status chips (compressed
-/// to a scrollable window, with a "(a-b of N)" indicator, when there are
-/// more specs than fit in `area_width`) followed by the selected spec's
-/// detail — falling back to the running/next-pending spec when nothing is
-/// manually selected, matching the strip's pre-selection behavior.
+/// Lay out the spec marker strip: status chips wrapped across multiple lines
+/// to fill available height; compressed to a scrollable window with a
+/// "(a-b of N)" indicator only when even multi-line wrapping cannot fit all
+/// specs — followed by the selected spec's detail, falling back to the
+/// running/next-pending spec when nothing is manually selected.
 fn spec_strip_layout(
     state: &LoopLiveState,
     selected_spec_id: Option<&str>,
     scroll: usize,
     area_width: u16,
+    area_height: u16,
     theme: &Theme,
 ) -> SpecStripLayout {
     if state.spec_queue.is_empty() {
@@ -328,25 +338,45 @@ fn spec_strip_layout(
             ))],
             click_map: Vec::new(),
             capacity: 0,
+            chip_line_count: 1,
         };
     }
 
     let total = state.spec_queue.len();
-    let full_capacity = (area_width / SPEC_CHIP_WIDTH).max(1) as usize;
-    let truncated = total > full_capacity;
+    let chips_per_line = (area_width / SPEC_CHIP_WIDTH).max(1) as usize;
+    let lines_needed = total.div_ceil(chips_per_line);
+    const RESERVED_NON_CHIP_LINES: u16 = 8;
+    let max_chip_lines = area_height.saturating_sub(RESERVED_NON_CHIP_LINES).max(1) as usize;
+    let chip_lines = lines_needed.min(max_chip_lines);
+    let truncated = total > chip_lines * chips_per_line;
     let capacity = if truncated {
-        let reserved = area_width.saturating_sub(SPEC_STRIP_RANGE_SUFFIX_WIDTH);
-        (reserved / SPEC_CHIP_WIDTH).max(1) as usize
+        // Round up: reserving 3 whole chips (12 cols) for a 14-col suffix
+        // leaves the "(a-b of N)" text spilling past the line and soft-wrapping
+        // onto an extra visual row. Reserve the ceiling so it fits.
+        let last_line_reserved = SPEC_STRIP_RANGE_SUFFIX_WIDTH
+            .div_ceil(SPEC_CHIP_WIDTH)
+            .max(1) as usize;
+        chip_lines.saturating_sub(1) * chips_per_line
+            + chips_per_line.saturating_sub(last_line_reserved)
     } else {
-        full_capacity
+        chip_lines * chips_per_line
     };
+    let capacity = capacity.max(1);
     let start = scroll.min(total.saturating_sub(capacity));
     let end = (start + capacity).min(total);
 
-    let mut chips: Vec<Span<'static>> = Vec::new();
-    let mut click_map = Vec::new();
+    let mut chip_lines_vec: Vec<Line<'static>> = Vec::new();
+    let mut click_map: Vec<(String, u16, u16, u16)> = Vec::new();
+    let mut current_spans: Vec<Span<'static>> = Vec::new();
     let mut col: u16 = 0;
+    let mut row_offset: u16 = 0;
+
     for entry in &state.spec_queue[start..end] {
+        if col > 0 && col + SPEC_CHIP_WIDTH > area_width {
+            chip_lines_vec.push(Line::from(std::mem::take(&mut current_spans)));
+            row_offset += 1;
+            col = 0;
+        }
         let (icon, color) = spec_chip(entry, state.current_spec_id.as_deref(), theme);
         let selected = Some(entry.spec_id.as_str()) == selected_spec_id;
         let core = if selected {
@@ -360,25 +390,30 @@ fn spec_strip_layout(
             Style::default().fg(color)
         };
         let core_width = core.chars().count() as u16;
-        click_map.push((entry.spec_id.clone(), col, col + core_width));
-        chips.push(Span::styled(core, style));
-        chips.push(Span::raw(" "));
+        click_map.push((entry.spec_id.clone(), row_offset, col, col + core_width));
+        current_spans.push(Span::styled(core, style));
+        current_spans.push(Span::raw(" "));
         col += SPEC_CHIP_WIDTH;
     }
     if truncated {
-        chips.push(Span::styled(
+        current_spans.push(Span::styled(
             format!(" ({}-{} of {})", start + 1, end, total),
             Style::default().fg(theme.dim_text),
         ));
     }
+    if !current_spans.is_empty() || chip_lines_vec.is_empty() {
+        chip_lines_vec.push(Line::from(current_spans));
+    }
 
-    let mut lines = vec![Line::from(chips)];
+    let chip_line_count = chip_lines_vec.len();
+    let mut lines = chip_lines_vec;
     lines.extend(spec_detail_lines(state, selected_spec_id, theme));
 
     SpecStripLayout {
         lines,
         click_map,
         capacity,
+        chip_line_count,
     }
 }
 
@@ -1147,7 +1182,7 @@ mod tests {
     }
 
     #[test]
-    fn spec_strip_compresses_and_shows_range_when_more_specs_than_fit() {
+    fn spec_strip_wraps_across_multiple_lines_when_many_specs_fit() {
         let mut state = running_state();
         state.spec_queue = (0..20)
             .map(|i| SpecQueueEntry {
@@ -1181,9 +1216,178 @@ mod tests {
         });
 
         assert!(
-            text.contains("of 20"),
-            "expected a range indicator saying which specs are shown in:\n{text}"
+            !text.contains("of 20"),
+            "with tall area all 20 chips should wrap without truncation, but got:\n{text}"
         );
+        // All 20 markers present — each ○ occupies a chip, so at least 20 appear.
+        assert!(
+            text.matches('○').count() >= 20,
+            "expected all 20 spec glyphs visible across wrapped lines in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn spec_strip_wraps_21_specs_across_rows_and_click_map_tracks_row() {
+        let mut state = running_state();
+        state.spec_queue = (0..21)
+            .map(|i| SpecQueueEntry {
+                spec_id: format!("s{i}"),
+                spec_name: format!("Spec {i}"),
+                status: LoopSpecStatus::Pending,
+                failure_reason: None,
+            })
+            .collect();
+        state.current_spec_id = None;
+        state.total_count = 21;
+
+        let theme = Theme::classic();
+        // Direct layout check with narrow but tall area: 40 wide -> 10 per line, tall enough for all.
+        let layout = spec_strip_layout(&state, None, 0, 40, 40, &theme);
+        assert_eq!(
+            layout.click_map.len(),
+            21,
+            "all 21 chips must be present when height allows"
+        );
+        assert_eq!(
+            layout.chip_line_count, 3,
+            "21 chips at 10/line needs 3 lines"
+        );
+        // First 10 on row 0, next 10 on row 1, last on row 2.
+        for i in 0..10 {
+            assert_eq!(layout.click_map[i].1, 0, "spec s{i} should be on row 0");
+        }
+        for i in 10..20 {
+            assert_eq!(layout.click_map[i].1, 1, "spec s{i} should be on row 1");
+        }
+        assert_eq!(layout.click_map[20].1, 2);
+
+        // Clicking spec at index 15 (row 1) returns correct spec id.
+        let (row, col) = (layout.click_map[15].1, layout.click_map[15].2);
+        let hit = layout
+            .click_map
+            .iter()
+            .find(|(_, r, c0, c1)| *r == row && *c0 <= col && col < *c1)
+            .map(|(id, _, _, _)| id.as_str());
+        assert_eq!(hit, Some("s15"));
+
+        // Also visible in rendered text with no range indicator.
+        let node_info = NodeRunInfo::default();
+        let text = render_to_text(40, 40, |frame, area| {
+            render_loop_live_view(
+                frame,
+                area,
+                &LiveViewContext {
+                    state: &state,
+                    follow: true,
+                    highlighted_node_id: None,
+                    node_info: &node_info,
+                    blocked: false,
+                    now: Utc::now(),
+                    theme: &Theme::classic(),
+                    selected_spec_id: None,
+                    spec_scroll: 0,
+                    scroll: 0,
+                },
+            );
+        });
+        assert!(
+            !text.contains("of 21"),
+            "all chips visible so no range suffix:\n{text}"
+        );
+        assert!(
+            text.matches('○').count() >= 21,
+            "expected 21 glyphs in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn spec_strip_falls_back_to_scroll_when_height_is_tight() {
+        let mut state = running_state();
+        state.spec_queue = (0..21)
+            .map(|i| SpecQueueEntry {
+                spec_id: format!("s{i}"),
+                spec_name: format!("Spec {i}"),
+                status: LoopSpecStatus::Pending,
+                failure_reason: None,
+            })
+            .collect();
+        state.current_spec_id = None;
+        state.total_count = 21;
+
+        let theme = Theme::classic();
+        // Height 10 -> max_chip_lines = 2, so only 2 lines fit -> truncated.
+        let layout = spec_strip_layout(&state, None, 0, 40, 10, &theme);
+        assert!(
+            layout.capacity < 21,
+            "capacity {} should be < 21 when height is tight",
+            layout.capacity
+        );
+        assert_eq!(layout.chip_line_count, 2);
+
+        let node_info = NodeRunInfo::default();
+        let text = render_to_text(40, 10, |frame, area| {
+            render_loop_live_view(
+                frame,
+                area,
+                &LiveViewContext {
+                    state: &state,
+                    follow: true,
+                    highlighted_node_id: None,
+                    node_info: &node_info,
+                    blocked: false,
+                    now: Utc::now(),
+                    theme: &Theme::classic(),
+                    selected_spec_id: None,
+                    spec_scroll: 0,
+                    scroll: 0,
+                },
+            );
+        });
+        // The suffix "(1-17 of 21)" may wrap across two buffer rows when the
+        // area is narrow; normalize whitespace so the assertion is not fragile
+        // to buffer padding while still requiring the indicator to be present.
+        let flat = text.replace('\n', " ");
+        let normalized = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized.contains("of 21"),
+            "expected range indicator when height is tight in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn spec_strip_single_line_when_few_specs() {
+        let state = running_state();
+        // running_state has 3 specs.
+        let theme = Theme::classic();
+        let layout = spec_strip_layout(&state, None, 0, 80, 40, &theme);
+        assert_eq!(layout.chip_line_count, 1);
+        assert!(
+            !layout.lines.iter().any(|l| l.to_string().contains("of ")),
+            "no range indicator with few specs"
+        );
+        assert_eq!(layout.click_map.len(), 3);
+        assert!(layout.click_map.iter().all(|(_, row, _, _)| *row == 0));
+
+        let node_info = NodeRunInfo::default();
+        let text = render_to_text(80, 40, |frame, area| {
+            render_loop_live_view(
+                frame,
+                area,
+                &LiveViewContext {
+                    state: &state,
+                    follow: true,
+                    highlighted_node_id: None,
+                    node_info: &node_info,
+                    blocked: false,
+                    now: Utc::now(),
+                    theme: &Theme::classic(),
+                    selected_spec_id: None,
+                    spec_scroll: 0,
+                    scroll: 0,
+                },
+            );
+        });
+        assert!(!text.contains("of "), "no range with few specs in:\n{text}");
     }
 
     #[test]
