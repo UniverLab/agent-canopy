@@ -46,6 +46,9 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Them
                     && app.automation_kind == AutomationKind::Loop;
                 let is_bg = matches!(app.selected_agent(), Some(AgentEntry::Agent(_)));
                 let mut h = vec![("↑↓", "nav"), ("Enter", "focus"), ("Shift+←→", "tab")];
+                if on_loop && app.loop_live_focus == crate::tui::app::types::LoopLiveFocus::Graph {
+                    h.push(("←→", "graph ↑↓"));
+                }
                 if on_loop {
                     // Run-time controls apply only to the live (non-archived)
                     // list — an archived loop is inert until restored.

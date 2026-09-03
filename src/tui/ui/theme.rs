@@ -38,6 +38,14 @@ pub struct Theme {
     /// Input-field background, focused — the theme-driven pair for
     /// `field_bg` (C4 audit: `Color::Rgb(40, 40, 40)`).
     pub field_bg_focused: Color,
+    /// Graph status palette — routed through Theme so the drawing never
+    /// ships with fixed colors (CT2).
+    pub status_running: Color,
+    pub status_ok: Color,
+    pub status_fail: Color,
+    pub status_disabled: Color,
+    pub status_interrupted: Color,
+    pub kind_router: Color,
 }
 
 impl Theme {
@@ -62,6 +70,12 @@ impl Theme {
             success: Color::Green,
             field_bg: Color::Rgb(30, 30, 30),
             field_bg_focused: Color::Rgb(40, 40, 40),
+            status_running: Color::Rgb(76, 175, 80),
+            status_ok: Color::Rgb(66, 165, 245),
+            status_fail: Color::Rgb(229, 57, 53),
+            status_disabled: Color::Rgb(120, 120, 120),
+            status_interrupted: Color::Rgb(255, 179, 0),
+            kind_router: Color::Rgb(171, 71, 188),
         }
     }
 
@@ -86,6 +100,12 @@ impl Theme {
             success: Color::Rgb(120, 190, 145),
             field_bg: Color::Rgb(35, 35, 45),
             field_bg_focused: Color::Rgb(45, 45, 60),
+            status_running: Color::Rgb(76, 175, 80),
+            status_ok: Color::Rgb(66, 165, 245),
+            status_fail: Color::Rgb(229, 57, 53),
+            status_disabled: Color::Rgb(120, 120, 120),
+            status_interrupted: Color::Rgb(255, 179, 0),
+            kind_router: Color::Rgb(171, 71, 188),
         }
     }
 
@@ -137,6 +157,12 @@ mod tests {
         assert_eq!(theme.warning, Color::Yellow);
         assert_eq!(theme.error, Color::Red);
         assert_eq!(theme.success, Color::Green);
+        assert_eq!(theme.status_running, Color::Rgb(76, 175, 80));
+        assert_eq!(theme.status_ok, Color::Rgb(66, 165, 245));
+        assert_eq!(theme.status_fail, Color::Rgb(229, 57, 53));
+        assert_eq!(theme.status_disabled, Color::Rgb(120, 120, 120));
+        assert_eq!(theme.status_interrupted, Color::Rgb(255, 179, 0));
+        assert_eq!(theme.kind_router, Color::Rgb(171, 71, 188));
     }
 
     #[test]
@@ -159,6 +185,9 @@ mod tests {
     /// `classic` and `modern` — otherwise a role was added and never given
     /// its own modern treatment, silently falling back to the classic look
     /// (the exact defect this spec fixes, reintroduced one field at a time).
+    /// Semantic status colors (and router tag) are intentionally identical
+    /// across themes — they encode pass/fail/running, not chrome — so they
+    /// are excluded from this distinctness check (see CT2).
     #[test]
     fn classic_and_modern_differ_in_every_color_field() {
         let classic = Theme::classic();
@@ -178,6 +207,25 @@ mod tests {
         assert_ne!(classic.success, modern.success);
         assert_ne!(classic.field_bg, modern.field_bg);
         assert_ne!(classic.field_bg_focused, modern.field_bg_focused);
+    }
+
+    #[test]
+    fn classic_has_status_colors() {
+        let theme = Theme::classic();
+        assert_eq!(theme.status_running, Color::Rgb(76, 175, 80));
+        assert_eq!(theme.status_ok, Color::Rgb(66, 165, 245));
+        assert_eq!(theme.status_fail, Color::Rgb(229, 57, 53));
+        assert_eq!(theme.status_disabled, Color::Rgb(120, 120, 120));
+        assert_eq!(theme.status_interrupted, Color::Rgb(255, 179, 0));
+        assert_eq!(theme.kind_router, Color::Rgb(171, 71, 188));
+        // Modern intentionally preserves the same semantic values.
+        let modern = Theme::modern();
+        assert_eq!(modern.status_running, Color::Rgb(76, 175, 80));
+        assert_eq!(modern.status_ok, Color::Rgb(66, 165, 245));
+        assert_eq!(modern.status_fail, Color::Rgb(229, 57, 53));
+        assert_eq!(modern.status_disabled, Color::Rgb(120, 120, 120));
+        assert_eq!(modern.status_interrupted, Color::Rgb(255, 179, 0));
+        assert_eq!(modern.kind_router, Color::Rgb(171, 71, 188));
     }
 
     #[test]

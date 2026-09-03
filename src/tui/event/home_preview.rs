@@ -247,11 +247,30 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
             app.log_scroll = 0;
             app.focus = Focus::Agent;
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Down | KeyCode::Char('j')
+            if !(on_loop && app.loop_live_focus == LoopLiveFocus::Graph) =>
+        {
             app.select_next();
         }
-        KeyCode::Up | KeyCode::Char('k') => {
+        KeyCode::Up | KeyCode::Char('k')
+            if !(on_loop && app.loop_live_focus == LoopLiveFocus::Graph) =>
+        {
             app.select_prev();
+        }
+        // Graph navigation: Right = child (forward along edges, pass first),
+        // Left = parent (back along incoming), Up/Down = sibling in DFS order.
+        // Documented: "next" at a branch = pass > fail > always > route(alpha) > break.
+        KeyCode::Right if on_loop && app.loop_live_focus == LoopLiveFocus::Graph => {
+            app.loop_graph_navigate_child();
+        }
+        KeyCode::Left if on_loop && app.loop_live_focus == LoopLiveFocus::Graph => {
+            app.loop_graph_navigate_parent();
+        }
+        KeyCode::Down if on_loop && app.loop_live_focus == LoopLiveFocus::Graph => {
+            app.loop_graph_navigate_sibling(true);
+        }
+        KeyCode::Up if on_loop && app.loop_live_focus == LoopLiveFocus::Graph => {
+            app.loop_graph_navigate_sibling(false);
         }
         // Plain Tab/BackTab hand arrow-key ownership between the graph and
         // the spec marker strip — the strip participates in the panel's
@@ -266,12 +285,6 @@ pub fn handle_preview_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
         }
         KeyCode::Right if on_loop && app.loop_live_focus == LoopLiveFocus::SpecStrip => {
             app.loop_spec_strip_move_selection(true);
-        }
-        KeyCode::Left if on_loop => {
-            app.loop_graph_move_highlight(false);
-        }
-        KeyCode::Right if on_loop => {
-            app.loop_graph_move_highlight(true);
         }
         KeyCode::Char('[') if on_loop => {
             app.cycle_loop_spec(false);

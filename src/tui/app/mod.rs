@@ -1075,24 +1075,436 @@ impl App {
         }
     }
 
-    /// Move the live loop view's graph highlight to the next/previous node
-    /// (by `position` order) in the current spec's effective graph, entering
-    /// manual-inspection mode. No-op when there's no live state or graph.
-    pub fn loop_graph_move_highlight(&mut self, forward: bool) {
-        let ids: Vec<String> = match self.loop_live_state.as_ref() {
-            Some(state) if !state.effective_nodes.is_empty() => {
-                state.effective_nodes.iter().map(|n| n.id.clone()).collect()
-            }
-            _ => return,
-        };
+    fn edge_priority(condition: &crate::domain::loops::LoopEdgeCondition) -> (u8, Option<String>) {
+        match condition {
+            crate::domain::loops::LoopEdgeCondition::Pass => (0, None),
+            crate::domain::loops::LoopEdgeCondition::Fail => (1, None),
+            crate::domain::loops::LoopEdgeCondition::Always => (2, None),
+            crate::domain::loops::LoopEdgeCondition::Route(label) => (3, Some(label.clone())),
+            crate::domain::loops::LoopEdgeCondition::Break => (4, None),
+        }
+    }
 
+    /// DFS traversal order of the effective graph (collapsed ensembles as one
+    /// node, cycles via visited set, `pass > fail > always > route(alpha) > break`).
+    /// This is the visual order the renderer draws, and what Up/Down navigate.
+    pub fn dfs_order(&self) -> Vec<String> {
+        let Some(state) = self.loop_live_state.as_ref() else {
+            return Vec::new();
+        };
+        if state.effective_nodes.is_empty() {
+            return Vec::new();
+        }
+        // Build collapsed graph identical to loop_live::graph_lines
+        use std::collections::{HashMap, HashSet};
+        let join_ids: HashSet<&str> = state
+            .ensembles
+            .iter()
+            .map(|e| e.join_node_id.as_str())
+            .collect();
+        let ensemble_by_member: HashMap<&str, &crate::tui::app::loop_live_state::EnsembleLiveInfo> =
+            state
+                .ensembles
+                .iter()
+                .flat_map(|e| e.members.iter().map(move |m| (m.node_id.as_str(), e)))
+                .collect();
+        let ensemble_by_join: HashMap<&str, &crate::tui::app::loop_live_state::EnsembleLiveInfo> =
+            state
+                .ensembles
+                .iter()
+                .map(|e| (e.join_node_id.as_str(), e))
+                .collect();
+
+        // collapsed key -> (kind, pos)
+        let mut collapsed: HashMap<String, (bool, i64)> = HashMap::new(); // true=ensemble
+        let mut member_to_ensemble: HashMap<String, String> = HashMap::new();
+        let mut seen_ens: HashSet<String> = HashSet::new();
+        let mut collapsed_pos: HashMap<String, i64> = HashMap::new();
+        for node in &state.effective_nodes {
+            if join_ids.contains(node.id.as_str()) {
+                continue;
+            }
+            if let Some(ens) = ensemble_by_member.get(node.id.as_str()) {
+                if seen_ens.insert(ens.ensemble_id.clone()) {
+                    collapsed.insert(ens.ensemble_id.clone(), (true, node.position));
+                    collapsed_pos.insert(ens.ensemble_id.clone(), node.position);
+                    for m in &ens.members {
+                        member_to_ensemble.insert(m.node_id.clone(), ens.ensemble_id.clone());
+                    }
+                }
+            } else {
+                collapsed.insert(node.id.clone(), (false, node.position));
+                collapsed_pos.insert(node.id.clone(), node.position);
+            }
+        }
+        if collapsed.is_empty() {
+            return Vec::new();
+        }
+        let mut collapsed_edges: HashMap<
+            String,
+            Vec<(String, crate::domain::loops::LoopEdgeCondition)>,
+        > = HashMap::new();
+        for edge in &state.effective_edges {
+            let from_raw = edge.from_node.as_str();
+            let to_raw = edge.to_node.as_str();
+            if let Some(ens) = ensemble_by_member.get(from_raw) {
+                if ens.join_node_id.as_str() == to_raw {
+                    continue;
+                }
+            }
+            let from_key = if let Some(ens) = ensemble_by_join.get(from_raw) {
+                Some(ens.ensemble_id.clone())
+            } else if let Some(ek) = member_to_ensemble.get(from_raw) {
+                Some(ek.clone())
+            } else if collapsed.contains_key(from_raw) {
+                Some(from_raw.to_string())
+            } else {
+                None
+            };
+            let to_key = if let Some(ens) = ensemble_by_join.get(to_raw) {
+                Some(ens.ensemble_id.clone())
+            } else if let Some(ek) = member_to_ensemble.get(to_raw) {
+                Some(ek.clone())
+            } else if collapsed.contains_key(to_raw) {
+                Some(to_raw.to_string())
+            } else {
+                None
+            };
+            if let (Some(fk), Some(tk)) = (from_key, to_key) {
+                let entry = collapsed_edges.entry(fk).or_default();
+                if !entry
+                    .iter()
+                    .any(|(ek, ec)| ek == &tk && ec == &edge.condition)
+                {
+                    entry.push((tk, edge.condition.clone()));
+                }
+            }
+        }
+        for edges in collapsed_edges.values_mut() {
+            edges.sort_by(|a, b| {
+                let (pa, la) = Self::edge_priority(&a.1);
+                let (pb, lb) = Self::edge_priority(&b.1);
+                pa.cmp(&pb).then_with(|| la.cmp(&lb))
+            });
+        }
+        let mut incoming: HashSet<String> = HashSet::new();
+        for tos in collapsed_edges.values() {
+            for (tk, _) in tos {
+                incoming.insert(tk.clone());
+            }
+        }
+        let entry_key = collapsed
+            .keys()
+            .find(|k| !incoming.contains(*k))
+            .cloned()
+            .or_else(|| {
+                collapsed
+                    .keys()
+                    .min_by_key(|k| collapsed_pos.get(*k).copied().unwrap_or(i64::MAX))
+                    .cloned()
+            })
+            .unwrap();
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut order: Vec<String> = Vec::new();
+        fn dfs_rec(
+            key: &str,
+            collapsed_edges: &HashMap<
+                String,
+                Vec<(String, crate::domain::loops::LoopEdgeCondition)>,
+            >,
+            visited: &mut HashSet<String>,
+            order: &mut Vec<String>,
+        ) {
+            if visited.contains(key) {
+                return;
+            }
+            visited.insert(key.to_string());
+            order.push(key.to_string());
+            if let Some(edges) = collapsed_edges.get(key) {
+                for (tk, _) in edges {
+                    if !visited.contains(tk.as_str()) {
+                        dfs_rec(tk, collapsed_edges, visited, order);
+                    }
+                }
+            }
+        }
+        dfs_rec(&entry_key, &collapsed_edges, &mut visited, &mut order);
+        let mut remaining: Vec<String> = collapsed
+            .keys()
+            .filter(|k| !visited.contains(k.as_str()))
+            .cloned()
+            .collect();
+        remaining.sort_by_key(|k| collapsed_pos.get(k.as_str()).copied().unwrap_or(i64::MAX));
+        for rk in remaining {
+            dfs_rec(&rk, &collapsed_edges, &mut visited, &mut order);
+        }
+        // Map collapsed keys back to concrete node ids for selection.
+        // For ensembles, use the first member's node id (renderer highlights on any member).
+        let mut ensemble_first_member: HashMap<String, String> = HashMap::new();
+        for ens in &state.ensembles {
+            if let Some(first) = ens.members.first() {
+                ensemble_first_member.insert(ens.ensemble_id.clone(), first.node_id.clone());
+            }
+        }
+        order
+            .into_iter()
+            .map(|ck| {
+                if let Some(mid) = ensemble_first_member.get(&ck) {
+                    mid.clone()
+                } else {
+                    ck
+                }
+            })
+            .collect()
+    }
+
+    /// Move to the next/previous node in DFS visual order (Up/Down).
+    pub fn loop_graph_navigate_sibling(&mut self, forward: bool) {
+        let ids = self.dfs_order();
+        if ids.is_empty() {
+            return;
+        }
         let current = self.loop_graph_highlighted_node_id().map(str::to_string);
+        // Map current concrete id to its collapsed representation for index lookup
+        // dfs_order already returns concrete ids (ensemble first member), so direct lookup works
         let idx = current
             .as_deref()
             .and_then(|id| ids.iter().position(|n| n == id))
             .unwrap_or(0);
         let next_idx = crate::tui::selection::move_index(idx, ids.len(), forward);
         self.loop_graph_selected_node = Some(ids[next_idx].clone());
+        self.loop_graph_follow = false;
+    }
+
+    /// Keep the old name as an alias for backward compatibility (tests, older key handlers).
+    #[allow(dead_code)]
+    pub fn loop_graph_move_highlight(&mut self, forward: bool) {
+        self.loop_graph_navigate_sibling(forward);
+    }
+
+    /// Move to the first outgoing edge's target (Right): pass > fail > always > route(alpha) > break.
+    pub fn loop_graph_navigate_child(&mut self) {
+        let Some(state) = self.loop_live_state.as_ref() else {
+            return;
+        };
+        let Some(current_id) = self.loop_graph_highlighted_node_id().map(str::to_string) else {
+            let order = self.dfs_order();
+            if let Some(first) = order.first() {
+                self.loop_graph_selected_node = Some(first.clone());
+                self.loop_graph_follow = false;
+            } else {
+                self.loop_graph_follow = false;
+            }
+            return;
+        };
+        // Resolve current to its collapsed key if it's an ensemble member
+        let ensemble_by_member: std::collections::HashMap<
+            &str,
+            &crate::tui::app::loop_live_state::EnsembleLiveInfo,
+        > = state
+            .ensembles
+            .iter()
+            .flat_map(|e| e.members.iter().map(move |m| (m.node_id.as_str(), e)))
+            .collect();
+        let ensemble_by_join: std::collections::HashMap<
+            &str,
+            &crate::tui::app::loop_live_state::EnsembleLiveInfo,
+        > = state
+            .ensembles
+            .iter()
+            .map(|e| (e.join_node_id.as_str(), e))
+            .collect();
+        let mut member_to_ensemble: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for ens in &state.ensembles {
+            for m in &ens.members {
+                member_to_ensemble.insert(m.node_id.clone(), ens.ensemble_id.clone());
+            }
+        }
+        let current_key = if let Some(ens) = ensemble_by_join.get(current_id.as_str()) {
+            ens.ensemble_id.clone()
+        } else if let Some(ek) = member_to_ensemble.get(&current_id) {
+            ek.clone()
+        } else {
+            current_id.clone()
+        };
+        // Build collapsed edges to find sorted outgoing
+        let join_ids: std::collections::HashSet<&str> = state
+            .ensembles
+            .iter()
+            .map(|e| e.join_node_id.as_str())
+            .collect();
+        let mut collapsed_edges: std::collections::HashMap<
+            String,
+            Vec<(String, crate::domain::loops::LoopEdgeCondition)>,
+        > = std::collections::HashMap::new();
+        for edge in &state.effective_edges {
+            let from_raw = edge.from_node.as_str();
+            let to_raw = edge.to_node.as_str();
+            if let Some(ens) = ensemble_by_member.get(from_raw) {
+                if ens.join_node_id.as_str() == to_raw {
+                    continue;
+                }
+            }
+            let from_key = if let Some(ens) = ensemble_by_join.get(from_raw) {
+                Some(ens.ensemble_id.clone())
+            } else if let Some(ek) = member_to_ensemble.get(from_raw) {
+                Some(ek.clone())
+            } else if state.effective_nodes.iter().any(|n| n.id == from_raw)
+                && !join_ids.contains(from_raw)
+            {
+                Some(from_raw.to_string())
+            } else {
+                None
+            };
+            let to_key = if let Some(ens) = ensemble_by_join.get(to_raw) {
+                Some(ens.ensemble_id.clone())
+            } else if let Some(ek) = member_to_ensemble.get(to_raw) {
+                Some(ek.clone())
+            } else if state.effective_nodes.iter().any(|n| n.id == to_raw)
+                && !join_ids.contains(to_raw)
+            {
+                Some(to_raw.to_string())
+            } else {
+                None
+            };
+            if let (Some(fk), Some(tk)) = (from_key, to_key) {
+                let e = collapsed_edges.entry(fk).or_default();
+                if !e.iter().any(|(ek, ec)| ek == &tk && ec == &edge.condition) {
+                    e.push((tk, edge.condition.clone()));
+                }
+            }
+        }
+        for edges in collapsed_edges.values_mut() {
+            edges.sort_by(|a, b| {
+                let (pa, la) = Self::edge_priority(&a.1);
+                let (pb, lb) = Self::edge_priority(&b.1);
+                pa.cmp(&pb).then_with(|| la.cmp(&lb))
+            });
+        }
+        let Some(targets) = collapsed_edges.get(&current_key) else {
+            return;
+        };
+        if targets.is_empty() {
+            return;
+        }
+        let target_key = &targets[0].0;
+        // Map collapsed target back to concrete node id
+        let target_id = state
+            .ensembles
+            .iter()
+            .find(|e| &e.ensemble_id == target_key)
+            .and_then(|e| e.members.first().map(|m| m.node_id.clone()))
+            .unwrap_or_else(|| target_key.clone());
+        self.loop_graph_selected_node = Some(target_id);
+        self.loop_graph_follow = false;
+    }
+
+    /// Move to the incoming edge's source (Left).
+    pub fn loop_graph_navigate_parent(&mut self) {
+        let Some(state) = self.loop_live_state.as_ref() else {
+            return;
+        };
+        let Some(current_id) = self.loop_graph_highlighted_node_id().map(str::to_string) else {
+            return;
+        };
+        let ensemble_by_member: std::collections::HashMap<
+            &str,
+            &crate::tui::app::loop_live_state::EnsembleLiveInfo,
+        > = state
+            .ensembles
+            .iter()
+            .flat_map(|e| e.members.iter().map(move |m| (m.node_id.as_str(), e)))
+            .collect();
+        let ensemble_by_join: std::collections::HashMap<
+            &str,
+            &crate::tui::app::loop_live_state::EnsembleLiveInfo,
+        > = state
+            .ensembles
+            .iter()
+            .map(|e| (e.join_node_id.as_str(), e))
+            .collect();
+        let mut member_to_ensemble: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for ens in &state.ensembles {
+            for m in &ens.members {
+                member_to_ensemble.insert(m.node_id.clone(), ens.ensemble_id.clone());
+            }
+        }
+        let current_key = if let Some(ens) = ensemble_by_join.get(current_id.as_str()) {
+            ens.ensemble_id.clone()
+        } else if let Some(ek) = member_to_ensemble.get(&current_id) {
+            ek.clone()
+        } else {
+            current_id.clone()
+        };
+        let join_ids: std::collections::HashSet<&str> = state
+            .ensembles
+            .iter()
+            .map(|e| e.join_node_id.as_str())
+            .collect();
+        let mut collapsed_edges: std::collections::HashMap<
+            String,
+            Vec<(String, crate::domain::loops::LoopEdgeCondition)>,
+        > = std::collections::HashMap::new();
+        for edge in &state.effective_edges {
+            let from_raw = edge.from_node.as_str();
+            let to_raw = edge.to_node.as_str();
+            if let Some(ens) = ensemble_by_member.get(from_raw) {
+                if ens.join_node_id.as_str() == to_raw {
+                    continue;
+                }
+            }
+            let from_key = if let Some(ens) = ensemble_by_join.get(from_raw) {
+                Some(ens.ensemble_id.clone())
+            } else if let Some(ek) = member_to_ensemble.get(from_raw) {
+                Some(ek.clone())
+            } else if state.effective_nodes.iter().any(|n| n.id == from_raw)
+                && !join_ids.contains(from_raw)
+            {
+                Some(from_raw.to_string())
+            } else {
+                None
+            };
+            let to_key = if let Some(ens) = ensemble_by_join.get(to_raw) {
+                Some(ens.ensemble_id.clone())
+            } else if let Some(ek) = member_to_ensemble.get(to_raw) {
+                Some(ek.clone())
+            } else if state.effective_nodes.iter().any(|n| n.id == to_raw)
+                && !join_ids.contains(to_raw)
+            {
+                Some(to_raw.to_string())
+            } else {
+                None
+            };
+            if let (Some(fk), Some(tk)) = (from_key, to_key) {
+                let e = collapsed_edges.entry(fk).or_default();
+                if !e.iter().any(|(ek, ec)| ek == &tk && ec == &edge.condition) {
+                    e.push((tk, edge.condition.clone()));
+                }
+            }
+        }
+        // Find incoming: any collapsed edge where to == current_key
+        let mut incoming: Vec<String> = Vec::new();
+        for (fk, tos) in &collapsed_edges {
+            for (tk, _) in tos {
+                if tk == &current_key {
+                    incoming.push(fk.clone());
+                    break;
+                }
+            }
+        }
+        if incoming.is_empty() {
+            return;
+        }
+        let parent_key = &incoming[0];
+        let parent_id = state
+            .ensembles
+            .iter()
+            .find(|e| &e.ensemble_id == parent_key)
+            .and_then(|e| e.members.first().map(|m| m.node_id.clone()))
+            .unwrap_or_else(|| parent_key.clone());
+        self.loop_graph_selected_node = Some(parent_id);
         self.loop_graph_follow = false;
     }
 
@@ -6410,5 +6822,174 @@ mod tests {
         assert_eq!(app.loop_live_view_scroll, 15);
         app.loop_live_view_scroll_step(100);
         assert_eq!(app.loop_live_view_scroll, 30);
+    }
+    // --- CT2 navigation tests ---
+
+    fn graph_state(
+        nodes: &[(&str, &str)],
+        edges: &[(&str, &str, crate::domain::loops::LoopEdgeCondition)],
+        current: Option<&str>,
+    ) -> LoopLiveState {
+        use crate::domain::loops::{LoopEdge, LoopNode, LoopNodeKind};
+        use chrono::Utc;
+        use serde_json::json;
+        let effective_nodes = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, (id, name))| LoopNode {
+                id: id.to_string(),
+                spec_id: Some("s1".to_string()),
+                loop_id: None,
+                name: name.to_string(),
+                kind: LoopNodeKind::Agent,
+                config: json!({}),
+                position: i as i64,
+                created_at: Utc::now(),
+            })
+            .collect::<Vec<_>>();
+        let effective_edges = edges
+            .iter()
+            .enumerate()
+            .map(|(i, (from, to, cond))| LoopEdge {
+                id: format!("e{i}"),
+                spec_id: Some("s1".to_string()),
+                loop_id: None,
+                from_node: from.to_string(),
+                to_node: to.to_string(),
+                condition: (*cond).clone(),
+            })
+            .collect::<Vec<_>>();
+        LoopLiveState {
+            loop_id: "lp1".to_string(),
+            loop_name: "loop".to_string(),
+            loop_status: LoopStatus::Running,
+            workdir: "/tmp".to_string(),
+            trigger_type: "manual".to_string(),
+            schedule_expr: None,
+            watch_path: None,
+            autorun_at: None,
+            spec_queue: Vec::new(),
+            done_count: 0,
+            total_count: 0,
+            current_spec_id: Some("s1".to_string()),
+            effective_nodes,
+            effective_edges,
+            ensembles: Vec::new(),
+            router_taken_routes: HashMap::new(),
+            current_node_id: current.map(|s| s.to_string()),
+            current_node_status: None,
+            current_node_started_at: None,
+            current_node_iteration: None,
+            current_node_output_tail: None,
+        }
+    }
+
+    #[test]
+    fn navigate_child_follows_pass_edge() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        let state = graph_state(
+            &[("a", "A"), ("b", "B"), ("c", "C")],
+            &[
+                ("a", "b", crate::domain::loops::LoopEdgeCondition::Pass),
+                ("a", "c", crate::domain::loops::LoopEdgeCondition::Fail),
+            ],
+            Some("a"),
+        );
+        app.loop_live_state = Some(state);
+        app.loop_graph_follow = true; // starts auto-following at a
+                                      // child should follow pass edge to b
+        app.loop_graph_navigate_child();
+        assert_eq!(app.loop_graph_highlighted_node_id(), Some("b"));
+        assert!(!app.loop_graph_follow);
+    }
+
+    #[test]
+    fn navigate_parent_follows_incoming_edge() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        let state = graph_state(
+            &[("a", "A"), ("b", "B")],
+            &[("a", "b", crate::domain::loops::LoopEdgeCondition::Pass)],
+            Some("b"),
+        );
+        app.loop_live_state = Some(state);
+        app.loop_graph_follow = false;
+        app.loop_graph_selected_node = Some("b".to_string());
+        app.loop_graph_navigate_parent();
+        assert_eq!(app.loop_graph_highlighted_node_id(), Some("a"));
+    }
+
+    #[test]
+    fn navigate_child_no_op_at_leaf() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        let state = graph_state(&[("a", "A")], &[], Some("a"));
+        app.loop_live_state = Some(state);
+        app.loop_graph_follow = false;
+        app.loop_graph_selected_node = Some("a".to_string());
+        app.loop_graph_navigate_child();
+        assert_eq!(
+            app.loop_graph_highlighted_node_id(),
+            Some("a"),
+            "leaf child should be no-op"
+        );
+    }
+
+    #[test]
+    fn navigate_parent_no_op_at_root() {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        let state = graph_state(
+            &[("a", "A"), ("b", "B")],
+            &[("a", "b", crate::domain::loops::LoopEdgeCondition::Pass)],
+            Some("a"),
+        );
+        app.loop_live_state = Some(state);
+        app.loop_graph_follow = false;
+        app.loop_graph_selected_node = Some("a".to_string());
+        app.loop_graph_navigate_parent();
+        assert_eq!(
+            app.loop_graph_highlighted_node_id(),
+            Some("a"),
+            "root parent should be no-op"
+        );
+    }
+
+    #[test]
+    fn navigate_sibling_follows_dfs_order() {
+        // Graph: a pass->b, a fail->c, b pass->d
+        // DFS order should be a,b,d,c
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        let state = graph_state(
+            &[("a", "A"), ("b", "B"), ("c", "C"), ("d", "D")],
+            &[
+                ("a", "b", crate::domain::loops::LoopEdgeCondition::Pass),
+                ("a", "c", crate::domain::loops::LoopEdgeCondition::Fail),
+                ("b", "d", crate::domain::loops::LoopEdgeCondition::Pass),
+            ],
+            Some("a"),
+        );
+        app.loop_live_state = Some(state);
+        app.loop_graph_follow = false;
+        app.loop_graph_selected_node = Some("a".to_string());
+        let expected = vec!["b", "d", "c"];
+        for exp in expected {
+            app.loop_graph_navigate_sibling(true);
+            assert_eq!(
+                app.loop_graph_highlighted_node_id(),
+                Some(exp),
+                "sibling order mismatch"
+            );
+        }
+        // wrap? sibling move_index wraps, so next should go to a again
+        app.loop_graph_navigate_sibling(true);
+        assert_eq!(app.loop_graph_highlighted_node_id(), Some("a"));
     }
 }

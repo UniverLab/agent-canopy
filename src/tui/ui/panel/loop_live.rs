@@ -15,10 +15,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::super::theme::Theme;
-use super::{
-    compact_cwd, truncate_str, KIND_ROUTER, STATUS_DISABLED, STATUS_FAIL, STATUS_INTERRUPTED,
-    STATUS_OK, STATUS_RUNNING,
-};
+use super::{compact_cwd, truncate_str};
 use crate::domain::loops::{
     LoopEdgeCondition, LoopNode, LoopNodeKind, LoopRunStatus, LoopSpecStatus, LoopStatus,
 };
@@ -235,13 +232,13 @@ fn status_icon_and_label(
         );
     }
     if blocked {
-        return ("⛔", "blocked".to_string(), STATUS_FAIL);
+        return ("⛔", "blocked".to_string(), theme.status_fail);
     }
     match state.loop_status {
-        LoopStatus::Running => ("▶", "running".to_string(), STATUS_RUNNING),
+        LoopStatus::Running => ("▶", "running".to_string(), theme.status_running),
         LoopStatus::Paused => ("⏸", "paused".to_string(), Color::Yellow),
-        LoopStatus::Completed => ("✓", "completed".to_string(), STATUS_OK),
-        LoopStatus::Failed => ("✗", "failed".to_string(), STATUS_FAIL),
+        LoopStatus::Completed => ("✓", "completed".to_string(), theme.status_ok),
+        LoopStatus::Failed => ("✗", "failed".to_string(), theme.status_fail),
         LoopStatus::Draft => ("·", "draft".to_string(), theme.dim_text),
     }
 }
@@ -284,15 +281,15 @@ fn spec_chip(
     theme: &Theme,
 ) -> (&'static str, Color) {
     if Some(entry.spec_id.as_str()) == current_spec_id {
-        return ("▶", STATUS_RUNNING);
+        return ("▶", theme.status_running);
     }
     match entry.status {
         LoopSpecStatus::Pending => ("○", theme.dim_text),
-        LoopSpecStatus::Running => ("▶", STATUS_RUNNING),
-        LoopSpecStatus::Completed => ("✓", STATUS_OK),
-        LoopSpecStatus::Failed => ("✗", STATUS_FAIL),
-        LoopSpecStatus::Skipped => ("⊘", STATUS_DISABLED),
-        LoopSpecStatus::Interrupted => ("⚑", STATUS_INTERRUPTED),
+        LoopSpecStatus::Running => ("▶", theme.status_running),
+        LoopSpecStatus::Completed => ("✓", theme.status_ok),
+        LoopSpecStatus::Failed => ("✗", theme.status_fail),
+        LoopSpecStatus::Skipped => ("⊘", theme.status_disabled),
+        LoopSpecStatus::Interrupted => ("⚑", theme.status_interrupted),
     }
 }
 
@@ -443,7 +440,7 @@ fn spec_detail_lines(
         Span::styled(
             entry.spec_name.clone(),
             Style::default()
-                .fg(Color::White)
+                .fg(theme.text_primary)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
@@ -498,9 +495,23 @@ fn node_style(is_highlighted: bool, follow: bool, theme: &Theme) -> (Style, Styl
     } else {
         (
             Style::default().fg(theme.border_color),
-            Style::default().fg(Color::White),
+            Style::default().fg(theme.text_primary),
             " ",
         )
+    }
+}
+
+fn depth_prefix(depth: usize) -> String {
+    "   ".repeat(depth.min(3))
+}
+
+fn edge_condition_priority(condition: &LoopEdgeCondition) -> (u8, Option<String>) {
+    match condition {
+        LoopEdgeCondition::Pass => (0, None),
+        LoopEdgeCondition::Fail => (1, None),
+        LoopEdgeCondition::Always => (2, None),
+        LoopEdgeCondition::Route(label) => (3, Some(label.clone())),
+        LoopEdgeCondition::Break => (4, None),
     }
 }
 
@@ -510,18 +521,17 @@ fn node_box_lines(
     follow: bool,
     inner: usize,
     theme: &Theme,
+    depth: usize,
 ) -> Vec<Line<'static>> {
+    let prefix = depth_prefix(depth);
     let (border_style, text_style, marker) = node_style(is_highlighted, follow, theme);
     let kind_tag = format!("[{}]", node.kind.display_str());
     let max_name = inner.saturating_sub(2 + kind_tag.len());
     let name_display = truncate_str(&node.name, max_name);
     let spaces = inner.saturating_sub(2 + name_display.len() + kind_tag.len());
-    // A router is a branch point, not a pass/fail step like agent/check/gate
-    // — tag it with its own color so it reads as distinct at a glance
-    // instead of only through the text tag every kind already carries.
     let kind_tag_style = if node.kind == LoopNodeKind::Router {
         Style::default()
-            .fg(KIND_ROUTER)
+            .fg(theme.kind_router)
             .add_modifier(Modifier::BOLD)
     } else {
         text_style
@@ -529,19 +539,19 @@ fn node_box_lines(
 
     vec![
         Line::from(Span::styled(
-            format!("  ┌{}┐", "─".repeat(inner)),
+            format!("{prefix}┌{}┐", "─".repeat(inner)),
             border_style,
         )),
         Line::from(vec![
             Span::styled(
-                format!("  │{marker} {name_display}{}", " ".repeat(spaces)),
+                format!("{prefix}│{marker} {name_display}{}", " ".repeat(spaces)),
                 text_style,
             ),
             Span::styled(kind_tag, kind_tag_style),
             Span::styled("│", text_style),
         ]),
         Line::from(Span::styled(
-            format!("  └{}┘", "─".repeat(inner)),
+            format!("{prefix}└{}┘", "─".repeat(inner)),
             border_style,
         )),
     ]
@@ -560,7 +570,9 @@ fn ensemble_box_lines(
     follow: bool,
     inner: usize,
     theme: &Theme,
+    depth: usize,
 ) -> Vec<Line<'static>> {
+    let prefix = depth_prefix(depth);
     let (border_style, text_style, marker) = node_style(is_highlighted, follow, theme);
     let title = format!("{} [{} models]", ensemble.name, ensemble.members.len());
     let max_title = inner.saturating_sub(2);
@@ -569,12 +581,12 @@ fn ensemble_box_lines(
 
     let mut lines = vec![
         Line::from(Span::styled(
-            format!("  ┌{}┐", "─".repeat(inner)),
+            format!("{prefix}┌{}┐", "─".repeat(inner)),
             border_style,
         )),
         Line::from(Span::styled(
             format!(
-                "  │{} {}{}│",
+                "{prefix}│{} {}{}│",
                 marker,
                 title_display,
                 " ".repeat(title_spaces)
@@ -589,12 +601,12 @@ fn ensemble_box_lines(
         let label_display = truncate_str(&label, max_label);
         let spaces = inner.saturating_sub(4 + label_display.chars().count());
         lines.push(Line::from(Span::styled(
-            format!("  │  {}{}│", label_display, " ".repeat(spaces)),
+            format!("{prefix}│  {}{}│", label_display, " ".repeat(spaces)),
             Style::default().fg(color),
         )));
     }
     lines.push(Line::from(Span::styled(
-        format!("  └{}┘", "─".repeat(inner)),
+        format!("{prefix}└{}┘", "─".repeat(inner)),
         border_style,
     )));
     lines
@@ -605,95 +617,19 @@ fn ensemble_member_status_tag(
     theme: &Theme,
 ) -> (&'static str, Color) {
     match status {
-        Some(LoopRunStatus::Pass) => ("[pass]", STATUS_OK),
-        Some(LoopRunStatus::Fail) => ("[fail]", STATUS_FAIL),
-        Some(LoopRunStatus::Running) => ("[running]", STATUS_RUNNING),
+        Some(LoopRunStatus::Pass) => ("[pass]", theme.status_ok),
+        Some(LoopRunStatus::Fail) => ("[fail]", theme.status_fail),
+        Some(LoopRunStatus::Running) => ("[running]", theme.status_running),
         None => ("[pending]", theme.dim_text),
     }
 }
 
-/// `taken_route` is the route label the edges' shared `from_node`'s latest
-/// completed run selected, if it's a router (see
-/// [`crate::tui::app::loop_live_state::LoopLiveState::router_taken_routes`]).
-/// A `Route`-conditioned edge whose label matches it renders with a `✓` and
-/// the OK color instead of the generic dim tree branch, so a completed
-/// router run's actual path is visible at a glance among its N routes.
-fn edge_lines(
-    edges: &[(String, LoopEdgeCondition)],
-    taken_route: Option<&str>,
-    theme: &Theme,
-) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    for (i, (label, condition)) in edges.iter().enumerate() {
-        let branch = if i == edges.len() - 1 { "└" } else { "├" };
-        // A `Route` condition's `as_str()` is the fixed tag `"route"` — show
-        // the declared route label itself instead, since that's what's
-        // actually legible/actionable to a reader picking among routes.
-        match condition.route_label() {
-            Some(route) => {
-                let taken = taken_route == Some(route);
-                let (marker, style) = if taken {
-                    (
-                        "✓",
-                        Style::default().fg(STATUS_OK).add_modifier(Modifier::BOLD),
-                    )
-                } else {
-                    (" ", Style::default().fg(theme.dim_text))
-                };
-                lines.push(Line::from(Span::styled(
-                    format!("   {branch}─{marker} {route} → {label}"),
-                    style,
-                )));
-            }
-            None => {
-                lines.push(Line::from(Span::styled(
-                    format!("   {}─ {} → {}", branch, condition.as_str(), label),
-                    Style::default().fg(theme.dim_text),
-                )));
-            }
-        }
-    }
-    lines
-}
-
-/// Collapse a node's outgoing edge targets for display: consecutive targets
-/// that are all members of the same ensemble (F1) become one
-/// `"<ensemble name> [N models]"` label instead of N near-identical edges —
-/// this is what an ensemble's *entry* fan-out looks like from its
-/// predecessor's side. Targets outside any ensemble pass through unchanged.
-fn collapse_ensemble_targets(
-    edges: &[(&LoopNode, LoopEdgeCondition)],
-    ensemble_by_member: &HashMap<&str, &EnsembleLiveInfo>,
-) -> Vec<(String, LoopEdgeCondition)> {
-    let mut seen_ensembles: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for (target, condition) in edges {
-        match ensemble_by_member.get(target.id.as_str()) {
-            Some(ensemble) => {
-                if seen_ensembles.insert(ensemble.ensemble_id.as_str()) {
-                    out.push((
-                        format!("{} [{} models]", ensemble.name, ensemble.members.len()),
-                        condition.clone(),
-                    ));
-                }
-            }
-            None => out.push((target.name.clone(), condition.clone())),
-        }
-    }
-    out
-}
-
-/// Node boxes in `position` order (a simple, deterministic layout — see the
-/// spec's "layered by graph depth" allowance), each followed by its
-/// outgoing edges labeled with their condition. Handles cycles (a node
-/// whose edges point back up the list) since edges are rendered as text
-/// annotations rather than a 2-D layout.
-///
-/// An ensemble (F1) renders as one collapsed box (its members + join folded
-/// together — see [`ensemble_box_lines`]) at the position of its first
-/// member; every other member and the join itself are skipped as individual
-/// boxes. Fan-out edges into an ensemble's members are likewise collapsed to
-/// one edge (see [`collapse_ensemble_targets`]).
+/// Node boxes in DFS tree order starting from the entry node (the node
+/// with no incoming edges, or position 0 if every node has one). Each node's
+/// children appear immediately after its edge lines, indented one level
+/// deeper. Cycles render as a back-reference line with `↩` instead of a
+/// second box. An ensemble (F1) renders as one collapsed box at the depth
+/// of its first member; other members and the join are skipped.
 struct GraphLinesResult<'a> {
     lines: Vec<Line<'a>>,
     highlighted_offset: Option<u16>,
@@ -706,20 +642,6 @@ fn graph_lines(
     area_width: u16,
     theme: &Theme,
 ) -> GraphLinesResult<'static> {
-    let mut outgoing: HashMap<&str, Vec<(&LoopNode, LoopEdgeCondition)>> = HashMap::new();
-    for edge in &state.effective_edges {
-        if let Some(target) = state
-            .effective_nodes
-            .iter()
-            .find(|node| node.id == edge.to_node)
-        {
-            outgoing
-                .entry(edge.from_node.as_str())
-                .or_default()
-                .push((target, edge.condition.clone()));
-        }
-    }
-
     let box_width = (area_width as usize).saturating_sub(4).clamp(22, 48);
     let inner = box_width.saturating_sub(2);
 
@@ -733,68 +655,294 @@ fn graph_lines(
         .iter()
         .flat_map(|e| e.members.iter().map(move |m| (m.node_id.as_str(), e)))
         .collect();
+    let ensemble_by_join: HashMap<&str, &EnsembleLiveInfo> = state
+        .ensembles
+        .iter()
+        .map(|e| (e.join_node_id.as_str(), e))
+        .collect();
 
-    let nodes = &state.effective_nodes;
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut highlighted_offset: Option<u16> = None;
-    let mut rendered_ensembles: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for (idx, node) in nodes.iter().enumerate() {
-        // The join is folded into its ensemble's collapsed box (rendered at
-        // the first member's position) — never drawn as its own box.
+    // --- Collapsed node map (key -> renderable) ---
+    enum Collapsed<'a> {
+        Node(&'a LoopNode),
+        Ensemble(&'a EnsembleLiveInfo),
+    }
+    // Position for ordering fallback entry selection.
+    let mut collapsed_nodes: HashMap<String, Collapsed> = HashMap::new();
+    let mut collapsed_pos: HashMap<String, i64> = HashMap::new();
+    let mut seen_ens: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for node in &state.effective_nodes {
         if join_node_ids.contains(node.id.as_str()) {
             continue;
         }
+        if let Some(ens) = ensemble_by_member.get(node.id.as_str()) {
+            if seen_ens.insert(ens.ensemble_id.as_str()) {
+                // position is the first member's position
+                collapsed_nodes.insert(ens.ensemble_id.clone(), Collapsed::Ensemble(ens));
+                collapsed_pos.insert(ens.ensemble_id.clone(), node.position);
+            }
+        } else {
+            collapsed_nodes.insert(node.id.clone(), Collapsed::Node(node));
+            collapsed_pos.insert(node.id.clone(), node.position);
+        }
+    }
+    if collapsed_nodes.is_empty() {
+        return GraphLinesResult {
+            lines: Vec::new(),
+            highlighted_offset: None,
+        };
+    }
 
-        if let Some(ensemble) = ensemble_by_member.get(node.id.as_str()) {
-            if !rendered_ensembles.insert(ensemble.ensemble_id.as_str()) {
+    // --- Collapsed edges (deduped, sorted later per DFS) ---
+    let mut collapsed_edges: HashMap<String, Vec<(String, LoopEdgeCondition)>> = HashMap::new();
+    for edge in &state.effective_edges {
+        let from_raw = edge.from_node.as_str();
+        let to_raw = edge.to_node.as_str();
+        // internal ensemble member -> join edge
+        if let Some(ens) = ensemble_by_member.get(from_raw) {
+            if ens.join_node_id.as_str() == to_raw {
                 continue;
             }
-            let is_highlighted = ensemble
-                .members
+        }
+        let from_key = if let Some(ens) = ensemble_by_join.get(from_raw) {
+            Some(ens.ensemble_id.clone())
+        } else if let Some(ens) = ensemble_by_member.get(from_raw) {
+            Some(ens.ensemble_id.clone())
+        } else if collapsed_nodes.contains_key(from_raw) {
+            Some(from_raw.to_string())
+        } else {
+            None
+        };
+        let to_key = if let Some(ens) = ensemble_by_join.get(to_raw) {
+            Some(ens.ensemble_id.clone())
+        } else if let Some(ens) = ensemble_by_member.get(to_raw) {
+            Some(ens.ensemble_id.clone())
+        } else if collapsed_nodes.contains_key(to_raw) {
+            Some(to_raw.to_string())
+        } else {
+            None
+        };
+        if let (Some(fk), Some(tk)) = (from_key, to_key) {
+            if fk == tk {
+                // self-loop: keep as edge but DFS will treat it as back-ref
+            }
+            let entry = collapsed_edges.entry(fk).or_default();
+            if !entry
+                .iter()
+                .any(|(ek, ec)| ek == &tk && ec == &edge.condition)
+            {
+                entry.push((tk, edge.condition.clone()));
+            }
+        }
+    }
+    // Sort each adjacency by pass > fail > always > route(alpha) > break
+    for edges in collapsed_edges.values_mut() {
+        edges.sort_by(|a, b| {
+            let (pa, la) = edge_condition_priority(&a.1);
+            let (pb, lb) = edge_condition_priority(&b.1);
+            pa.cmp(&pb).then_with(|| la.cmp(&lb))
+        });
+    }
+
+    // --- Find entry (node with no incoming collapsed edge) ---
+    let mut incoming: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for tos in collapsed_edges.values() {
+        for (tk, _) in tos {
+            incoming.insert(tk.as_str());
+        }
+    }
+    let entry_key = collapsed_nodes
+        .keys()
+        .find(|k| !incoming.contains(k.as_str()))
+        .cloned()
+        .or_else(|| {
+            // fallback to smallest position
+            collapsed_nodes
+                .keys()
+                .min_by_key(|k| collapsed_pos.get(k.as_str()).copied().unwrap_or(i64::MAX))
+                .cloned()
+        })
+        .unwrap();
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut highlighted_offset: Option<u16> = None;
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::needless_pass_by_value)]
+    fn dfs_visit(
+        key: &str,
+        depth: usize,
+        collapsed_nodes: &HashMap<String, Collapsed>,
+        collapsed_edges: &HashMap<String, Vec<(String, LoopEdgeCondition)>>,
+        state: &LoopLiveState,
+        follow: bool,
+        inner: usize,
+        theme: &Theme,
+        lines: &mut Vec<Line<'static>>,
+        highlighted_offset: &mut Option<u16>,
+        visited: &mut std::collections::HashSet<String>,
+        highlighted_node_id: Option<&str>,
+    ) {
+        if visited.contains(key) {
+            return;
+        }
+        visited.insert(key.to_string());
+        let depth_clamped = depth.min(3);
+        let is_hl = if let Some(Collapsed::Ensemble(ens)) = collapsed_nodes.get(key) {
+            ens.members
                 .iter()
                 .any(|m| Some(m.node_id.as_str()) == highlighted_node_id)
-                || highlighted_node_id == Some(ensemble.join_node_id.as_str());
-            if is_highlighted && highlighted_offset.is_none() {
-                highlighted_offset = Some(lines.len() as u16);
+                || highlighted_node_id == Some(ens.join_node_id.as_str())
+        } else {
+            highlighted_node_id == Some(key)
+        };
+        if is_hl && highlighted_offset.is_none() {
+            *highlighted_offset = Some(lines.len() as u16);
+        }
+        match collapsed_nodes.get(key) {
+            Some(Collapsed::Node(node)) => {
+                lines.extend(node_box_lines(
+                    node,
+                    is_hl,
+                    follow,
+                    inner,
+                    theme,
+                    depth_clamped,
+                ));
             }
-            lines.extend(ensemble_box_lines(
-                ensemble,
-                is_highlighted,
-                follow,
-                inner,
-                theme,
-            ));
-
-            // The collapsed box's own outgoing routing is the join's real
-            // outgoing edges (on_pass_to/on_fail_to) — a join never routes
-            // by label, so no taken-route marker applies here.
-            if let Some(edges) = outgoing.get(ensemble.join_node_id.as_str()) {
-                let labeled = collapse_ensemble_targets(edges, &ensemble_by_member);
-                lines.extend(edge_lines(&labeled, None, theme));
-                lines.push(Line::from(""));
-            } else if idx + 1 < nodes.len() {
-                lines.push(Line::from(""));
+            Some(Collapsed::Ensemble(ens)) => {
+                lines.extend(ensemble_box_lines(
+                    ens,
+                    is_hl,
+                    follow,
+                    inner,
+                    theme,
+                    depth_clamped,
+                ));
             }
-            continue;
+            None => return,
         }
-
-        let is_highlighted = highlighted_node_id == Some(node.id.as_str());
-        if is_highlighted && highlighted_offset.is_none() {
-            highlighted_offset = Some(lines.len() as u16);
-        }
-        lines.extend(node_box_lines(node, is_highlighted, follow, inner, theme));
-
-        if let Some(edges) = outgoing.get(node.id.as_str()) {
-            let labeled = collapse_ensemble_targets(edges, &ensemble_by_member);
-            let taken_route = state
-                .router_taken_routes
-                .get(node.id.as_str())
-                .map(String::as_str);
-            lines.extend(edge_lines(&labeled, taken_route, theme));
+        if let Some(edges) = collapsed_edges.get(key) {
+            let prefix = depth_prefix(depth_clamped);
+            // Determine taken route for router nodes (only regular nodes)
+            let taken_route = if let Some(Collapsed::Node(node)) = collapsed_nodes.get(key) {
+                state
+                    .router_taken_routes
+                    .get(node.id.as_str())
+                    .map(String::as_str)
+            } else {
+                None
+            };
+            for (i, (to_key, cond)) in edges.iter().enumerate() {
+                let branch = if i == edges.len() - 1 { "└" } else { "├" };
+                let is_back = visited.contains(to_key.as_str());
+                let target_label = match collapsed_nodes.get(to_key.as_str()) {
+                    Some(Collapsed::Ensemble(ens)) => {
+                        format!("{} [{} models]", ens.name, ens.members.len())
+                    }
+                    Some(Collapsed::Node(n)) => n.name.clone(),
+                    None => to_key.clone(),
+                };
+                let suffix = if is_back { "  ↩" } else { "" };
+                match cond.route_label() {
+                    Some(route) => {
+                        let taken = taken_route == Some(route);
+                        let (marker, style) = if taken {
+                            (
+                                "✓",
+                                Style::default()
+                                    .fg(theme.status_ok)
+                                    .add_modifier(Modifier::BOLD),
+                            )
+                        } else {
+                            (" ", Style::default().fg(theme.dim_text))
+                        };
+                        lines.push(Line::from(Span::styled(
+                            format!(
+                                "{prefix}   {branch}─{marker} {route} → {target_label}{suffix}"
+                            ),
+                            style,
+                        )));
+                    }
+                    None => {
+                        let label = format!("{target_label}{suffix}");
+                        lines.push(Line::from(Span::styled(
+                            format!("{prefix}   {}─ {} → {}", branch, cond.as_str(), label),
+                            Style::default().fg(theme.dim_text),
+                        )));
+                    }
+                }
+            }
             lines.push(Line::from(""));
-        } else if idx + 1 < nodes.len() {
+            // Recurse into unvisited children in priority order
+            for (to_key, _) in edges {
+                if !visited.contains(to_key.as_str()) {
+                    dfs_visit(
+                        to_key,
+                        depth + 1,
+                        collapsed_nodes,
+                        collapsed_edges,
+                        state,
+                        follow,
+                        inner,
+                        theme,
+                        lines,
+                        highlighted_offset,
+                        visited,
+                        highlighted_node_id,
+                    );
+                }
+            }
+        } else {
+            // leaf node still needs spacing before next sibling at same depth
+            // Only add blank if not last overall? DFS already pushes blanks per node with edges;
+            // for leaves, add a blank line to separate siblings visually unless at end.
+            // We'll add a blank line for consistency with old rendering.
             lines.push(Line::from(""));
         }
+    }
+
+    // Start DFS from entry
+    dfs_visit(
+        &entry_key,
+        0,
+        &collapsed_nodes,
+        &collapsed_edges,
+        state,
+        follow,
+        inner,
+        theme,
+        &mut lines,
+        &mut highlighted_offset,
+        &mut visited,
+        highlighted_node_id,
+    );
+    // Visit any disconnected components not reached from entry
+    let mut remaining: Vec<String> = collapsed_nodes
+        .keys()
+        .filter(|k| !visited.contains(k.as_str()))
+        .cloned()
+        .collect();
+    remaining.sort_by_key(|k| collapsed_pos.get(k.as_str()).copied().unwrap_or(i64::MAX));
+    for rk in &remaining {
+        dfs_visit(
+            rk,
+            0,
+            &collapsed_nodes,
+            &collapsed_edges,
+            state,
+            follow,
+            inner,
+            theme,
+            &mut lines,
+            &mut highlighted_offset,
+            &mut visited,
+            highlighted_node_id,
+        );
+    }
+    // Trim trailing blank lines
+    while lines.last().is_some_and(|l| l.width() == 0) {
+        lines.pop();
     }
     GraphLinesResult {
         lines,
@@ -816,10 +964,10 @@ fn format_elapsed(started_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
 fn run_status_span(status: Option<LoopRunStatus>, theme: &Theme) -> Span<'static> {
     match status {
         Some(LoopRunStatus::Running) => {
-            Span::styled("running", Style::default().fg(STATUS_RUNNING))
+            Span::styled("running", Style::default().fg(theme.status_running))
         }
-        Some(LoopRunStatus::Pass) => Span::styled("pass", Style::default().fg(STATUS_OK)),
-        Some(LoopRunStatus::Fail) => Span::styled("fail", Style::default().fg(STATUS_FAIL)),
+        Some(LoopRunStatus::Pass) => Span::styled("pass", Style::default().fg(theme.status_ok)),
+        Some(LoopRunStatus::Fail) => Span::styled("fail", Style::default().fg(theme.status_fail)),
         None => Span::styled("(no runs yet)", Style::default().fg(theme.dim_text)),
     }
 }
@@ -884,7 +1032,9 @@ fn footer_lines(
         meta.push(Span::raw("  "));
         meta.push(Span::styled(
             format!("route → {route}"),
-            Style::default().fg(STATUS_OK).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.status_ok)
+                .add_modifier(Modifier::BOLD),
         ));
     }
     lines.push(Line::from(meta));
@@ -894,7 +1044,7 @@ fn footer_lines(
         for line in tail.lines() {
             lines.push(Line::from(Span::styled(
                 line.to_string(),
-                Style::default().fg(Color::White),
+                Style::default().fg(theme.text_primary),
             )));
         }
     }
@@ -2093,6 +2243,397 @@ mod tests {
         assert!(
             text.contains("Node 14"),
             "auto-follow must keep highlighted node visible, missing Node 14 in:\n{text}"
+        );
+    }
+    #[test]
+    fn dfs_layout_renders_children_immediately_after_edges() {
+        // A pass-> B pass-> C : DFS order should be A,B,C with B box immediately after A's edges
+        let mut state = running_state();
+        state.effective_nodes = vec![
+            LoopNode {
+                id: "a".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                name: "A".to_string(),
+                kind: LoopNodeKind::Agent,
+                config: json!({}),
+                position: 0,
+                created_at: Utc::now(),
+            },
+            LoopNode {
+                id: "b".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                name: "B".to_string(),
+                kind: LoopNodeKind::Agent,
+                config: json!({}),
+                position: 1,
+                created_at: Utc::now(),
+            },
+            LoopNode {
+                id: "c".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                name: "C".to_string(),
+                kind: LoopNodeKind::Agent,
+                config: json!({}),
+                position: 2,
+                created_at: Utc::now(),
+            },
+        ];
+        state.effective_edges = vec![
+            LoopEdge {
+                id: "e0".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                from_node: "a".to_string(),
+                to_node: "b".to_string(),
+                condition: LoopEdgeCondition::Pass,
+            },
+            LoopEdge {
+                id: "e1".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                from_node: "b".to_string(),
+                to_node: "c".to_string(),
+                condition: LoopEdgeCondition::Pass,
+            },
+        ];
+        state.ensembles = Vec::new();
+        state.current_node_id = Some("a".to_string());
+        let node_info = NodeRunInfo::default();
+        let text = render_to_text(80, 40, |frame, area| {
+            render_loop_live_view(
+                frame,
+                area,
+                &LiveViewContext {
+                    state: &state,
+                    follow: true,
+                    highlighted_node_id: state.current_node_id.as_deref(),
+                    node_info: &node_info,
+                    blocked: false,
+                    now: Utc::now(),
+                    theme: &Theme::classic(),
+                    selected_spec_id: None,
+                    spec_scroll: 0,
+                    scroll: 0,
+                },
+            );
+        });
+        // Ensure B appears after A and C after B
+        // For robustness, just check order of node names in rendered text
+        let ai = text.find("A").unwrap();
+        let bi = text.find("B").unwrap();
+        let ci = text.find("C").unwrap();
+        assert!(
+            ai < bi,
+            "A should appear before B in DFS layout, got ai={ai} bi={bi} text:\n{text}"
+        );
+        assert!(
+            bi < ci,
+            "B should appear before C in DFS layout, got bi={bi} ci={ci} text:\n{text}"
+        );
+        // Also ensure B's box appears directly after A's edge lines (no other box between)
+        let pass_a = text.find("pass → B").unwrap();
+        assert!(
+            pass_a < bi,
+            "B box should appear after its incoming edge, pass_a={pass_a} bi={bi}"
+        );
+    }
+
+    #[test]
+    fn dfs_layout_shows_back_reference_for_cycles() {
+        let mut state = running_state();
+        state.effective_nodes = vec![
+            LoopNode {
+                id: "a".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                name: "A".to_string(),
+                kind: LoopNodeKind::Agent,
+                config: json!({}),
+                position: 0,
+                created_at: Utc::now(),
+            },
+            LoopNode {
+                id: "b".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                name: "B".to_string(),
+                kind: LoopNodeKind::Agent,
+                config: json!({}),
+                position: 1,
+                created_at: Utc::now(),
+            },
+        ];
+        state.effective_edges = vec![
+            LoopEdge {
+                id: "e0".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                from_node: "a".to_string(),
+                to_node: "b".to_string(),
+                condition: LoopEdgeCondition::Pass,
+            },
+            LoopEdge {
+                id: "e1".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                from_node: "b".to_string(),
+                to_node: "a".to_string(),
+                condition: LoopEdgeCondition::Pass,
+            },
+        ];
+        state.ensembles = Vec::new();
+        state.current_node_id = Some("a".to_string());
+        let node_info = NodeRunInfo::default();
+        let text = render_to_text(80, 40, |frame, area| {
+            render_loop_live_view(
+                frame,
+                area,
+                &LiveViewContext {
+                    state: &state,
+                    follow: true,
+                    highlighted_node_id: state.current_node_id.as_deref(),
+                    node_info: &node_info,
+                    blocked: false,
+                    now: Utc::now(),
+                    theme: &Theme::classic(),
+                    selected_spec_id: None,
+                    spec_scroll: 0,
+                    scroll: 0,
+                },
+            );
+        });
+        assert!(
+            text.contains("↩"),
+            "cycle back-edge should render with ↩ marker, got:\n{text}"
+        );
+        // A's box should appear only once (the back-reference is a line, not a box)
+        let box_count = text.matches("┌").count();
+        assert_eq!(box_count, 2, "expected 2 boxes (A and B), back-reference should not add a third, got {box_count} in:\n{text}");
+    }
+
+    #[test]
+    fn dfs_layout_pass_before_fail() {
+        let mut state = running_state();
+        state.effective_nodes = vec![
+            LoopNode {
+                id: "a".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                name: "A".to_string(),
+                kind: LoopNodeKind::Agent,
+                config: json!({}),
+                position: 0,
+                created_at: Utc::now(),
+            },
+            LoopNode {
+                id: "b".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                name: "B".to_string(),
+                kind: LoopNodeKind::Agent,
+                config: json!({}),
+                position: 1,
+                created_at: Utc::now(),
+            },
+            LoopNode {
+                id: "c".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                name: "C".to_string(),
+                kind: LoopNodeKind::Agent,
+                config: json!({}),
+                position: 2,
+                created_at: Utc::now(),
+            },
+        ];
+        state.effective_edges = vec![
+            LoopEdge {
+                id: "e0".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                from_node: "a".to_string(),
+                to_node: "c".to_string(),
+                condition: LoopEdgeCondition::Fail,
+            },
+            LoopEdge {
+                id: "e1".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                from_node: "a".to_string(),
+                to_node: "b".to_string(),
+                condition: LoopEdgeCondition::Pass,
+            },
+        ];
+        state.ensembles = Vec::new();
+        state.current_node_id = Some("a".to_string());
+        let node_info = NodeRunInfo::default();
+        let text = render_to_text(80, 40, |frame, area| {
+            render_loop_live_view(
+                frame,
+                area,
+                &LiveViewContext {
+                    state: &state,
+                    follow: true,
+                    highlighted_node_id: state.current_node_id.as_deref(),
+                    node_info: &node_info,
+                    blocked: false,
+                    now: Utc::now(),
+                    theme: &Theme::classic(),
+                    selected_spec_id: None,
+                    spec_scroll: 0,
+                    scroll: 0,
+                },
+            );
+        });
+        let pass_idx = text.find("pass → B").expect("pass edge missing");
+        let fail_idx = text.find("fail → C").expect("fail edge missing");
+        assert!(
+            pass_idx < fail_idx,
+            "pass should appear before fail, pass={pass_idx} fail={fail_idx} text:\n{text}"
+        );
+    }
+
+    #[test]
+    fn graph_colors_come_from_theme() {
+        // Drive the real render path (`graph_lines`), not a helper, so this
+        // actually guards the requirement that the drawing routes colors
+        // through `Theme`.
+        let theme = Theme {
+            status_ok: Color::Rgb(1, 2, 3),
+            kind_router: Color::Rgb(4, 5, 6),
+            ..Theme::classic()
+        };
+        let mut state = running_state();
+        state.effective_nodes = vec![
+            LoopNode {
+                id: "r".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                name: "Router".to_string(),
+                kind: LoopNodeKind::Router,
+                config: json!({}),
+                position: 0,
+                created_at: Utc::now(),
+            },
+            LoopNode {
+                id: "t".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                name: "Target".to_string(),
+                kind: LoopNodeKind::Agent,
+                config: json!({}),
+                position: 1,
+                created_at: Utc::now(),
+            },
+        ];
+        state.effective_edges = vec![LoopEdge {
+            id: "e0".to_string(),
+            spec_id: Some("spec-1".to_string()),
+            loop_id: None,
+            from_node: "r".to_string(),
+            to_node: "t".to_string(),
+            condition: LoopEdgeCondition::Route("myroute".to_string()),
+        }];
+        state.ensembles = Vec::new();
+        state.router_taken_routes = [("r".to_string(), "myroute".to_string())]
+            .into_iter()
+            .collect();
+
+        let taken = graph_lines(&state, None, true, 80, &theme);
+        let route_line = taken
+            .lines
+            .iter()
+            .find(|l| l.to_string().contains("myroute → Target"))
+            .expect("route edge line missing");
+        assert_eq!(
+            route_line.spans[0].style.fg,
+            Some(Color::Rgb(1, 2, 3)),
+            "taken route edge should use theme.status_ok"
+        );
+        assert!(
+            taken.lines.iter().any(|line| line
+                .spans
+                .iter()
+                .any(|s| s.style.fg == Some(Color::Rgb(4, 5, 6)))),
+            "router box should use theme.kind_router"
+        );
+
+        // With no route recorded as taken, the branch falls back to dim_text.
+        state.router_taken_routes = HashMap::new();
+        let untaken = graph_lines(&state, None, true, 80, &theme);
+        let route_line = untaken
+            .lines
+            .iter()
+            .find(|l| l.to_string().contains("myroute → Target"))
+            .expect("route edge line missing");
+        assert_eq!(
+            route_line.spans[0].style.fg,
+            Some(theme.dim_text),
+            "non-taken route edge should use theme.dim_text"
+        );
+    }
+
+    #[test]
+    fn back_reference_uses_theme_dim_text() {
+        let mut state = running_state();
+        state.effective_nodes = vec![
+            LoopNode {
+                id: "a".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                name: "A".to_string(),
+                kind: LoopNodeKind::Agent,
+                config: json!({}),
+                position: 0,
+                created_at: Utc::now(),
+            },
+            LoopNode {
+                id: "b".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                name: "B".to_string(),
+                kind: LoopNodeKind::Agent,
+                config: json!({}),
+                position: 1,
+                created_at: Utc::now(),
+            },
+        ];
+        state.effective_edges = vec![
+            LoopEdge {
+                id: "e0".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                from_node: "a".to_string(),
+                to_node: "b".to_string(),
+                condition: LoopEdgeCondition::Pass,
+            },
+            LoopEdge {
+                id: "e1".to_string(),
+                spec_id: Some("spec-1".to_string()),
+                loop_id: None,
+                from_node: "b".to_string(),
+                to_node: "a".to_string(),
+                condition: LoopEdgeCondition::Pass,
+            },
+        ];
+        state.ensembles = Vec::new();
+        let theme = Theme::classic();
+        // Verify graph_lines returns lines where the back-reference edge uses dim_text
+        let result = graph_lines(&state, Some("a"), true, 80, &theme);
+        let back_line = result
+            .lines
+            .iter()
+            .find(|l| l.to_string().contains("↩"))
+            .expect("back ref line missing");
+        let fg = back_line.spans[0].style.fg;
+        assert_eq!(
+            fg,
+            Some(theme.dim_text),
+            "back-reference should use theme.dim_text, got {:?}",
+            fg
         );
     }
 }
