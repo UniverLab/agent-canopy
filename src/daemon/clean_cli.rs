@@ -1088,7 +1088,7 @@ async fn run_reclaim_window_and_report(
     let blocking_ops = ops.clone();
     let blocking_restored = restored.clone();
     let outcome = tokio::task::spawn_blocking({
-        let db = Database::new(&db_owned)?;
+        let db = Database::new_safe(&db_owned, &db_dir_owned)?;
         move || {
             run_reclaim_window(
                 &db,
