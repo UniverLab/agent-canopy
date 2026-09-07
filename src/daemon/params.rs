@@ -825,6 +825,14 @@ pub struct QueueRemoveSpecParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopRemoveSpecParams {
+    /// Existing loop ID.
+    pub loop_id: String,
+    /// Spec ID to unbind from the loop.
+    pub spec_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct QueueReorderParams {
     /// Existing queue ID.
     pub queue_id: String,

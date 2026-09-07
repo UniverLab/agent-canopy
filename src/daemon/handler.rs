@@ -542,7 +542,23 @@ fn validate_position_conflict(
 fn validate_spec_deletable(spec: &LoopSpec) -> Result<(), String> {
     if let Some(loop_id) = &spec.loop_id {
         return Err(format!(
-            "Spec '{}' is bound to loop '{loop_id}'; remove it from the loop (or delete the loop) before deleting the spec.",
+            "Spec '{}' is bound to loop '{loop_id}'; use loop_remove_spec to unbind it from the loop first (or delete the loop), then delete the spec.",
+            spec.id
+        ));
+    }
+    Ok(())
+}
+
+fn validate_spec_unbindable(_db: &Database, spec: &LoopSpec) -> Result<(), String> {
+    if spec.loop_id.is_none() {
+        return Err(format!(
+            "Spec '{}' is not bound to any loop; nothing to unbind.",
+            spec.id
+        ));
+    }
+    if spec.status == LoopSpecStatus::Running {
+        return Err(format!(
+            "Spec '{}' is currently running and cannot be unbound from its loop; wait for it to finish, or pause the loop, first.",
             spec.id
         ));
     }
@@ -4166,6 +4182,35 @@ impl TaskTriggerHandler {
     }
 
     #[tool(
+        name = "loop_remove_spec",
+        description = "Unbind a spec from a loop, making it a standalone backlog spec. The spec's execution history is preserved. Refuses if the spec is currently running."
+    )]
+    async fn loop_remove_spec(
+        &self,
+        Parameters(params): Parameters<LoopRemoveSpecParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let loop_id = match resolve_prefix_or_error(
+            &self.db,
+            params.loop_id.trim(),
+            Database::resolve_loop_id_by_prefix,
+            "loop",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        let spec_id = match resolve_prefix_or_error(
+            &self.db,
+            params.spec_id.trim(),
+            Database::resolve_spec_id_by_prefix,
+            "spec",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        self.do_loop_remove_spec(&loop_id, &spec_id).await
+    }
+
+    #[tool(
         name = "spec_create",
         description = "Create a standalone spec (a backlog item) not yet assigned to any loop. Optionally tag it to a workdir for later filtering."
     )]
@@ -5796,6 +5841,36 @@ impl TaskTriggerHandler {
 
         Ok(success_result(&format!(
             "Spec '{spec_id}' removed from queue '{queue_id}'."
+        )))
+    }
+
+    async fn do_loop_remove_spec(
+        &self,
+        loop_id: &str,
+        spec_id: &str,
+    ) -> Result<CallToolResult, McpError> {
+        let spec_id = spec_id.trim();
+        let spec = match validate_spec_exists(&self.db, spec_id) {
+            Ok(s) => s,
+            Err(e) => return Ok(error_result(&e)),
+        };
+        if let Some(ref bound_loop) = spec.loop_id {
+            if bound_loop != loop_id {
+                return Ok(error_result(&format!(
+                    "Spec '{spec_id}' is bound to loop '{bound_loop}', not '{loop_id}'."
+                )));
+            }
+        } else {
+            return Ok(error_result(&format!(
+                "Spec '{spec_id}' is not bound to any loop; nothing to unbind."
+            )));
+        }
+        if let Err(e) = validate_spec_unbindable(&self.db, &spec) {
+            return Ok(error_result(&e));
+        }
+        self.db.unbind_loop_spec(spec_id).map_err(internal_error)?;
+        Ok(success_result(&format!(
+            "Spec '{spec_id}' unbound from loop '{loop_id}'. It is now a standalone spec."
         )))
     }
 
@@ -17290,6 +17365,149 @@ mod endpoint_tests {
             .await
             .unwrap();
         assert!(is_err(&refused));
+    }
+
+    #[tokio::test]
+    async fn loop_remove_spec_unbinds_bound_spec() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+
+        let removed = handler
+            .loop_remove_spec(Parameters(LoopRemoveSpecParams {
+                loop_id: lp.id.clone(),
+                spec_id: spec.id.clone(),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&removed), "{}", text(&removed));
+        assert!(text(&removed).contains("unbound"));
+
+        let after = db.get_loop_spec(&spec.id).unwrap().unwrap();
+        assert!(after.loop_id.is_none());
+
+        let unassigned = db.list_specs(None, None, true).unwrap();
+        assert!(unassigned.iter().any(|s| s.id == spec.id));
+
+        assert!(db
+            .list_loop_specs(&lp.id)
+            .unwrap()
+            .iter()
+            .all(|s| s.id != spec.id));
+    }
+
+    #[tokio::test]
+    async fn loop_remove_spec_rejects_running_spec() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        db.update_loop_spec_status(&spec.id, LoopSpecStatus::Running, None, None)
+            .unwrap();
+
+        let refused = handler
+            .loop_remove_spec(Parameters(LoopRemoveSpecParams {
+                loop_id: lp.id.clone(),
+                spec_id: spec.id.clone(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&refused));
+        assert!(text(&refused).contains("running"));
+    }
+
+    #[tokio::test]
+    async fn loop_remove_spec_rejects_wrong_loop() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp_a = insert_test_loop(&db, dir.path());
+        let lp_b = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp_a.id, 1);
+
+        let refused = handler
+            .loop_remove_spec(Parameters(LoopRemoveSpecParams {
+                loop_id: lp_b.id.clone(),
+                spec_id: spec.id.clone(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&refused));
+        assert!(text(&refused).contains(&lp_a.id));
+    }
+
+    #[tokio::test]
+    async fn loop_remove_spec_rejects_standalone_spec() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let created = handler
+            .spec_create(Parameters(SpecCreateParams {
+                name: "Standalone".to_string(),
+                description: valid_spec_description(),
+                workdir: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&created), "{}", text(&created));
+        let standalone_id = db
+            .list_specs(None, None, false)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "Standalone")
+            .unwrap()
+            .id;
+
+        let refused = handler
+            .loop_remove_spec(Parameters(LoopRemoveSpecParams {
+                loop_id: lp.id.clone(),
+                spec_id: standalone_id,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&refused));
+        assert!(text(&refused).contains("not bound to any loop"));
+    }
+
+    #[tokio::test]
+    async fn spec_delete_error_message_names_loop_remove_spec() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+
+        let refused = handler
+            .spec_delete(Parameters(SpecDeleteParams {
+                spec_id: spec.id.clone(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&refused));
+        assert!(text(&refused).contains("loop_remove_spec"));
+    }
+
+    #[tokio::test]
+    async fn loop_remove_spec_preserves_execution_history() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let node = insert_named_node(&db, &spec.id, "build", 1);
+        insert_finalized_node_run(
+            &db,
+            &lp.id,
+            &spec.id,
+            &node.id,
+            LoopRunStatus::Pass,
+            None,
+            chrono::Utc::now(),
+        );
+
+        let removed = handler
+            .loop_remove_spec(Parameters(LoopRemoveSpecParams {
+                loop_id: lp.id.clone(),
+                spec_id: spec.id.clone(),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&removed), "{}", text(&removed));
+
+        let runs = db.list_loop_runs_for_spec(&spec.id).unwrap();
+        assert_eq!(runs.len(), 1);
     }
 
     // ── blueprint_list / blueprint_create / blueprint_delete ─────

@@ -4441,6 +4441,67 @@ fn set_spec_admin_status_rejects_loop_bound_spec() {
 }
 
 #[test]
+fn unbind_loop_spec_clears_loop_id() {
+    let db = test_db();
+    let lp = sample_loop("loop-unbind");
+    db.insert_loop(&lp).unwrap();
+    let spec = sample_loop_spec(&lp.id, "spec-unbind", 1);
+    let name = spec.name.clone();
+    let description = spec.description.clone();
+    db.insert_loop_spec(&spec).unwrap();
+
+    assert!(db.unbind_loop_spec(&spec.id).unwrap());
+
+    let after = db.get_loop_spec(&spec.id).unwrap().unwrap();
+    assert!(after.loop_id.is_none());
+    assert_eq!(after.name, name);
+    assert_eq!(after.description, description);
+}
+
+#[test]
+fn unbind_loop_spec_noop_for_standalone() {
+    let db = test_db();
+    let mut spec = sample_loop_spec("unused", "spec-standalone", 1);
+    spec.loop_id = None;
+    db.insert_loop_spec(&spec).unwrap();
+
+    assert!(!db.unbind_loop_spec(&spec.id).unwrap());
+}
+
+#[test]
+fn unbind_loop_spec_preserves_execution_history() {
+    let db = test_db();
+    let lp = sample_loop("loop-unbind-hist");
+    db.insert_loop(&lp).unwrap();
+    let spec = sample_loop_spec(&lp.id, "spec-unbind-hist", 1);
+    db.insert_loop_spec(&spec).unwrap();
+    let node = sample_loop_node(&spec.id, "node-unbind-hist", 1);
+    db.insert_loop_node(&node).unwrap();
+    let run = LoopNodeRun {
+        id: "run-unbind-hist".to_string(),
+        loop_id: lp.id,
+        spec_id: spec.id.clone(),
+        node_id: node.id,
+        status: LoopRunStatus::Pass,
+        input: None,
+        output: None,
+        started_at: Utc::now(),
+        completed_at: None,
+        iteration: 1,
+        pid: None,
+        boot_id: None,
+        session_id: None,
+    };
+    db.insert_loop_run(&run).unwrap();
+
+    assert!(db.unbind_loop_spec(&spec.id).unwrap());
+
+    let runs = db.list_loop_runs_for_spec(&spec.id).unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].id, "run-unbind-hist");
+}
+
+#[test]
 fn set_spec_admin_status_rejects_active_run() {
     let db = test_db();
     let mut spec = sample_loop_spec("unused", "spec-with-run", 1);

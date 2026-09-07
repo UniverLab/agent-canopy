@@ -128,6 +128,13 @@ pub(crate) enum LoopAction {
         #[arg(long)]
         cancel: bool,
     },
+    /// Unbind a spec from a loop, making it a standalone backlog spec.
+    RemoveSpec {
+        /// Full loop id, an unambiguous id prefix, or the exact loop name.
+        id_or_name: String,
+        /// Spec ID (or unambiguous prefix) to unbind.
+        spec_id: String,
+    },
 }
 
 pub(crate) async fn handle_loop_action(
@@ -186,6 +193,10 @@ pub(crate) async fn handle_loop_action(
             quota_reset_message.as_deref(),
             cancel,
         ),
+        LoopAction::RemoveSpec {
+            id_or_name,
+            spec_id,
+        } => handle_loop_remove_spec(&db, port_override, &id_or_name, &spec_id),
     }
 }
 
@@ -225,6 +236,28 @@ fn handle_loop_pause(db: &Database, port_override: Option<u16>, id_or_name: &str
             port_override,
             "loop_pause",
             &serde_json::json!({ "loop_id": lp.id }),
+        )?
+    );
+    Ok(())
+}
+
+fn handle_loop_remove_spec(
+    db: &Database,
+    port_override: Option<u16>,
+    id_or_name: &str,
+    spec_id: &str,
+) -> Result<()> {
+    let loops = db.list_loops(None, true)?;
+    let lp = resolve_loop(&loops, id_or_name)?;
+    println!(
+        "{}",
+        call_tool(
+            port_override,
+            "loop_remove_spec",
+            &serde_json::json!({
+                "loop_id": lp.id,
+                "spec_id": spec_id,
+            }),
         )?
     );
     Ok(())

@@ -847,6 +847,21 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Unbind a spec from its loop (set loop_id = NULL), making it standalone.
+    /// Does NOT delete the spec row — execution history is preserved.
+    /// Returns true if a row was updated, false if spec_id not found.
+    pub fn unbind_loop_spec(&self, spec_id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE loop_specs SET loop_id = NULL WHERE id = ?1 AND loop_id IS NOT NULL",
+            params![spec_id],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// Record the workdir's git HEAD at the moment a spec starts running.
     /// Called once per spec (not per node) — see [`crate::loop_engine`]'s
     /// `{{spec_start_head}}` placeholder. `head = None` means the workdir
