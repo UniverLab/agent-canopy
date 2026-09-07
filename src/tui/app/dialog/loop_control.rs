@@ -254,6 +254,15 @@ impl App {
 
     /// Run the selected loop (`r`) — valid for a `draft`, `completed`, or
     /// `failed` loop (see [`available_loop_actions`]); a no-op otherwise.
+    ///
+    /// (CB22) Pure dispatch: sends `loop_run` with only `loop_id` — never a
+    /// `queue_id`, never an `idea`, and never a spec-creation request. A loop
+    /// with neither bound specs nor a selected queue is refused by the
+    /// daemon's launch validation (surfacing through
+    /// `dispatch_loop_action`'s error banner), not papered over with a blank
+    /// spec row. There is no MCP-dispatch seam to unit-test the payload
+    /// here, so the user-visible refusal is covered at the handler/engine
+    /// boundary instead.
     pub fn run_selected_loop(&mut self) {
         let Some(lp) = self.actionable_selected_loop() else {
             return;

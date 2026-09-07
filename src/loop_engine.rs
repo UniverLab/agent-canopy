@@ -306,15 +306,18 @@ impl LoopEngine {
             bail!("Loop '{}' not found.", loop_id);
         };
 
-        // (B17) Compute the effective spec set BEFORE flipping the loop to
+        // (B17, CB22) Compute the effective spec set BEFORE flipping the loop to
         // `Running` — the single choke point every launch path (fresh
         // `loop_run`, cron/watch triggers, scheduled autorun, and
-        // `loop_continue`'s resume) funnels through. An empty set is a launch
+        // `loop_continue`'s resume) funnels through. An empty set, or a set
+        // containing a spec with no content, is a launch
         // error, not a successful no-op run: it must leave the loop's status
         // untouched and record no run, so monitoring never sees a false
         // `completed` over a backlog the caller simply failed to point this
         // launch at (the 2026-07-14T14:16:31Z incident).
-        if let Some(message) = self.empty_launch_check(&loop_id, queue_id.as_deref())? {
+        if let Some(message) =
+            self.empty_launch_check(&loop_id, queue_id.as_deref(), idea.as_deref())?
+        {
             return Err(EmptySpecSetError(message).into());
         }
 
@@ -501,11 +504,11 @@ impl LoopEngine {
                 }
             }
             None => {
-                // A terminal (Completed/Failed/Skipped) placeholder a PRIOR
-                // spec-less dispatch left behind is purged before deciding
-                // whether THIS dispatch needs a fresh one — never a
-                // still-live one (Pending/Running/Interrupted), which is
-                // exactly the row a resume of that same attempt needs to
+                // A terminal blank-name bookkeeping row a PRIOR idea-driven
+                // (or legacy graph-only) dispatch left behind is purged
+                // before deciding whether THIS dispatch needs a fresh one —
+                // never a still-live one (Pending/Running/Interrupted), which
+                // is exactly the row a resume of that same attempt needs to
                 // find via `list_loop_specs` below. Deferring the purge to
                 // here (the start of the NEXT dispatch) rather than doing it
                 // the moment the prior attempt finished is what lets that
@@ -513,6 +516,9 @@ impl LoopEngine {
                 // inspected (`loop_get`/`loop_node_runs_list`) — deleting it
                 // immediately would cascade its `loop_runs` rows away (FK
                 // `ON DELETE CASCADE`) before anyone could look.
+                // `empty_launch_check` already treated "only bookkeeping left,
+                // no idea" as empty, so a no-idea TUI launch never reaches
+                // this purge-then-refuse path after the claim.
                 for spec in self.db.list_loop_specs(&loop_id)? {
                     if is_no_spec_placeholder(&spec)
                         && matches!(
@@ -527,23 +533,32 @@ impl LoopEngine {
                 }
 
                 let mut specs = self.db.list_loop_specs(&loop_id)?;
-                // `empty_launch_check` already established this loop has a
-                // top-level graph to fall back on (it's the only way this
-                // dispatch got past it with zero bound specs), so give this
-                // attempt a single placeholder spec to run against — every
-                // per-spec mechanic below (the NOT NULL `loop_runs.spec_id`
-                // FK, resumability, `spec_start_head`) needs a real
-                // `loop_specs` row to hang off of, and this is the one place
-                // in the whole dispatch that knows "zero bound specs" just
-                // meant "no spec was ever attached", not "nothing to run".
-                // See `no_spec_placeholder` for why its blank name is what
-                // makes `{{spec_content}}`/`{{spec_name}}` resolve to ""
-                // instead of leaking a fabricated spec into the prompt.
+                // (CB22) A no-spec launch never reaches here without an
+                // explicit non-empty `idea` — `empty_launch_check` above
+                // already refused it. The `idea` path keeps a single
+                // internal bookkeeping row (idea text as the description, so
+                // it carries content) because every per-spec mechanic below
+                // (the NOT NULL `loop_runs.spec_id` FK, resumability,
+                // `spec_start_head`) needs a real `loop_specs` row. That row
+                // is hidden from work listings by its blank name (see the
+                // `spec_list`/`loop_get` filters) and must never be created
+                // for a no-idea TUI launch.
                 if specs.is_empty() {
-                    let mut placeholder = no_spec_placeholder(&loop_id);
-                    if let Some(idea_text) = &idea {
-                        placeholder.description = Some(idea_text.clone());
+                    let Some(idea_text) = &idea else {
+                        // Should be unreachable: empty_launch_check refused
+                        // this before the claim. Unwind the claim rather than
+                        // leaving the loop `Running` with nothing to execute.
+                        let message = self.empty_spec_set_message(&lp, None)?;
+                        self.fail_loop(&loop_id, Some(claimed_at), None, &message)?;
+                        return Err(EmptySpecSetError(message).into());
+                    };
+                    if idea_text.trim().is_empty() {
+                        let message = self.empty_spec_set_message(&lp, None)?;
+                        self.fail_loop(&loop_id, Some(claimed_at), None, &message)?;
+                        return Err(EmptySpecSetError(message).into());
                     }
+                    let mut placeholder = no_spec_placeholder(&loop_id);
+                    placeholder.description = Some(idea_text.clone());
                     self.db.insert_loop_spec(&placeholder)?;
                     specs = vec![placeholder];
                 }
@@ -777,6 +792,38 @@ impl LoopEngine {
         }
     }
 
+    /// (CB22) Whether `spec` carries usable content: a trimmed non-empty
+    /// name or a trimmed non-empty description. A spec with neither is not
+    /// executable — the engine rejects it at launch instead of spending
+    /// agents on an empty `{{spec_content}}`.
+    pub fn spec_has_content(spec: &LoopSpec) -> bool {
+        if !spec.name.trim().is_empty() {
+            return true;
+        }
+        if let Some(description) = spec.description.as_deref() {
+            if !description.trim().is_empty() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// (CB22) Actionable error for a bound or queued spec with no content.
+    /// Names the loop and the offending spec (falling back to its id when
+    /// its name is blank) so the caller knows exactly which row to fix.
+    fn blank_spec_message(loop_name: &str, spec: &LoopSpec) -> String {
+        let display = if spec.name.trim().is_empty() {
+            spec.id.clone()
+        } else {
+            spec.name.clone()
+        };
+        format!(
+            "Loop '{}' has a spec '{}' (id '{}') with no content: both name and description \
+             are empty. Give the spec a name or description before running.",
+            loop_name, display, spec.id
+        )
+    }
+
     /// (B17) `Ok(Some(message))` if launching `loop_id` (optionally against
     /// `queue_id`) would find no effective spec to run — `message` is the
     /// actionable, human/LLM-readable error to surface. `Ok(None)` means the
@@ -790,15 +837,14 @@ impl LoopEngine {
     /// check from `run_loop_dispatch` itself.
     ///
     /// Emptiness is defined per launch mode:
-    /// - Bound specs (`queue_id` is `None`): the loop has *zero* specs bound
-    ///   to it AND *zero* top-level graph nodes to fall back on. A graph is a
-    ///   runnable thing on its own (the 2026-08-19 report): a loop with no
-    ///   specs but a real top-level graph still has something to execute, so
-    ///   it is not empty. Deliberately not "every bound spec is already
-    ///   completed/skipped" — a loop's own bound specs belong to it 1:1, so
-    ///   if they're all done the loop genuinely is finished (see the
-    ///   zero-execution completion path in `run_loop_dispatch`, which still
-    ///   completes but never fires the hook).
+    /// - Bound specs (`queue_id` is `None`): every *non-terminal* bound spec
+    ///   must have usable content (CB22 — trimmed non-empty name or
+    ///   description); a runnable spec with both blank is rejected before
+    ///   the loop is claimed. Blank-name bookkeeping rows (idea / legacy
+    ///   placeholders) do not count as an effective bound set. Zero real
+    ///   bound specs is an error unless the caller supplied an explicit
+    ///   non-empty `idea` (the intentional spec-less API mode). A top-level
+    ///   graph alone is not a spec and never substitutes for content.
     /// - A queue (`queue_id` is `Some`): the queue has no `pending` member *and*
     ///   no other non-terminal (`running`/`failed`) member left either — i.e.
     ///   [`Database::queue_has_incomplete_members`] is false. Unlike bound
@@ -806,12 +852,16 @@ impl LoopEngine {
     ///   easily point at by mistake, so "every member already done" is
     ///   treated as an error here rather than a silent, do-nothing
     ///   completion (regression (b): a queue run where every member is
-    ///   already completed). Unaffected by the spec-less carve-out above —
+    ///   already completed). Only the queue's own selected (non-terminal)
+    ///   members are inspected for blank content — unrelated loop-bound
+    ///   specs, including blank ones, are ignored. Unaffected by the
+    ///   spec-less carve-out above —
     ///   a queue run always needs actual queue members.
     pub fn empty_launch_check(
         &self,
         loop_id: &str,
         queue_id: Option<&str>,
+        idea: Option<&str>,
     ) -> Result<Option<String>> {
         let Some(lp) = self.db.get_loop(loop_id)? else {
             // Not-found is handled by the caller (`run_loop_dispatch` bails
@@ -820,18 +870,84 @@ impl LoopEngine {
             return Ok(None);
         };
 
-        let is_empty = match queue_id {
-            Some(queue_id) => !self.db.queue_has_incomplete_members(queue_id)?,
-            None => {
-                self.db.list_loop_specs(loop_id)?.is_empty()
-                    && self.db.list_loop_nodes_for_loop(loop_id)?.is_empty()
+        if let Some(queue_id) = queue_id {
+            if !self.db.queue_has_incomplete_members(queue_id)? {
+                return Ok(Some(self.empty_spec_set_message(&lp, Some(queue_id))?));
             }
-        };
-        if !is_empty {
+            // (CB22) Validate only the queue's own effective members: a
+            // blank selected member is rejected, while unrelated loop-bound
+            // specs are ignored entirely.
+            for spec_id in self.db.list_queue_member_spec_ids(queue_id)? {
+                let Some(spec) = self.db.get_loop_spec(&spec_id)? else {
+                    continue;
+                };
+                if matches!(
+                    spec.status,
+                    LoopSpecStatus::Completed | LoopSpecStatus::Skipped
+                ) {
+                    continue;
+                }
+                if !Self::spec_has_content(&spec) {
+                    return Ok(Some(Self::blank_spec_message(&lp.name, &spec)));
+                }
+            }
             return Ok(None);
         }
 
-        Ok(Some(self.empty_spec_set_message(&lp, queue_id)?))
+        let bound = self.db.list_loop_specs(loop_id)?;
+        // (CB22) Reject non-terminal bound specs with no content before the
+        // loop is claimed — the engine must never execute an empty
+        // `{{spec_content}}`. Terminal rows are skipped here so a leftover
+        // completed bookkeeping/legacy blank does not block a relaunch that
+        // still has real work (and so this matches the queue path above).
+        for spec in &bound {
+            if matches!(
+                spec.status,
+                LoopSpecStatus::Completed | LoopSpecStatus::Skipped
+            ) {
+                continue;
+            }
+            if !Self::spec_has_content(spec) {
+                return Ok(Some(Self::blank_spec_message(&lp.name, spec)));
+            }
+        }
+
+        // Effective bound work, for the emptiness decision below:
+        // - any remaining non-terminal row (already content-checked) is
+        //   executable — including a live idea bookkeeping row still mid-run;
+        // - terminal rows with a non-empty name are real user specs, so an
+        //   all-done relaunch still takes the zero-exec completion path.
+        // Blank-name bookkeeping left over from a prior idea/legacy run does
+        // *not* count: the next no-idea dispatch must refuse before claim
+        // rather than purge-then-fail after flipping the loop to Running.
+        let has_effective_bound = bound.iter().any(|spec| {
+            if matches!(
+                spec.status,
+                LoopSpecStatus::Completed | LoopSpecStatus::Skipped
+            ) {
+                !spec.name.trim().is_empty()
+            } else {
+                true
+            }
+        });
+        if has_effective_bound {
+            return Ok(None);
+        }
+
+        // Zero real bound specs: only an explicit non-empty `idea` may supply
+        // `spec_content` — and even then only against a top-level graph to
+        // execute it (an idea with nothing to feed is still a launch error).
+        // A top-level graph alone, without bound specs or an idea, is not
+        // executable (CB22).
+        let has_idea = idea
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some();
+        if has_idea && !self.db.list_loop_nodes_for_loop(loop_id)?.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(self.empty_spec_set_message(&lp, None)?))
     }
 
     /// Build the actionable error text for [`Self::empty_launch_check`].
@@ -5632,17 +5748,16 @@ fn ensemble_owning_node(node_id: &str, ensembles: &[EnsembleDetails]) -> Option<
         .map(|details| details.ensemble.id.clone())
 }
 
-/// The one-off spec [`LoopEngine::run_loop_dispatch`]'s bound-spec (`None`
-/// queue) branch fabricates for a spec-less run — a loop launched with zero
-/// bound specs whose top-level graph is what `empty_launch_check` let the
-/// launch through on. Its blank `name`/`description` are load-bearing, not
-/// incidental: `render_agent_prompt`/`render_resume_prompt` already fall
-/// back from `spec.description` to `spec.name` for `{{spec_content}}`, and
-/// substitute `spec.name` directly for `{{spec_name}}`, so an empty name
-/// with no description makes both resolve to `""` — honestly empty, per the
-/// "unresolved placeholder is a bug" rule — through that existing code,
-/// unchanged. `loop_add_spec` rejects an empty name for every real,
-/// user-authored spec, so `""` can never collide with one.
+/// The internal bookkeeping row [`LoopEngine::run_loop_dispatch`]'s
+/// bound-spec (`None` queue) branch inserts for an explicit-`idea` run only:
+/// a loop launched with zero bound specs and a non-empty `idea` that
+/// `empty_launch_check` let through. The blank `name` keeps it hidden from
+/// work listings (`spec_list`/`loop_get` filter on it); the caller-supplied
+/// idea text in `description` is what `{{spec_content}}` resolves from, so
+/// this row always carries content and is never the blank row CB22 refuses.
+/// `loop_add_spec` rejects an empty name for every real, user-authored spec,
+/// so `""` can never collide with one. Never created for a no-idea launch —
+/// those are refused before reaching the dispatch body.
 fn no_spec_placeholder(loop_id: &str) -> LoopSpec {
     LoopSpec {
         id: uuid::Uuid::new_v4().to_string(),
@@ -5663,14 +5778,14 @@ fn no_spec_placeholder(loop_id: &str) -> LoopSpec {
     }
 }
 
-/// Whether `spec` is the placeholder [`no_spec_placeholder`] creates — the
-/// sentinel `run_loop_dispatch`'s bound-spec path checks for at the start of
-/// every dispatch, to purge a prior spec-less run's placeholder once it's
-/// reached a terminal status (see the purge loop ahead of this branch's
-/// `list_loop_specs` call) without ever touching a still-live one a resume
-/// still needs.
+/// Whether `spec` is the blank-name bookkeeping row [`no_spec_placeholder`]
+/// creates for an idea-driven run (and that legacy graph-only runs also
+/// wrote). The blank `name` is the sentinel — idea text may live in
+/// `description` — so `run_loop_dispatch` can purge a prior attempt's
+/// terminal bookkeeping row without touching a still-live resume row or any
+/// real user-authored spec (`loop_add_spec` rejects an empty name).
 fn is_no_spec_placeholder(spec: &LoopSpec) -> bool {
-    spec.name.is_empty()
+    spec.name.trim().is_empty()
 }
 
 #[allow(clippy::type_complexity)]
@@ -13091,12 +13206,9 @@ echo done
 
     // ── B17: empty effective spec set is a launch error, not a completion ──
 
-    /// A loop with *neither* bound specs *nor* a top-level graph — `bare_loop_fixture`
-    /// adds no nodes at all — has genuinely nothing to run and must still
-    /// refuse to launch, with the same message as before this fixture grew a
-    /// graph-aware carve-out (see `spec_less_run_executes_top_level_graph_once`
-    /// below for the case that carve-out actually lets through). Status must
-    /// stay untouched and no run recorded.
+    /// A loop with *neither* bound specs *nor* an explicit idea has genuinely
+    /// nothing to run and must refuse to launch (CB22: a top-level graph
+    /// alone is not a spec). Status must stay untouched and no run recorded.
     #[tokio::test]
     async fn loop_engine_zero_bound_specs_and_no_queue_is_a_launch_error() {
         let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
@@ -13122,14 +13234,12 @@ echo done
         );
     }
 
-    /// A loop refuses to run without a spec (2026-08-19 report): a loop is a
-    /// graph of nodes, and a graph is runnable on its own. `empty_launch_check`
-    /// must let a spec-less launch through as soon as the loop has *any*
-    /// top-level graph node — it doesn't need to inspect the graph any more
-    /// deeply than that (a malformed/disconnected graph is the author's
-    /// problem, per the loop's own decision record, not this guard's).
+    /// (CB22) A top-level graph alone is not a spec: `empty_launch_check`
+    /// must refuse a spec-less, idea-less launch even when the loop has
+    /// top-level graph nodes. Only an explicit non-empty `idea` may supply
+    /// `spec_content` for a loop with zero bound specs.
     #[tokio::test]
-    async fn empty_launch_check_lets_spec_less_run_through_when_a_top_level_graph_exists() {
+    async fn empty_launch_check_refuses_spec_less_run_even_when_a_top_level_graph_exists() {
         let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
         db.insert_loop_node(&LoopNode {
             id: "node-only".to_string(),
@@ -13146,29 +13256,23 @@ echo done
         })
         .unwrap();
 
-        assert_eq!(
-            engine.empty_launch_check(&loop_id, None).unwrap(),
-            None,
-            "a top-level graph node means this launch is not empty, even with zero bound specs"
+        let message = engine
+            .empty_launch_check(&loop_id, None, None)
+            .unwrap()
+            .expect("a spec-less, idea-less launch must be refused even with a graph");
+        assert!(
+            message.contains("no specs to run"),
+            "unexpected refusal message: {message}"
         );
     }
 
-    /// The core fix: a loop with a valid top-level graph and zero bound specs
-    /// runs the graph exactly once and completes — not an infinite loop, not
-    /// a silent no-op. Every placeholder the agent node's prompt would have
-    /// drawn from a spec (`{{spec_content}}`, `{{spec_name}}`) must resolve to
-    /// "", never survive as a literal `{{...}}` token.
-    ///
-    /// The engine's internal placeholder spec (see `no_spec_placeholder`) is
-    /// left in place, `Completed`, right after this run — deleting it
-    /// immediately would cascade its `loop_runs` rows away (FK
-    /// `ON DELETE CASCADE`) before anyone could inspect what ran. It's
-    /// purged lazily, at the start of the *next* spec-less dispatch — proven
-    /// here by a second run reusing a fresh placeholder rather than finding
-    /// the first one still `Completed` and (like a real finished bound spec)
-    /// silently skipping it.
+    /// (CB22) A loop with a top-level graph but zero bound specs and no
+    /// explicit `idea` is refused: the engine must not manufacture a blank
+    /// bound spec and spend agents on an empty `{{spec_content}}`. No agent
+    /// node ever executes, no `loop_runs` row is recorded, and no placeholder
+    /// row is left behind.
     #[tokio::test]
-    async fn spec_less_run_executes_top_level_graph_once() {
+    async fn spec_less_run_with_graph_and_no_idea_is_refused() {
         let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
         let argv_file = dir.path().join("argv.log");
         let script = write_argv_echo_cli(dir.path());
@@ -13222,6 +13326,497 @@ echo done
         );
 
         let guard = HomeGuard::set(home.path());
+        let error = engine
+            .run_loop(loop_id.clone(), None, None, None, None)
+            .await
+            .unwrap_err();
+        drop(guard);
+        assert!(
+            error.to_string().contains("no specs to run"),
+            "a graph-only launch with no idea must be refused: {error}"
+        );
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(
+            lp.status,
+            LoopStatus::Draft,
+            "a refused launch must leave the loop's status untouched"
+        );
+        assert!(
+            db.list_loop_runs_for_loop(&loop_id).unwrap().is_empty(),
+            "a refused launch must record no run"
+        );
+        assert!(
+            db.list_loop_specs(&loop_id).unwrap().is_empty(),
+            "a refused launch must not manufacture a blank bound spec"
+        );
+        assert!(
+            std::fs::read_to_string(&argv_file)
+                .unwrap_or_default()
+                .is_empty(),
+            "no agent node may execute on a refused launch"
+        );
+    }
+
+    /// (CB22) A loop with a bound spec whose name and description are both
+    /// empty is not executable: `run_loop` rejects it before claiming the
+    /// loop, so no agent node ever executes. This is the measured 2026-09-01
+    /// incident shape (empty name, `None` description, bound to the loop).
+    #[tokio::test]
+    async fn blank_bound_spec_is_rejected_before_any_agent_executes() {
+        let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+        let argv_file = dir.path().join("argv.log");
+        let script = write_argv_echo_cli(dir.path());
+        let mut env = HashMap::new();
+        env.insert(
+            "ARGV_FILE".to_string(),
+            argv_file.to_string_lossy().into_owned(),
+        );
+        env.insert("RESUME_FLAG".to_string(), "--resume".to_string());
+        let cli = argv_cli_config(&script, env, None, None, None);
+        let home = write_resume_cli_home(cli);
+
+        db.insert_loop_spec(&LoopSpec {
+            id: "blank-spec".to_string(),
+            loop_id: Some(loop_id.clone()),
+            name: String::new(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-impl".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "impl".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({ "platform": "resume-cli" }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let guard = HomeGuard::set(home.path());
+        let error = engine
+            .run_loop(loop_id.clone(), None, None, None, None)
+            .await
+            .unwrap_err();
+        drop(guard);
+
+        let message = error.to_string();
+        assert!(
+            message.contains("blank-spec"),
+            "the refusal must name the offending spec: {message}"
+        );
+        assert!(
+            message.contains("both name and description are empty"),
+            "the refusal must say what is missing: {message}"
+        );
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(
+            lp.status,
+            LoopStatus::Draft,
+            "a refused launch must leave the loop's status untouched"
+        );
+        assert!(
+            db.list_loop_runs_for_loop(&loop_id).unwrap().is_empty(),
+            "a refused launch must record no run"
+        );
+        assert!(
+            std::fs::read_to_string(&argv_file)
+                .unwrap_or_default()
+                .is_empty(),
+            "no agent node may execute for a blank spec"
+        );
+    }
+
+    /// (CB22) A whitespace-only name/description is blank too: trimming
+    /// applies before the content check.
+    #[tokio::test]
+    async fn whitespace_only_bound_spec_is_rejected() {
+        let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+        db.insert_loop_spec(&LoopSpec {
+            id: "ws-spec".to_string(),
+            loop_id: Some(loop_id.clone()),
+            name: "   ".to_string(),
+            description: Some("  \n\t ".to_string()),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+
+        let error = engine
+            .run_loop(loop_id.clone(), None, None, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("ws-spec"),
+            "the refusal must name the offending spec: {error}"
+        );
+    }
+
+    /// A description-only bound spec has usable content and remains
+    /// executable even though the interactive spec-creation flow normally
+    /// requires a name.
+    #[tokio::test]
+    async fn description_only_bound_spec_is_executable() {
+        let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+        db.insert_loop_spec(&LoopSpec {
+            id: "description-only".to_string(),
+            loop_id: Some(loop_id.clone()),
+            name: String::new(),
+            description: Some("Run the verification checks.".to_string()),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_at: None,
+            completed_via_reason: None,
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "description-only-check".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        engine
+            .run_loop(loop_id.clone(), None, None, None, None)
+            .await
+            .unwrap();
+
+        let spec = db.get_loop_spec("description-only").unwrap().unwrap();
+        assert_eq!(spec.status, LoopSpecStatus::Completed);
+    }
+
+    /// (CB22) Queue isolation: a valid queue run succeeds even when the loop
+    /// has an unrelated blank bound spec — queue launches validate only the
+    /// queue's own members.
+    #[tokio::test]
+    async fn queue_run_ignores_unrelated_blank_bound_spec() {
+        let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+        db.insert_loop_spec(&LoopSpec {
+            id: "blank-bound".to_string(),
+            loop_id: Some(loop_id.clone()),
+            name: String::new(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+
+        let member = standalone_spec("queue-member", 1);
+        db.insert_loop_spec(&member).unwrap();
+        insert_queue_with_members(&db, "queue-1", &[&member.id]);
+
+        db.insert_loop_node(&LoopNode {
+            id: "loop-check".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        engine
+            .run_loop(
+                loop_id.clone(),
+                Some("queue-1".to_string()),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Completed);
+    }
+
+    /// (CB22) A blank queue member is rejected at launch: the queue path
+    /// validates the members it actually selects.
+    #[tokio::test]
+    async fn blank_queue_member_is_rejected() {
+        let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+        db.insert_loop_spec(&LoopSpec {
+            id: "blank-member".to_string(),
+            loop_id: None,
+            name: String::new(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+        insert_queue_with_members(&db, "queue-1", &["blank-member"]);
+
+        let error = engine
+            .run_loop(
+                loop_id.clone(),
+                Some("queue-1".to_string()),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("blank-member"),
+            "the refusal must name the offending queue member: {error}"
+        );
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(
+            lp.status,
+            LoopStatus::Draft,
+            "a refused queue launch must leave the loop's status untouched"
+        );
+    }
+
+    /// (CB22) Explicit non-empty `idea` still drives a zero-bound-spec loop:
+    /// the engine binds an internal bookkeeping row carrying the idea as
+    /// `description`, runs the top-level graph once, and a second idea
+    /// launch purges the prior terminal bookkeeping row so the new idea
+    /// actually executes (not a silent zero-exec completion).
+    #[tokio::test]
+    async fn explicit_idea_run_executes_graph_and_rerun_picks_up_new_idea() {
+        let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+        let argv_file = dir.path().join("argv.log");
+        let script = write_argv_echo_cli(dir.path());
+        let mut env = HashMap::new();
+        env.insert(
+            "ARGV_FILE".to_string(),
+            argv_file.to_string_lossy().into_owned(),
+        );
+        env.insert("RESUME_FLAG".to_string(), "--resume".to_string());
+        let cli = argv_cli_config(&script, env, None, None, None);
+        let home = write_resume_cli_home(cli);
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-impl".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "impl".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({ "platform": "resume-cli" }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 2,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "edge-impl-check".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            from_node: "node-impl".to_string(),
+            to_node: "node-check".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Pass,
+        })
+        .unwrap();
+
+        let guard = HomeGuard::set(home.path());
+        engine
+            .run_loop(
+                loop_id.clone(),
+                None,
+                None,
+                Some("build a landing page".to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Completed);
+        let specs = db.list_loop_specs(&loop_id).unwrap();
+        assert_eq!(specs.len(), 1, "idea run leaves one bookkeeping row");
+        assert!(
+            specs[0].name.is_empty(),
+            "bookkeeping row keeps a blank name"
+        );
+        assert_eq!(
+            specs[0].description.as_deref(),
+            Some("build a landing page")
+        );
+        let first_placeholder_id = specs[0].id.clone();
+        let argv = std::fs::read_to_string(&argv_file).unwrap();
+        assert!(
+            argv.contains("build a landing page"),
+            "the agent prompt must carry the idea as spec_content: {argv}"
+        );
+        assert_eq!(
+            argv.matches("===").count(),
+            1,
+            "the agent node must run exactly once on the first idea dispatch"
+        );
+
+        // A second idea launch: `claim_loop_for_run` only refuses while
+        // `Running`, so the completed status from the first run doesn't
+        // block this. The prior terminal bookkeeping row must be purged
+        // and replaced so the new idea actually executes.
+        engine
+            .run_loop(
+                loop_id.clone(),
+                None,
+                None,
+                Some("ship the docs site".to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+        drop(guard);
+
+        let specs_after = db.list_loop_specs(&loop_id).unwrap();
+        assert_eq!(specs_after.len(), 1);
+        assert_ne!(
+            specs_after[0].id, first_placeholder_id,
+            "the second idea dispatch must not reuse the first bookkeeping row"
+        );
+        assert_eq!(
+            specs_after[0].description.as_deref(),
+            Some("ship the docs site")
+        );
+        let argv = std::fs::read_to_string(&argv_file).unwrap();
+        assert!(
+            argv.contains("ship the docs site"),
+            "the second idea must reach the agent: {argv}"
+        );
+        assert_eq!(
+            argv.matches("===").count(),
+            2,
+            "the agent node must run again on the second idea dispatch: {argv}"
+        );
+    }
+
+    /// (CB22) A leftover *completed* blank bookkeeping/legacy row must not
+    /// block a launch that still has a real pending bound spec — only
+    /// non-terminal blank content is a launch error.
+    #[tokio::test]
+    async fn completed_blank_bookkeeping_does_not_block_real_bound_spec() {
+        let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+        db.insert_loop_spec(&LoopSpec {
+            id: "legacy-blank".to_string(),
+            loop_id: Some(loop_id.clone()),
+            name: String::new(),
+            description: None,
+            position: 0,
+            parallelizable: false,
+            status: LoopSpecStatus::Completed,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+        db.insert_loop_spec(&LoopSpec {
+            id: "real-spec".to_string(),
+            loop_id: Some(loop_id.clone()),
+            name: "Real Work".to_string(),
+            description: Some(
+                "Functional Requirements:\n- A\n\nNon-Functional Requirements:\n- B\n\nObjective:\n- C\n\nConstraints:\n- D\n\nGuidelines:\n- E\n\nIn Scope:\n- F\n\nOut of Scope:\n- G".to_string(),
+            ),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "loop-check".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
         engine
             .run_loop(loop_id.clone(), None, None, None, None)
             .await
@@ -13229,60 +13824,111 @@ echo done
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
         assert_eq!(lp.status, LoopStatus::Completed);
-
+        // Legacy blank bookkeeping is purged once terminal at the start of
+        // the next bound-spec dispatch.
         let specs = db.list_loop_specs(&loop_id).unwrap();
-        assert_eq!(
-            specs.len(),
-            1,
-            "the run's placeholder spec is left in place"
-        );
-        let placeholder = &specs[0];
-        assert_eq!(placeholder.status, LoopSpecStatus::Completed);
-
-        let runs = db.list_loop_runs_for_spec(&placeholder.id).unwrap();
-        assert_eq!(
-            runs.iter().filter(|r| r.node_id == "node-impl").count(),
-            1,
-            "the agent node must execute exactly once"
-        );
-        assert_eq!(
-            runs.iter().filter(|r| r.node_id == "node-check").count(),
-            1,
-            "the check node must execute exactly once"
-        );
-
-        let argv = std::fs::read_to_string(&argv_file).unwrap();
         assert!(
-            !argv.contains("{{"),
-            "the prompt handed to the agent node must contain no unresolved placeholder: {argv}"
+            specs.iter().all(|s| s.id != "legacy-blank"),
+            "terminal blank bookkeeping must be purged: {specs:?}"
         );
+    }
 
-        // A second spec-less launch must purge the first placeholder and run
-        // the graph fresh again — not find a `Completed` spec sitting in
-        // `list_loop_specs` and silently skip it like a real finished spec.
-        // `claim_loop_for_run` only refuses a claim while `Running`, so the
-        // completed status from the first run doesn't block this directly.
-        engine
+    /// (CB22) A loop whose only bound row is terminal blank-name bookkeeping
+    /// (no real named specs, no idea) must refuse *before* claim — leaving
+    /// status `Draft` — rather than claim, purge, and fail after the fact.
+    #[tokio::test]
+    async fn only_terminal_blank_bookkeeping_is_refused_before_claim() {
+        let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+        db.insert_loop_spec(&LoopSpec {
+            id: "stale-bookkeeping".to_string(),
+            loop_id: Some(loop_id.clone()),
+            name: String::new(),
+            description: Some("prior idea text".to_string()),
+            position: 0,
+            parallelizable: false,
+            status: LoopSpecStatus::Completed,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "graph-only".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let error = engine
             .run_loop(loop_id.clone(), None, None, None, None)
             .await
-            .unwrap();
-        drop(guard);
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("no specs to run"),
+            "only bookkeeping left must look empty: {error}"
+        );
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(
+            lp.status,
+            LoopStatus::Draft,
+            "refusal must happen before claim so status stays Draft"
+        );
+        assert!(
+            db.list_loop_runs_for_loop(&loop_id).unwrap().is_empty(),
+            "a pre-claim refusal must record no run"
+        );
+    }
 
-        let specs_after = db.list_loop_specs(&loop_id).unwrap();
-        assert_eq!(
-            specs_after.len(),
-            1,
-            "the first run's placeholder must be purged, replaced by a fresh one"
+    /// (CB22) A whitespace-only `idea` does not unlock a zero-bound-spec
+    /// launch even when a top-level graph exists.
+    #[tokio::test]
+    async fn whitespace_only_idea_is_rejected_even_with_graph() {
+        let (_dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "graph-only".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let error = engine
+            .run_loop(
+                loop_id.clone(),
+                None,
+                None,
+                Some("   \n\t  ".to_string()),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("no specs to run"),
+            "whitespace idea must not count as content: {error}"
         );
-        assert_ne!(
-            specs_after[0].id, placeholder.id,
-            "the second dispatch must not reuse the first run's placeholder id"
-        );
-        let argv = std::fs::read_to_string(&argv_file).unwrap();
         assert_eq!(
-            argv.matches("===").count(),
-            2,
-            "the agent node must have run again on the second dispatch: {argv}"
+            db.get_loop(&loop_id).unwrap().unwrap().status,
+            LoopStatus::Draft
         );
     }
 

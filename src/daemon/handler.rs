@@ -4244,8 +4244,9 @@ impl TaskTriggerHandler {
             // The blank-name row a spec-less / idea-driven run binds to its
             // loop to carry `{{spec_content}}` is engine bookkeeping, not work
             // — never a user-authored spec (`loop_add_spec` rejects an empty
-            // name), so it must not surface here.
-            .filter(|s| !s.name.is_empty())
+            // name), so it must not surface here. Trimmed to match the
+            // engine's bookkeeping sentinel (`is_no_spec_placeholder`).
+            .filter(|s| !s.name.trim().is_empty())
             .collect();
 
         let include_descriptions = params.include_descriptions.unwrap_or(false);
@@ -6504,12 +6505,43 @@ impl TaskTriggerHandler {
             }
         }
 
+        // (CB22) Bound-spec content warnings: advisory only, never a tool
+        // error and never spending probe quota. Computed before the
+        // no-target early return so a loop with no agent nodes still reports
+        // its blank specs.
+        let spec_warnings: Vec<serde_json::Value> = details
+            .specs
+            .iter()
+            .filter(|s| !crate::loop_engine::LoopEngine::spec_has_content(&s.spec))
+            .map(|s| {
+                let display = if s.spec.name.trim().is_empty() {
+                    s.spec.id.clone()
+                } else {
+                    s.spec.name.clone()
+                };
+                serde_json::json!({
+                    "spec_id": s.spec.id,
+                    "warning": format!(
+                        "Spec '{}' (id '{}') has no content: both name and description are empty. Give the spec a name or description before running.",
+                        display, s.spec.id
+                    ),
+                })
+            })
+            .collect();
+
         let loop_targets = crate::daemon::probe::distinct_targets_for_loop(&details);
         if loop_targets.is_empty() {
-            return Ok(success_result(&format!(
-                "Loop '{}' has no agent nodes, ensemble members, or on_completed hook to probe.",
-                params.loop_id
-            )));
+            return Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "loop_id": params.loop_id,
+                    "message": format!(
+                        "Loop '{}' has no agent nodes, ensemble members, or on_completed hook to probe.",
+                        params.loop_id
+                    ),
+                    "spec_warnings": spec_warnings,
+                }))
+                .unwrap_or_default(),
+            )]));
         }
 
         let Some(home) = dirs::home_dir() else {
@@ -6583,6 +6615,7 @@ impl TaskTriggerHandler {
                 "unknown": crate::daemon::probe::unknown_count(&reports),
                 "probes": probes,
                 "effort_warnings": effort_warnings,
+                "spec_warnings": spec_warnings,
             }))
             .unwrap_or_default(),
         )]))
@@ -6689,7 +6722,15 @@ impl TaskTriggerHandler {
             return Ok(error_result(&e));
         }
 
-        match self.loop_engine.empty_launch_check(&loop_id, queue_id) {
+        // (CB22) Synchronous launch validation: the same check the engine's
+        // dispatch runs, so the TUI receives "what is missing" immediately
+        // instead of a misleading successful background-launch response. A
+        // run with no bound specs and no queue is refused here — the TUI
+        // must not manufacture a blank spec to fill the gap.
+        match self
+            .loop_engine
+            .empty_launch_check(&loop_id, queue_id, idea.as_deref())
+        {
             Ok(Some(message)) => return Ok(error_result(&message)),
             Ok(None) => {}
             Err(e) => return Err(internal_error(e.to_string())),
@@ -7951,10 +7992,11 @@ fn loop_details_json(db: &Database, lp: &LoopDetails) -> anyhow::Result<serde_js
     let specs = lp
         .specs
         .iter()
-        // Skip the blank-name placeholder a spec-less / idea-driven run binds
-        // to the loop to carry `{{spec_content}}`: it's engine bookkeeping,
-        // purged on the next dispatch, and must not read as a unit of work.
-        .filter(|spec| !spec.spec.name.is_empty())
+        // Skip the blank-name placeholder an idea-driven run binds to the
+        // loop to carry `{{spec_content}}`: it's engine bookkeeping (purged
+        // once terminal on the next dispatch) and must not read as work.
+        // Trimmed to match the engine's bookkeeping sentinel.
+        .filter(|spec| !spec.spec.name.trim().is_empty())
         .map(|spec| loop_spec_details_json(db, spec, lp.lp.status))
         .collect::<anyhow::Result<Vec<_>>>()?;
     let ensembles = db
@@ -20962,5 +21004,294 @@ mod endpoint_tests {
             !got.contains("hyperframes explainer"),
             "the idea placeholder must not appear in loop_get specs: {got}"
         );
+    }
+
+    /// (CB22) `loop_run` with a loop-bound spec whose name is `""` and
+    /// description is `None` is refused synchronously: the error names the
+    /// spec and the loop's status is untouched. The TUI's `run` flow sends
+    /// only `loop_id`, so this is the user-visible refusal for a loop with
+    /// no usable content and no queue.
+    #[tokio::test]
+    async fn loop_run_refuses_blank_bound_spec_and_leaves_loop_untouched() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let blank_id = uuid::Uuid::new_v4().to_string();
+        db.insert_loop_spec(&LoopSpec {
+            id: blank_id.clone(),
+            loop_id: Some(lp.id.clone()),
+            name: String::new(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+
+        let result = handler
+            .loop_run(Parameters(LoopRunParams {
+                loop_id: lp.id.clone(),
+                queue_id: None,
+                workdir: None,
+                idea: None,
+                sandbox: None,
+            }))
+            .await
+            .unwrap();
+        assert!(
+            is_err(&result),
+            "a blank bound spec must refuse the launch: {}",
+            text(&result)
+        );
+        let message = text(&result);
+        assert!(
+            message.contains(&blank_id),
+            "the refusal must name the offending spec: {message}"
+        );
+        assert!(
+            message.contains("both name and description are empty"),
+            "the refusal must say what is missing: {message}"
+        );
+
+        let stored = db.get_loop(&lp.id).unwrap().unwrap();
+        assert_eq!(
+            stored.status,
+            LoopStatus::Draft,
+            "a refused launch must leave the loop's status untouched"
+        );
+    }
+
+    /// (CB22) The TUI's loop-only dispatch is rejected synchronously when the
+    /// loop has neither bound specs nor a selected queue; no placeholder row
+    /// may be created while the background run is being started.
+    #[tokio::test]
+    async fn loop_run_refuses_when_no_specs_or_queue_are_selected() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+
+        let result = handler
+            .loop_run(Parameters(LoopRunParams {
+                loop_id: lp.id.clone(),
+                queue_id: None,
+                workdir: None,
+                idea: None,
+                sandbox: None,
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            is_err(&result),
+            "a loop-only launch without specs must be refused: {}",
+            text(&result)
+        );
+        assert!(
+            text(&result).contains("no specs to run"),
+            "the refusal must explain what is missing: {}",
+            text(&result)
+        );
+        let stored = db.get_loop(&lp.id).unwrap().unwrap();
+        assert_eq!(stored.status, LoopStatus::Draft);
+        assert!(
+            db.list_loop_specs(&lp.id).unwrap().is_empty(),
+            "the refused TUI launch must not create a blank spec"
+        );
+    }
+
+    /// (CB22) Queue isolation at the handler boundary: a `loop_run` with a
+    /// valid `queue_id` is accepted even when the loop has an unrelated
+    /// blank bound spec — queue launches validate only the queue's own
+    /// members.
+    #[tokio::test]
+    async fn loop_run_with_queue_ignores_unrelated_blank_bound_spec() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        db.insert_loop_spec(&LoopSpec {
+            id: uuid::Uuid::new_v4().to_string(),
+            loop_id: Some(lp.id.clone()),
+            name: String::new(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+
+        let member = LoopSpec {
+            id: uuid::Uuid::new_v4().to_string(),
+            loop_id: None,
+            name: "Queue Member".to_string(),
+            description: Some(valid_spec_description()),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        db.insert_loop_spec(&member).unwrap();
+        let queue_id = uuid::Uuid::new_v4().to_string();
+        db.insert_queue(&Queue {
+            id: queue_id.clone(),
+            name: queue_id.clone(),
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.append_queue_member(&queue_id, &member.id, None).unwrap();
+
+        let result = handler
+            .loop_run(Parameters(LoopRunParams {
+                loop_id: lp.id.clone(),
+                queue_id: Some(queue_id),
+                workdir: None,
+                idea: None,
+                sandbox: None,
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !is_err(&result),
+            "a valid queue launch must ignore the unrelated blank bound spec: {}",
+            text(&result)
+        );
+    }
+
+    /// (CB22) `loop_preflight` reports a blank bound spec as a structured
+    /// `spec_warnings` entry — advisory, not a tool error — including when
+    /// the loop has no agent targets to probe.
+    #[tokio::test]
+    async fn loop_preflight_warns_for_blank_bound_spec_without_probe_targets() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let blank_id = uuid::Uuid::new_v4().to_string();
+        db.insert_loop_spec(&LoopSpec {
+            id: blank_id.clone(),
+            loop_id: Some(lp.id.clone()),
+            name: String::new(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+
+        let result = handler
+            .loop_preflight(Parameters(LoopPreflightParams {
+                loop_id: lp.id.clone(),
+                timeout_seconds: None,
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !is_err(&result),
+            "a preflight warning must not be a tool error: {}",
+            text(&result)
+        );
+        let body: serde_json::Value = serde_json::from_str(&raw_text(&result)).unwrap();
+        let warnings = body["spec_warnings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("preflight must include spec_warnings: {body}"));
+        assert_eq!(warnings.len(), 1, "expected one warning: {body}");
+        assert_eq!(warnings[0]["spec_id"], blank_id);
+        assert!(
+            warnings[0]["warning"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("both name and description are empty"),
+            "the warning must say what is missing: {body}"
+        );
+    }
+
+    /// (CB22) `loop_preflight` includes `spec_warnings` alongside real probe
+    /// results. The agent node references a deliberately unconfigured
+    /// platform, so the probe reports `NotConfigured` immediately without
+    /// spawning anything or spending quota.
+    #[tokio::test]
+    async fn loop_preflight_includes_spec_warnings_alongside_probes() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let blank_id = uuid::Uuid::new_v4().to_string();
+        db.insert_loop_spec(&LoopSpec {
+            id: blank_id.clone(),
+            loop_id: Some(lp.id.clone()),
+            name: String::new(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: uuid::Uuid::new_v4().to_string(),
+            spec_id: None,
+            loop_id: Some(lp.id.clone()),
+            name: "impl".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "cb22-unconfigured-platform"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let result = handler
+            .loop_preflight(Parameters(LoopPreflightParams {
+                loop_id: lp.id.clone(),
+                timeout_seconds: Some(5),
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !is_err(&result),
+            "a preflight warning must not be a tool error: {}",
+            text(&result)
+        );
+        let body: serde_json::Value = serde_json::from_str(&raw_text(&result)).unwrap();
+        assert!(
+            body["probes"]
+                .as_array()
+                .is_some_and(|probes| !probes.is_empty()),
+            "expected probe results alongside the warning: {body}"
+        );
+        let warnings = body["spec_warnings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("preflight must include spec_warnings: {body}"));
+        assert_eq!(warnings.len(), 1, "expected one warning: {body}");
+        assert_eq!(warnings[0]["spec_id"], blank_id);
     }
 }
