@@ -6623,6 +6623,7 @@ impl TaskTriggerHandler {
             "loop_id": lp.id,
             "name": lp.name,
             "nodes_missing_platform": missing_platform,
+            "terminals": plan.terminals,
         })))
     }
 
@@ -6919,7 +6920,7 @@ impl TaskTriggerHandler {
 
         // Graph-level structural validation (CB8) — same validate_loop_graph
         // used by loop_import, before spending quota on platform probes.
-        {
+        let terminal_list: Vec<String> = {
             let router_labels: Vec<Vec<String>> = details
                 .graph_nodes
                 .iter()
@@ -6963,21 +6964,41 @@ impl TaskTriggerHandler {
                     condition: &e.condition,
                 })
                 .collect();
-            if let Err(e) = crate::domain::validation::validate_loop_graph(&node_views, &edge_views)
-            {
-                // The validator names nodes by id; a live graph's ids are
-                // opaque UUIDs, so enrich with the display name where we can
-                // (same treatment loop_import gives its message).
-                let mut enriched = e;
-                for n in &details.graph_nodes {
-                    if enriched.contains(n.id.as_str()) {
-                        enriched =
-                            enriched.replace(n.id.as_str(), &format!("{} ({})", n.name, n.id));
+            let validation_report =
+                match crate::domain::validation::validate_loop_graph(&node_views, &edge_views) {
+                    Ok(report) => report,
+                    Err(e) => {
+                        // The validator names nodes by id; a live graph's ids are
+                        // opaque UUIDs, so enrich with the display name where we can
+                        // (same treatment loop_import gives its message).
+                        let mut enriched = e;
+                        for n in &details.graph_nodes {
+                            if enriched.contains(n.id.as_str()) {
+                                enriched = enriched
+                                    .replace(n.id.as_str(), &format!("{} ({})", n.name, n.id));
+                            }
+                        }
+                        return Ok(error_result(&enriched));
                     }
-                }
-                return Ok(error_result(&enriched));
-            }
-        }
+                };
+            // Terminal exits are informational: a state with no outgoing edge
+            // ends the run there (the engine treats a missing edge as an
+            // ending). Name nodes the way the operator sees them — by name,
+            // with the id in parentheses, matching the error text's shape.
+            validation_report
+                .terminals
+                .iter()
+                .map(|t| {
+                    let display = details
+                        .graph_nodes
+                        .iter()
+                        .find(|n| n.id == t.node_id)
+                        .map(|n| format!("{} ({})", n.name, n.id))
+                        .unwrap_or_else(|| t.node_id.clone());
+                    format!("{} ends on '{}'", display, t.state)
+                })
+                .collect()
+        };
 
         // CM1: validate {{output:NodeName}} references
         {
@@ -7059,6 +7080,7 @@ impl TaskTriggerHandler {
                     ),
                     "spec_warnings": spec_warnings,
                     "review": reviewer_out,
+                    "terminals": terminal_list,
                 }))
                 .unwrap_or_default(),
             )]));
@@ -7137,6 +7159,7 @@ impl TaskTriggerHandler {
                 "effort_warnings": effort_warnings,
                 "spec_warnings": spec_warnings,
                 "review": reviewer_out,
+                "terminals": terminal_list,
             }))
             .unwrap_or_default(),
         )]))
@@ -17422,6 +17445,9 @@ mod endpoint_tests {
             .collect();
         assert!(missing.contains(&"implementer"));
         assert!(missing.contains(&"committer"));
+        assert!(body["terminals"]
+            .as_array()
+            .is_some_and(|terminals| !terminals.is_empty()));
 
         let nodes = db.list_loop_nodes_for_loop(&new_loop_id).unwrap();
         assert_eq!(nodes.len(), 3);

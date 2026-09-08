@@ -172,6 +172,22 @@ pub fn validate_ensembles_in_graph(
     Ok(())
 }
 
+/// A state that ends the graph — a node with no outgoing edge for that state.
+/// Informational; does not affect the Ok verdict.
+#[derive(Debug)]
+pub struct GraphTerminal {
+    pub node_id: String,
+    /// "pass" or "fail"
+    pub state: String,
+}
+
+/// Result of structural graph validation.
+#[derive(Debug)]
+pub struct GraphValidationReport {
+    /// Nodes where a state ends the graph (no outgoing edge for that state).
+    pub terminals: Vec<GraphTerminal>,
+}
+
 /// A node as seen by graph-level validation — identified by an opaque
 /// string (a name in an import document, an id in a live graph).
 pub struct GraphNodeView<'a> {
@@ -195,15 +211,18 @@ pub struct GraphEdgeView<'a> {
 /// 1. Every edge references nodes that exist in the graph.
 /// 2. Exactly one entry point (node with no incoming edges). Zero or 2+ is an error.
 /// 3. Every node is reachable from the entry point via outgoing edges.
-/// 4. Every agent/check/gate node has outgoing coverage for both `pass` and `fail`
-///    (an `always` edge covers both). Every router node has an outgoing edge for
-///    each of its declared routes. Join nodes are skipped (engine-managed).
+/// 4. Outgoing coverage — a state with no outgoing edge is a terminal exit,
+///    reported in [`GraphValidationReport::terminals`], not an error. Every
+///    router node still requires an outgoing edge for each of its declared
+///    routes. Join nodes are skipped (engine-managed).
 pub fn validate_loop_graph(
     nodes: &[GraphNodeView<'_>],
     edges: &[GraphEdgeView<'_>],
-) -> Result<(), String> {
+) -> Result<GraphValidationReport, String> {
     if nodes.is_empty() {
-        return Ok(());
+        return Ok(GraphValidationReport {
+            terminals: Vec::new(),
+        });
     }
 
     let node_ids: HashSet<&str> = nodes.iter().map(|n| n.id).collect();
@@ -220,6 +239,24 @@ pub fn validate_loop_graph(
             return Err(format!(
                 "Edge '{}' -> '{}' references unknown node '{}'.",
                 edge.from, edge.to, edge.to
+            ));
+        }
+    }
+
+    for edge in edges {
+        let Some(label) = edge.condition.route_label() else {
+            continue;
+        };
+        let source = nodes
+            .iter()
+            .find(|node| node.id == edge.from)
+            .expect("edge endpoints were validated above");
+        if source.kind != LoopNodeKind::Router
+            || !source.route_labels.iter().any(|declared| declared == label)
+        {
+            return Err(format!(
+                "Edge '{}' -> '{}' uses undeclared route '{}' on source node '{}'.",
+                edge.from, edge.to, label, edge.from
             ));
         }
     }
@@ -284,33 +321,37 @@ pub fn validate_loop_graph(
         ));
     }
 
-    // 4. Outgoing coverage.
+    // 4. Outgoing coverage — collect terminals (states with no outgoing edge).
     let mut outgoing: HashMap<&str, Vec<&LoopEdgeCondition>> = HashMap::new();
     for edge in edges {
         outgoing.entry(edge.from).or_default().push(edge.condition);
     }
 
+    let mut terminals: Vec<GraphTerminal> = Vec::new();
+
     for node in nodes {
         if node.kind == LoopNodeKind::Join {
             continue;
         }
-        let outgoing_for_node = outgoing.get(node.id);
-        // Leaf nodes (no outgoing edges at all) terminate the spec — the
-        // engine treats a missing outgoing as spec completion (pass) or
-        // spec failure (fail) without requiring an explicit edge. Requiring
-        // coverage there would make every linear chain invalid and break the
-        // "existing valid graph still imports" non-functional requirement.
-        // A router with no outgoing at all is also the valid "not yet wired"
-        // state (see validate_router_route_coverage's early return).
-        if outgoing_for_node.is_none() {
-            continue;
-        }
         if node.kind == LoopNodeKind::Router {
+            // Router route coverage is still required — a router missing a route
+            // edge is a broken graph, not a terminal.
+            let outgoing_for_node = outgoing.get(node.id);
+            if outgoing_for_node.is_none() {
+                continue; // unwired router, not yet an error
+            }
             let conds = outgoing_for_node.expect("just checked Some");
-            // If this router has no route edges at all, it's not yet wired.
             let has_any_route = conds.iter().any(|c| c.route_label().is_some());
             if !has_any_route {
                 continue;
+            }
+            for label in conds.iter().filter_map(|condition| condition.route_label()) {
+                if !node.route_labels.iter().any(|declared| declared == label) {
+                    return Err(format!(
+                        "Router node '{}' has outgoing edge for undeclared route '{}'.",
+                        node.id, label
+                    ));
+                }
             }
             for label in node.route_labels {
                 let has_route = conds
@@ -325,13 +366,24 @@ pub fn validate_loop_graph(
             }
             continue;
         }
-        // Agent / Check / Gate — must have both pass and fail coverage when
-        // they have any outgoing at all (missing fail is the demonstrator
-        // bug: the resilience node had no fail edge).
+        // Agent / Check / Gate — missing pass or fail is a terminal, not an error.
         if matches!(
             node.kind,
             LoopNodeKind::Agent | LoopNodeKind::Check | LoopNodeKind::Gate
         ) {
+            let outgoing_for_node = outgoing.get(node.id);
+            if outgoing_for_node.is_none() {
+                // No outgoing at all — both states terminate here.
+                terminals.push(GraphTerminal {
+                    node_id: node.id.to_string(),
+                    state: "pass".to_string(),
+                });
+                terminals.push(GraphTerminal {
+                    node_id: node.id.to_string(),
+                    state: "fail".to_string(),
+                });
+                continue;
+            }
             let conds = outgoing_for_node.expect("just checked Some");
             let has_pass = conds
                 .iter()
@@ -342,21 +394,21 @@ pub fn validate_loop_graph(
                     || **c == LoopEdgeCondition::Break
             });
             if !has_pass {
-                return Err(format!(
-                    "Node '{}' has no outgoing edge for state 'pass' (expected a 'pass' or 'always' edge).",
-                    node.id
-                ));
+                terminals.push(GraphTerminal {
+                    node_id: node.id.to_string(),
+                    state: "pass".to_string(),
+                });
             }
             if !has_fail {
-                return Err(format!(
-                    "Node '{}' has no outgoing edge for state 'fail' (expected a 'fail' or 'always' edge).",
-                    node.id
-                ));
+                terminals.push(GraphTerminal {
+                    node_id: node.id.to_string(),
+                    state: "fail".to_string(),
+                });
             }
         }
     }
 
-    Ok(())
+    Ok(GraphValidationReport { terminals })
 }
 
 #[cfg(test)]

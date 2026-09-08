@@ -356,6 +356,9 @@ pub struct LoopImportPlan {
     pub nodes: Vec<LoopNode>,
     pub edges: Vec<LoopEdge>,
     pub ensembles: Vec<LoopImportEnsemblePlan>,
+    /// Terminal exits reported by structural validation, formatted for
+    /// operators with the node name and id.
+    pub terminals: Vec<String>,
     /// CM2: resolved infra node id (from the document's `infra_node` name),
     /// or `None` when the document has no infra node.
     pub infra_node_id: Option<String>,
@@ -694,7 +697,7 @@ pub fn build_import_plan(
     // member/join nodes and wiring, so a document whose plain nodes appear
     // disconnected (kickoff/downstream with only ensemble bridging them) is
     // correctly considered connected.
-    {
+    let terminals = {
         let router_labels: Vec<Vec<String>> = all_nodes
             .iter()
             .map(|n| {
@@ -722,23 +725,37 @@ pub fn build_import_plan(
                 condition: &e.condition,
             })
             .collect();
-        if let Err(e) = validate_loop_graph(&node_views, &edge_views) {
-            // For import, the document names are more actionable than fresh
-            // UUIDs, so enrich the message with names where we can resolve them.
-            let mut enriched = e;
-            // Try to map UUIDs back to names for friendlier messages: build id->name map.
-            let id_to_name: std::collections::HashMap<&str, &str> = all_nodes
-                .iter()
-                .map(|n| (n.id.as_str(), n.name.as_str()))
-                .collect();
-            for (id, name) in id_to_name {
-                if enriched.contains(id) {
-                    enriched = enriched.replace(id, &format!("{name} ({id})"));
+        match validate_loop_graph(&node_views, &edge_views) {
+            Ok(report) => report
+                .terminals
+                .into_iter()
+                .map(|terminal| {
+                    let display = all_nodes
+                        .iter()
+                        .find(|node| node.id == terminal.node_id)
+                        .map(|node| format!("{} ({})", node.name, node.id))
+                        .unwrap_or(terminal.node_id);
+                    format!("{} ends on '{}'", display, terminal.state)
+                })
+                .collect(),
+            Err(e) => {
+                // For import, the document names are more actionable than fresh
+                // UUIDs, so enrich the message with names where we can resolve them.
+                let mut enriched = e;
+                // Try to map UUIDs back to names for friendlier messages: build id->name map.
+                let id_to_name: std::collections::HashMap<&str, &str> = all_nodes
+                    .iter()
+                    .map(|n| (n.id.as_str(), n.name.as_str()))
+                    .collect();
+                for (id, name) in id_to_name {
+                    if enriched.contains(id) {
+                        enriched = enriched.replace(id, &format!("{name} ({id})"));
+                    }
                 }
+                return Err(enriched);
             }
-            return Err(enriched);
         }
-    }
+    };
 
     let infra_node_id = document.infra_node.as_deref().map(resolve).transpose()?;
 
@@ -746,6 +763,7 @@ pub fn build_import_plan(
         nodes,
         edges,
         ensembles,
+        terminals,
         infra_node_id,
     })
 }
@@ -1404,8 +1422,9 @@ mod tests {
     }
 
     #[test]
-    fn import_plan_rejects_agent_missing_fail_edge() {
-        // Resilience node with only pass edge -> missing fail
+    fn import_plan_accepts_agent_missing_fail_edge_as_terminal() {
+        // Resilience node with only pass edge -> fail is a terminal exit,
+        // not an error (same verdict as loop_preflight).
         let doc = LoopExportDocument {
             format_version: 1,
             name: "x".to_string(),
@@ -1432,9 +1451,15 @@ mod tests {
             ensembles: vec![],
             infra_node: None,
         };
-        let err = build_import_plan(&doc, "new-loop").unwrap_err();
-        assert!(err.contains("resilience"), "err: {err}");
-        assert!(err.to_lowercase().contains("fail"), "err: {err}");
+        let plan =
+            build_import_plan(&doc, "new-loop").expect("missing fail is a terminal, not an error");
+        assert_eq!(plan.nodes.len(), 2);
+        assert_eq!(plan.terminals.len(), 3);
+        assert!(plan
+            .terminals
+            .iter()
+            .any(|terminal| terminal.starts_with("resilience (")
+                && terminal.ends_with(") ends on 'fail'")));
     }
 
     #[test]

@@ -390,27 +390,113 @@ mod graph_validation {
     }
 
     #[test]
-    fn rejects_agent_node_missing_fail_edge() {
-        // A (agent) -> B (agent), only pass edge from A (fail missing)
+    fn accepts_agent_node_missing_fail_edge_as_terminal() {
+        // A (agent) -> B (agent), only pass edge from A (fail is terminal)
         let pass = LoopEdgeCondition::Pass;
         let nodes = vec![agent_node("resilience"), agent_node("B")];
         let edges = vec![edge("resilience", "B", &pass)];
-        let err = validate_loop_graph(&nodes, &edges).unwrap_err();
-        assert!(err.contains("resilience"), "err should name node: {err}");
+        let report = validate_loop_graph(&nodes, &edges).expect("should validate");
         assert!(
-            err.to_lowercase().contains("fail"),
-            "err should mention fail: {err}"
+            report
+                .terminals
+                .iter()
+                .any(|t| t.node_id == "resilience" && t.state == "fail"),
+            "terminals should include resilience/fail: {:?}",
+            report.terminals
         );
     }
 
     #[test]
-    fn rejects_agent_node_missing_pass_edge() {
+    fn accepts_agent_node_missing_pass_edge_as_terminal() {
         let fail = LoopEdgeCondition::Fail;
         let nodes = vec![agent_node("resilience"), agent_node("B")];
         let edges = vec![edge("resilience", "B", &fail)];
-        let err = validate_loop_graph(&nodes, &edges).unwrap_err();
-        assert!(err.contains("resilience"), "err: {err}");
-        assert!(err.to_lowercase().contains("pass"), "err: {err}");
+        let report = validate_loop_graph(&nodes, &edges).expect("should validate");
+        assert!(
+            report
+                .terminals
+                .iter()
+                .any(|t| t.node_id == "resilience" && t.state == "pass"),
+            "terminals should include resilience/pass: {:?}",
+            report.terminals
+        );
+    }
+
+    /// Spec guideline: "A graph whose only 'violation' is a node with no `fail` edge
+    /// validates, and the terminal appears in the reported list."
+    #[test]
+    fn terminal_reported_for_missing_fail_edge() {
+        let pass = LoopEdgeCondition::Pass;
+        let nodes = vec![agent_node("A"), agent_node("B")];
+        let edges = vec![edge("A", "B", &pass)];
+        let report = validate_loop_graph(&nodes, &edges).unwrap();
+        assert!(report
+            .terminals
+            .iter()
+            .any(|t| t.node_id == "A" && t.state == "fail"));
+    }
+
+    /// Spec guideline: "The real shape of `cascade-v2-sonnet-fixes` — a resilience
+    /// node ending on `fail`, and a last node ending on `pass` — validates as a fixture."
+    #[test]
+    fn accepts_cascade_shape_with_two_terminals() {
+        // Entry -> Resilience -[pass]-> Next -[pass]-> Last (leaf)
+        // Resilience has no fail edge (terminal), Last has no outgoing (both terminals)
+        let pass = LoopEdgeCondition::Pass;
+        let nodes = vec![
+            agent_node("Entry"),
+            agent_node("Resilience"),
+            agent_node("Next"),
+            agent_node("Last"),
+        ];
+        let edges = vec![
+            edge("Entry", "Resilience", &pass),
+            edge("Resilience", "Next", &pass),
+            edge("Next", "Last", &pass),
+        ];
+        let report = validate_loop_graph(&nodes, &edges).expect("should validate");
+        // Resilience ends on fail
+        assert!(report
+            .terminals
+            .iter()
+            .any(|t| t.node_id == "Resilience" && t.state == "fail"));
+        // Last ends on both pass and fail (leaf node)
+        assert!(report
+            .terminals
+            .iter()
+            .any(|t| t.node_id == "Last" && t.state == "pass"));
+        assert!(report
+            .terminals
+            .iter()
+            .any(|t| t.node_id == "Last" && t.state == "fail"));
+    }
+
+    /// Spec guideline: "A graph with two terminals reports both in a single call."
+    #[test]
+    fn reports_multiple_terminals_in_single_call() {
+        // A -[pass]-> B, A -[fail]-> C, B and C are leaves (both terminals)
+        let pass = LoopEdgeCondition::Pass;
+        let fail = LoopEdgeCondition::Fail;
+        let nodes = vec![agent_node("A"), agent_node("B"), agent_node("C")];
+        let edges = vec![edge("A", "B", &pass), edge("A", "C", &fail)];
+        let report = validate_loop_graph(&nodes, &edges).unwrap();
+        // B and C are leaves so they each have both pass and fail terminals
+        assert!(report
+            .terminals
+            .iter()
+            .any(|t| t.node_id == "B" && t.state == "pass"));
+        assert!(report
+            .terminals
+            .iter()
+            .any(|t| t.node_id == "B" && t.state == "fail"));
+        assert!(report
+            .terminals
+            .iter()
+            .any(|t| t.node_id == "C" && t.state == "pass"));
+        assert!(report
+            .terminals
+            .iter()
+            .any(|t| t.node_id == "C" && t.state == "fail"));
     }
 
     #[test]
@@ -442,6 +528,17 @@ mod graph_validation {
             err.contains("reject"),
             "err should name missing route: {err}"
         );
+    }
+
+    #[test]
+    fn rejects_router_edge_for_undeclared_route() {
+        let route = LoopEdgeCondition::Route("unexpected".to_string());
+        let labels = vec!["approve".to_string()];
+        let nodes = vec![router_node("router", &labels), agent_node("next")];
+        let edges = vec![edge("router", "next", &route)];
+        let err = validate_loop_graph(&nodes, &edges).unwrap_err();
+        assert!(err.contains("undeclared route"), "err: {err}");
+        assert!(err.contains("unexpected"), "err: {err}");
     }
 
     #[test]
@@ -498,17 +595,17 @@ mod graph_validation {
         assert!(validate_loop_graph(&nodes, &edges).is_ok());
     }
 
-    /// CM2: `Break` alone (without `Pass`) still fails validation — pass
-    /// coverage is separate from fail coverage.
+    /// CM2: `Break` alone (without `Pass`) — pass is a terminal, not an error.
     #[test]
-    fn rejects_agent_node_with_only_break_edge() {
+    fn accepts_agent_node_with_only_break_edge_pass_is_terminal() {
         let brk = LoopEdgeCondition::Break;
         let nodes = vec![agent_node("A"), agent_node("B")];
         let edges = vec![edge("A", "B", &brk)];
-        let err = validate_loop_graph(&nodes, &edges).unwrap_err();
-        assert!(
-            err.to_lowercase().contains("pass"),
-            "err should mention missing pass: {err}"
-        );
+        let report = validate_loop_graph(&nodes, &edges).expect("should validate");
+        // A has break (covers fail) but no pass — pass is terminal
+        assert!(report
+            .terminals
+            .iter()
+            .any(|t| t.node_id == "A" && t.state == "pass"));
     }
 }
