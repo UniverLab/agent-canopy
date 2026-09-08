@@ -392,15 +392,31 @@ impl Executor {
         if let Some(reason) = &effort_reason {
             tracing::warn!("agent '{}': effort not applied — {}", params.id, reason);
         }
-        let with_effort_notice = |stderr: &[u8]| -> Vec<u8> {
-            match &effort_reason {
-                Some(reason) => {
-                    let mut out = format!("[canopy] effort not applied: {reason}\n").into_bytes();
-                    out.extend_from_slice(stderr);
-                    out
-                }
-                None => stderr.to_vec(),
+
+        // CB34: same for a `model` a model-flagless platform can't honour —
+        // recorded in the agent's own run log, not silently dropped.
+        let model_reason = params.model.and_then(|m| {
+            crate::domain::cli_config::model_rejection_reason(
+                params.cli.strategy().model_flag.as_deref(),
+                params.cli.as_str(),
+                m,
+            )
+        });
+        if let Some(reason) = &model_reason {
+            tracing::warn!("agent '{}': model not applied — {}", params.id, reason);
+        }
+
+        let with_notices = |stderr: &[u8]| -> Vec<u8> {
+            let mut prefix = String::new();
+            if let Some(reason) = &effort_reason {
+                prefix.push_str(&format!("[canopy] effort not applied: {reason}\n"));
             }
+            if let Some(reason) = &model_reason {
+                prefix.push_str(&format!("[canopy] model not applied: {reason}\n"));
+            }
+            let mut out = prefix.into_bytes();
+            out.extend_from_slice(stderr);
+            out
         };
 
         let started_at = Utc::now();
@@ -417,7 +433,7 @@ impl Executor {
                     &started_at,
                     code,
                     &out.stdout,
-                    &with_effort_notice(&out.stderr),
+                    &with_notices(&out.stderr),
                 )?;
                 (code, success)
             }
@@ -430,7 +446,7 @@ impl Executor {
                     &started_at,
                     -1,
                     &[],
-                    &with_effort_notice(e.to_string().as_bytes()),
+                    &with_notices(e.to_string().as_bytes()),
                 )?;
                 (-1, false)
             }

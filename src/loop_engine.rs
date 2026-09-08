@@ -4736,6 +4736,26 @@ fn effort_notice(
     .map(serde_json::Value::from)
 }
 
+/// CB34 mirror of [`effort_notice`]: a `model` requested on a platform whose
+/// `model_flag` is absent or blank cannot be honoured. Record that fact in
+/// the run record — named platform, named model — rather than silently
+/// dropping it (the `yolo_flag`-in-headless mistake the effort rule exists to
+/// avoid repeating). `None` when no model was requested or the platform can
+/// select one.
+fn model_notice(
+    platform: &str,
+    strategy: &crate::domain::cli_strategy::CliStrategy,
+    model: Option<&str>,
+) -> Option<serde_json::Value> {
+    let model = model?;
+    crate::domain::cli_config::model_rejection_reason(
+        strategy.model_flag.as_deref(),
+        platform,
+        model,
+    )
+    .map(serde_json::Value::from)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_process(
     db: &Database,
@@ -4798,6 +4818,7 @@ async fn run_agent_process(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let effort_not_applied = effort_notice(cli.as_str(), strategy, effort);
+    let model_not_applied = model_notice(cli.as_str(), strategy, model);
     let outcome = spawn_and_wait_cli_process(
         strategy,
         prompt,
@@ -4840,6 +4861,11 @@ async fn run_agent_process(
                     );
                 }
             }
+            if let Some(notice) = &model_not_applied {
+                if let serde_json::Value::Object(map) = &mut exec.output {
+                    map.insert("model_not_applied".to_string(), notice.clone());
+                }
+            }
             Ok(exec)
         }
         Ok(CliProcessOutcome::TimedOut) => {
@@ -4862,6 +4888,11 @@ async fn run_agent_process(
                         "effort_applied".to_string(),
                         serde_json::Value::String(e.to_string()),
                     );
+                }
+            }
+            if let Some(notice) = &model_not_applied {
+                if let serde_json::Value::Object(map) = &mut output {
+                    map.insert("model_not_applied".to_string(), notice.clone());
                 }
             }
             let _ = db.update_loop_run_result(
@@ -4911,6 +4942,11 @@ async fn run_agent_process(
                         "effort_applied".to_string(),
                         serde_json::Value::String(e.to_string()),
                     );
+                }
+            }
+            if let Some(notice) = &model_not_applied {
+                if let serde_json::Value::Object(map) = &mut exec.output {
+                    map.insert("model_not_applied".to_string(), notice.clone());
                 }
             }
             Ok(exec)
@@ -10278,6 +10314,78 @@ echo done
             Some("high")
         );
         assert!(execution.output.get("effort_not_applied").is_none());
+    }
+
+    /// CB34: a `model` requested on a platform whose `model_flag` is blank
+    /// (antigravity) must land in the run record as an explicit not-applied
+    /// notice, naming platform and model — not vanish.
+    #[tokio::test]
+    async fn run_agent_process_records_model_not_applied_when_flag_blank() {
+        let (dir, db) = test_db();
+        let cli = Cli::new("test-cli");
+        let script = write_member_script(dir.path(), "ok.sh", "printf ok");
+        let mut strategy = sample_strategy(&script);
+        strategy.model_flag = Some(String::new());
+        let node = sample_agent_node();
+
+        let execution = run_agent_process(
+            &db,
+            "run-model-blank",
+            &cli,
+            &strategy,
+            &node,
+            "prompt",
+            Some("claude-opus-4-8"),
+            None,
+            "/tmp",
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let notice = execution
+            .output
+            .get("model_not_applied")
+            .and_then(Value::as_str)
+            .expect("model_not_applied must be in the run record");
+        assert!(
+            notice.contains("test-cli"),
+            "notice names the platform: {notice}"
+        );
+        assert!(
+            notice.contains("claude-opus-4-8"),
+            "notice names the model: {notice}"
+        );
+    }
+
+    /// The mirror: a real `model_flag` carries no not-applied notice.
+    #[tokio::test]
+    async fn run_agent_process_no_model_notice_when_flag_is_real() {
+        let (dir, db) = test_db();
+        let cli = Cli::new("test-cli");
+        let script = write_member_script(dir.path(), "ok.sh", "printf ok");
+        let mut strategy = sample_strategy(&script);
+        strategy.model_flag = Some("--model".to_string());
+        let node = sample_agent_node();
+
+        let execution = run_agent_process(
+            &db,
+            "run-model-real",
+            &cli,
+            &strategy,
+            &node,
+            "prompt",
+            Some("claude-opus-4-8"),
+            None,
+            "/tmp",
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(execution.output.get("model_not_applied").is_none());
     }
 
     /// C3: the 2026-08-13 `gitkit-composition` incident, reproduced with the

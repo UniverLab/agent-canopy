@@ -8620,7 +8620,7 @@ fn platform_model_selection_warning(platform: &str) -> Option<String> {
     let home = dirs::home_dir()?;
     let config = crate::domain::canopy_config::CanopyConfig::load(&home.join(".canopy"));
     let cli = config.get_cli(platform)?;
-    if cli.model_flag.is_some() {
+    if crate::domain::cli_config::model_flag_selects_model(cli.model_flag.as_deref()) {
         return None;
     }
     Some(format!(

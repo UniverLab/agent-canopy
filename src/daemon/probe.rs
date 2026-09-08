@@ -248,15 +248,15 @@ pub(crate) async fn probe_target(
 
     let strategy = CliStrategy::from_cli_config(cli_config);
 
-    // A model was requested but this platform's CLI has no flag to select
-    // one — `CliStrategy::build_command` would silently drop it and probe
-    // the bare default instead, which is exactly how the 2026-08-13
+    // A model was requested but this platform's CLI has no usable model flag
+    // (absent or blank) — `CliStrategy::build_command` would silently drop it
+    // and probe the bare default instead, which is exactly how the 2026-08-13
     // `mistral` pair was wrongly reported `reachable`: the probe validated
     // a different pair than the one a real node run would use. Report
     // `Unknown` without spawning rather than pretend the specific model was
     // exercised.
     if let Some(model) = target.model.as_deref() {
-        if strategy.model_flag.is_none() {
+        if !crate::domain::cli_config::model_flag_selects_model(strategy.model_flag.as_deref()) {
             return ProbeReport {
                 platform: target.platform.clone(),
                 model: target.model.clone(),
@@ -264,8 +264,8 @@ pub(crate) async fn probe_target(
                 duration_ms: start.elapsed().as_millis(),
                 error: Some(format!(
                     "Platform '{}' has no configured way to select a model explicitly \
-                     (no model_flag) — cannot validate model '{}' end-to-end. Omit `model` \
-                     to probe the platform's own default instead.",
+                     (no usable model_flag) — cannot validate model '{}' end-to-end. Omit \
+                     `model` to probe the platform's own default instead.",
                     target.platform, model
                 )),
             };
@@ -855,6 +855,27 @@ mod tests {
         };
         let report = probe_target(&config, &target, None, Duration::from_secs(5)).await;
         assert_eq!(report.outcome, ProbeOutcome::Reachable);
+    }
+
+    /// CB34: antigravity's `model_flag = ""` — a blank flag is not a flag. A
+    /// specific `model` was requested and cannot be honoured, so the pair is
+    /// `Unknown` ("cannot select a model"), never `Broken` and never `Reachable`.
+    /// The stub script would look healthy if it ran, proving the verdict is
+    /// pre-spawn.
+    #[tokio::test]
+    async fn probe_target_reports_unknown_when_model_flag_is_blank() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_script(&dir, "blank-model-flag-cli", "echo \"$1\"\n");
+        let mut config = config_with_cli("blank-model-flag", &script);
+        config.clis[0].model_flag = Some(String::new());
+        let target = ProbeTarget {
+            platform: "blank-model-flag".to_string(),
+            model: Some("claude-opus-4-8".to_string()),
+            effort: None,
+        };
+        let report = probe_target(&config, &target, None, Duration::from_secs(5)).await;
+        assert_eq!(report.outcome, ProbeOutcome::Unknown);
+        assert!(!report.outcome.reachable());
     }
 
     /// A harness that hangs past the timeout must report `TimedOut`,

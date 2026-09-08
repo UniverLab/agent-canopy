@@ -196,6 +196,35 @@ pub fn effort_rejection_reason(
     }
 }
 
+/// Whether `model_flag` names a real model-selection flag. `None` (the
+/// platform never declared one) and a blank string (CB34 — antigravity's
+/// `model_flag = ""`, which was being emitted as a stray empty argv word the
+/// CLI rejects before the run starts) both mean "this platform cannot select
+/// a model explicitly". The invocation path, the probe and `loop_preflight`
+/// all read this one function so they can never disagree.
+pub fn model_flag_selects_model(model_flag: Option<&str>) -> bool {
+    matches!(model_flag, Some(f) if !f.trim().is_empty())
+}
+
+/// The one place the "why `model = value` won't apply on `platform`" wording
+/// is produced, mirroring [`effort_rejection_reason`]. `None` means the model
+/// WILL be applied. `Some(msg)` names both the platform and the model that
+/// was asked for and could not be honoured — never a silent drop, never a
+/// silent fallback to a default.
+pub fn model_rejection_reason(
+    model_flag: Option<&str>,
+    platform: &str,
+    model: &str,
+) -> Option<String> {
+    if model_flag_selects_model(model_flag) {
+        None
+    } else {
+        Some(format!(
+            "platform '{platform}' cannot select a model; requested model '{model}' was not applied"
+        ))
+    }
+}
+
 fn default_paste_submit_presses() -> u8 {
     1
 }
@@ -794,5 +823,37 @@ mod tests {
             r.as_deref(),
             Some("value 'ultra' not in platform's accepted values: [low, high]")
         );
+    }
+
+    #[test]
+    fn model_flag_selects_model_true_only_for_nonblank() {
+        assert!(model_flag_selects_model(Some("--model")));
+        assert!(!model_flag_selects_model(Some("")));
+        assert!(!model_flag_selects_model(Some("   ")));
+        assert!(!model_flag_selects_model(None));
+    }
+
+    #[test]
+    fn model_rejection_reason_none_when_flag_is_real() {
+        assert_eq!(
+            model_rejection_reason(Some("--model"), "codex", "gpt-5"),
+            None
+        );
+    }
+
+    #[test]
+    fn model_rejection_reason_names_platform_and_model_when_flag_blank() {
+        let r = model_rejection_reason(Some(""), "antigravity", "claude-opus-4-8")
+            .expect("blank model_flag must produce a reason");
+        assert!(r.contains("antigravity"), "must name the platform: {r}");
+        assert!(r.contains("claude-opus-4-8"), "must name the model: {r}");
+    }
+
+    #[test]
+    fn model_rejection_reason_names_platform_and_model_when_flag_absent() {
+        let r = model_rejection_reason(None, "mistral", "mistral-medium-latest")
+            .expect("absent model_flag must produce a reason");
+        assert!(r.contains("mistral"));
+        assert!(r.contains("mistral-medium-latest"));
     }
 }

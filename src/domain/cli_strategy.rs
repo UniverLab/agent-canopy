@@ -205,6 +205,15 @@ impl CliStrategy {
         }
     }
 
+    /// The model-selection flag, but only when it names one. `None` when the
+    /// platform has no `model_flag` OR it is blank (`model_flag = ""`) — in
+    /// both cases a requested model must be omitted from argv entirely, never
+    /// rendered as an empty word or a bare value.
+    fn selectable_model_flag(&self) -> Option<&str> {
+        let f = self.model_flag.as_deref()?;
+        crate::domain::cli_config::model_flag_selects_model(Some(f)).then_some(f)
+    }
+
     /// Return a copy of this strategy with `prompt_via_stdin` forced to
     /// `true`. Used by the loop engine when the composed prompt exceeds
     /// the OS argv size limit — delivering via stdin avoids E2BIG
@@ -495,9 +504,14 @@ impl CliStrategy {
                 cmd.stdin(std::process::Stdio::null());
             }
 
-            // Add model if specified
+            // Add model if specified — but only when the platform actually
+            // declares a way to select one. A blank `model_flag` (CB34,
+            // antigravity's `model_flag = ""`) is NOT a flag: emitting it puts
+            // a stray empty argv word on the command line that the CLI
+            // rejects before the run starts. Treat blank like `None` and omit
+            // the model entirely; the caller records a not-applied notice.
             if let Some(m) = model {
-                if let Some(ref flag) = self.model_flag {
+                if let Some(flag) = self.selectable_model_flag() {
                     cmd.arg(flag).arg(m);
                 }
             }
@@ -667,6 +681,55 @@ mod tests {
 
         let cmd_str = format!("{:?}", cmd);
         assert!(!cmd_str.contains("--model"));
+    }
+
+    /// CB34: a blank `model_flag` (antigravity's `model_flag = ""`) must not put
+    /// an empty argv word — or the bare model value — on the command line.
+    #[test]
+    fn build_command_blank_model_flag_omits_model_from_argv() {
+        let mut strategy = sample_strategy();
+        strategy.model_flag = Some(String::new());
+
+        let cmd = strategy
+            .build_command("test prompt", Some("gpt-4"), None)
+            .unwrap();
+
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(
+            !args.iter().any(|a| a.is_empty()),
+            "blank model_flag must not render an empty argv word: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "gpt-4"),
+            "the model value must be omitted, not passed bare: {args:?}"
+        );
+    }
+
+    /// A real `model_flag` is unaffected: flag + value still land in argv, adjacent.
+    #[test]
+    fn build_command_real_model_flag_still_passes_model_in_argv() {
+        let strategy = sample_strategy(); // model_flag = Some("--model")
+
+        let cmd = strategy
+            .build_command("test prompt", Some("gpt-4"), None)
+            .unwrap();
+
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        let i = args
+            .iter()
+            .position(|a| a == "--model")
+            .expect("--model must be present");
+        assert_eq!(args.get(i + 1).map(String::as_str), Some("gpt-4"));
     }
 
     #[test]
