@@ -78,6 +78,30 @@ use crate::watchers::WatcherEngine;
 const MISSING_SYNC_IDENTITY_MESSAGE: &str =
     "Missing Canopy session identity. Launch via `canopy bridge --id <AGENT_ID>` so requests include Canopy identity headers.";
 
+/// MCP result budget in bytes. Read surfaces must fit within this limit so
+/// that reading state never requires the database. Both
+/// `intelligence_graph_walk` and `spec_list` read this constant; the next
+/// surface that needs paging should reuse it instead of a new hardcoded
+/// number.
+pub(crate) const MCP_RESULT_BUDGET_BYTES: usize = 32_000;
+
+/// Measured serialised size of one compact `spec_list` row in bytes: 339
+/// compact specs measured 55,605 characters on 2026-09-02, i.e. ~164
+/// bytes/row. Budgeted at 200 bytes/row so the default page keeps headroom
+/// against longer-than-average names.
+const SPEC_LIST_COMPACT_ROW_BYTES: usize = 200;
+
+/// Default `spec_list` page derived from the budget, not a round number:
+/// `MCP_RESULT_BUDGET_BYTES / SPEC_LIST_COMPACT_ROW_BYTES`, clamped to
+/// `[1, 200]` like `loop_node_runs_list` (the quotient is 160, so the upper
+/// clamp is vacuous and the lower clamp is enforced by the const assert).
+pub(crate) const SPEC_LIST_DEFAULT_LIMIT: u32 =
+    MCP_RESULT_BUDGET_BYTES as u32 / SPEC_LIST_COMPACT_ROW_BYTES as u32;
+const _: () = assert!(
+    SPEC_LIST_DEFAULT_LIMIT >= 1 && SPEC_LIST_DEFAULT_LIMIT <= 200,
+    "spec_list default page must stay within [1, 200]"
+);
+
 fn missing_sync_identity_error() -> McpError {
     McpError::invalid_params(MISSING_SYNC_IDENTITY_MESSAGE.to_string(), None)
 }
@@ -3606,13 +3630,16 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "intelligence_graph_walk",
-        description = "Walk the project-context graph from a node up to the requested depth."
+        description = "Walk the project-context graph from a node up to the requested depth. \
+         Default is compact mode (nodes omit body/metadata; pass compact: false for full bodies). \
+         The root is returned in `root` only, never duplicated in `nodes`."
     )]
     async fn intelligence_graph_walk(
         &self,
         Parameters(params): Parameters<IntelligenceGraphWalkParams>,
     ) -> Result<CallToolResult, McpError> {
         let depth = params.depth.unwrap_or(2).min(8);
+        let compact = params.compact.unwrap_or(true);
         let effective_id = match self.db.resolve_node_id_by_prefix(&params.node_id) {
             Ok(Some(full)) => full,
             Ok(None) => {
@@ -3634,11 +3661,41 @@ impl TaskTriggerHandler {
             Err(e) => return Err(McpError::internal_error(e.to_string(), None)),
         };
 
-        let out = serde_json::json!({
-            "root": intelligence_node_json(&graph.root),
-            "nodes": graph.nodes.iter().map(intelligence_node_json).collect::<Vec<_>>(),
-            "edges": graph.edges.iter().map(intelligence_edge_json).collect::<Vec<_>>(),
+        // The database layer returns whole nodes including the root inside
+        // `nodes`; the projection happens here at the MCP boundary, where
+        // the budget lives, and the root is returned in `root` only.
+        let project_node = |node: &crate::db::intelligence::IntelligenceNodeRecord| {
+            if compact {
+                intelligence_node_compact_json(node)
+            } else {
+                intelligence_node_json(node)
+            }
+        };
+        let nodes: Vec<serde_json::Value> = graph
+            .nodes
+            .iter()
+            .filter(|n| n.id != graph.root.id)
+            .map(project_node)
+            .collect();
+        let edges: Vec<serde_json::Value> =
+            graph.edges.iter().map(intelligence_edge_json).collect();
+        let node_count = nodes.len();
+        let edge_count = edges.len();
+
+        let mut out = serde_json::json!({
+            "root": project_node(&graph.root),
+            "nodes": nodes,
+            "edges": edges,
+            "node_count": node_count,
+            "edge_count": edge_count,
+            "compact": compact,
         });
+        if compact {
+            out["bodies_omitted"] = serde_json::json!(true);
+            out["hint"] = serde_json::json!(
+                "Node bodies/metadata omitted in compact mode (default); pass {\"compact\": false} for full bodies."
+            );
+        }
 
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&out).unwrap_or_default(),
@@ -4433,7 +4490,9 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "spec_list",
-        description = "List standalone/backlog specs, optionally filtered by workdir tag, status, or unassigned-only."
+        description = "List standalone/backlog specs, optionally filtered by workdir tag, status, or unassigned-only. \
+         Supports limit/offset pagination; the default page fits the result budget. \
+         Pass offset to page past it."
     )]
     async fn spec_list(
         &self,
@@ -4465,15 +4524,24 @@ impl TaskTriggerHandler {
             .collect();
 
         let include_descriptions = params.include_descriptions.unwrap_or(false);
+        let limit = params
+            .limit
+            .unwrap_or(SPEC_LIST_DEFAULT_LIMIT)
+            .clamp(1, 200) as usize;
+        let offset = params.offset.unwrap_or(0) as usize;
         let total = specs.len();
-        let cap = 200usize;
-        let truncated = total > cap;
-        let omitted = total.saturating_sub(cap);
-        let visible = &specs[..specs.len().min(cap)];
+        let visible: Vec<_> = specs.iter().skip(offset).take(limit).collect();
+        let returned = visible.len();
+        let remaining = total.saturating_sub(offset.saturating_add(returned));
+        let truncated = remaining > 0;
+        let omitted = remaining;
 
         let mut body = serde_json::json!({
             "specs": visible.iter().map(|s| spec_summary_json(s, include_descriptions)).collect::<Vec<_>>(),
             "total": total,
+            "limit": limit,
+            "offset": offset,
+            "returned": returned,
         });
         if truncated {
             body["truncated"] = serde_json::json!(true);
@@ -8599,6 +8667,26 @@ fn intelligence_node_json(
         "metadata": node.metadata,
         "project_hash": node.project_hash,
         "session_id": node.session_id,
+        "created_at": node.created_at,
+        "updated_at": node.updated_at,
+    })
+}
+
+/// Compact projection of an intelligence node for `intelligence_graph_walk`:
+/// `id`, `kind`, `title`, `created_at`, `updated_at` and `project_hash`,
+/// omitting `body` and `metadata`. Uses the same field names as the rows
+/// `intelligence_search` emits where the fields overlap — no second compact
+/// shape for the same entity. The database layer keeps returning whole
+/// nodes; this projection happens at the MCP boundary, where the budget
+/// lives.
+fn intelligence_node_compact_json(
+    node: &crate::db::intelligence::IntelligenceNodeRecord,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": node.id,
+        "kind": node.kind,
+        "title": node.title,
+        "project_hash": node.project_hash,
         "created_at": node.created_at,
         "updated_at": node.updated_at,
     })
@@ -17963,6 +18051,8 @@ mod endpoint_tests {
                 status: None,
                 unassigned_only: Some(true),
                 include_descriptions: None,
+                limit: None,
+                offset: None,
             }))
             .await
             .unwrap();
@@ -17974,6 +18064,8 @@ mod endpoint_tests {
                 status: Some("sideways".to_string()),
                 unassigned_only: None,
                 include_descriptions: None,
+                limit: None,
+                offset: None,
             }))
             .await
             .unwrap();
@@ -20862,6 +20954,7 @@ mod endpoint_tests {
             .intelligence_graph_walk(Parameters(IntelligenceGraphWalkParams {
                 node_id: "fact-2".to_string(),
                 depth: Some(2),
+                compact: None,
             }))
             .await
             .unwrap();
@@ -20872,6 +20965,7 @@ mod endpoint_tests {
             .intelligence_graph_walk(Parameters(IntelligenceGraphWalkParams {
                 node_id: "ghost-node".to_string(),
                 depth: None,
+                compact: None,
             }))
             .await
             .unwrap();
@@ -20974,6 +21068,7 @@ mod endpoint_tests {
             .intelligence_graph_walk(Parameters(IntelligenceGraphWalkParams {
                 node_id: "delete-a".to_string(),
                 depth: Some(3),
+                compact: None,
             }))
             .await
             .unwrap();
@@ -20984,6 +21079,7 @@ mod endpoint_tests {
             .intelligence_graph_walk(Parameters(IntelligenceGraphWalkParams {
                 node_id: "delete-c".to_string(),
                 depth: Some(3),
+                compact: None,
             }))
             .await
             .unwrap();
@@ -21031,6 +21127,7 @@ mod endpoint_tests {
             .intelligence_graph_walk(Parameters(IntelligenceGraphWalkParams {
                 node_id: "rel-b".to_string(),
                 depth: Some(1),
+                compact: None,
             }))
             .await
             .unwrap();
@@ -21059,6 +21156,7 @@ mod endpoint_tests {
             .intelligence_graph_walk(Parameters(IntelligenceGraphWalkParams {
                 node_id: "rel-b".to_string(),
                 depth: Some(1),
+                compact: None,
             }))
             .await
             .unwrap();
@@ -21883,6 +21981,7 @@ mod endpoint_tests {
             .intelligence_graph_walk(Parameters(IntelligenceGraphWalkParams {
                 node_id: "deadbeef".to_string(),
                 depth: Some(1),
+                compact: None,
             }))
             .await
             .unwrap();
@@ -21950,6 +22049,7 @@ mod endpoint_tests {
             .intelligence_graph_walk(Parameters(IntelligenceGraphWalkParams {
                 node_id: full_id.to_string(),
                 depth: Some(1),
+                compact: None,
             }))
             .await
             .unwrap();
@@ -21979,6 +22079,8 @@ mod endpoint_tests {
                 status: None,
                 unassigned_only: None,
                 include_descriptions: None,
+                limit: None,
+                offset: None,
             }))
             .await
             .unwrap();
@@ -22010,6 +22112,8 @@ mod endpoint_tests {
                 status: None,
                 unassigned_only: None,
                 include_descriptions: Some(true),
+                limit: None,
+                offset: None,
             }))
             .await
             .unwrap();
@@ -22017,6 +22121,322 @@ mod endpoint_tests {
         assert!(
             body.contains("<objective>") || body.contains("Objective"),
             "include_descriptions must include description content"
+        );
+    }
+
+    // ── CB28: result budget contract for graph walk + spec_list ──────────
+
+    async fn upsert_large_intel_node(
+        handler: &TaskTriggerHandler,
+        id: &str,
+        title: &str,
+        body_marker: &str,
+        relations: Option<Vec<IntelligenceRelationParams>>,
+    ) {
+        let body = format!("{body_marker}-{}", "x".repeat(12_000));
+        let result = handler
+            .intelligence_upsert(
+                Parameters(IntelligenceUpsertParams {
+                    node_data: IntelligenceNodeParams {
+                        id: Some(id.to_string()),
+                        kind: "fact".to_string(),
+                        status: None,
+                        title: title.to_string(),
+                        body,
+                        metadata: None,
+                        project_hash: None,
+                        session_id: None,
+                        relations,
+                    },
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!is_err(&result), "{}", text(&result));
+    }
+
+    #[tokio::test]
+    async fn intelligence_graph_walk_compact_omits_bodies() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let _agent_guard = AgentIdVar::set("agent-cb28-walk-compact");
+
+        upsert_large_intel_node(&handler, "cb28-a", "CB28 node A", "LARGE-BODY-ALPHA", None).await;
+        upsert_large_intel_node(
+            &handler,
+            "cb28-b",
+            "CB28 node B",
+            "LARGE-BODY-BETA",
+            Some(vec![IntelligenceRelationParams {
+                to_node_id: "cb28-a".to_string(),
+                relation: "extends".to_string(),
+                weight: None,
+            }]),
+        )
+        .await;
+        upsert_large_intel_node(
+            &handler,
+            "cb28-c",
+            "CB28 node C",
+            "LARGE-BODY-GAMMA",
+            Some(vec![IntelligenceRelationParams {
+                to_node_id: "cb28-b".to_string(),
+                relation: "extends".to_string(),
+                weight: None,
+            }]),
+        )
+        .await;
+
+        let walked = handler
+            .intelligence_graph_walk(Parameters(IntelligenceGraphWalkParams {
+                node_id: "cb28-c".to_string(),
+                depth: Some(2),
+                compact: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&walked), "{}", text(&walked));
+        let body = raw_text(&walked);
+        for marker in ["LARGE-BODY-ALPHA", "LARGE-BODY-BETA", "LARGE-BODY-GAMMA"] {
+            assert!(
+                !body.contains(marker),
+                "compact walk must omit node bodies, found {marker}"
+            );
+        }
+        // The nodes are still there — only their bodies are gone.
+        for title in ["CB28 node A", "CB28 node B", "CB28 node C"] {
+            assert!(body.contains(title), "compact walk must keep {title}");
+        }
+        assert!(
+            body.len() < MCP_RESULT_BUDGET_BYTES,
+            "compact walk ({} bytes) must fit the {}-byte budget",
+            body.len(),
+            MCP_RESULT_BUDGET_BYTES
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            parsed.get("node_count").is_some(),
+            "walk must state node_count"
+        );
+        assert!(
+            parsed.get("edge_count").is_some(),
+            "walk must state edge_count"
+        );
+    }
+
+    #[tokio::test]
+    async fn intelligence_graph_walk_root_appears_once() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let _agent_guard = AgentIdVar::set("agent-cb28-walk-root");
+
+        upsert_large_intel_node(&handler, "cb28-r1", "CB28 root R1", "ROOT-BODY-R1", None).await;
+        upsert_large_intel_node(
+            &handler,
+            "cb28-r2",
+            "CB28 leaf R2",
+            "ROOT-BODY-R2",
+            Some(vec![IntelligenceRelationParams {
+                to_node_id: "cb28-r1".to_string(),
+                relation: "extends".to_string(),
+                weight: None,
+            }]),
+        )
+        .await;
+
+        let walked = handler
+            .intelligence_graph_walk(Parameters(IntelligenceGraphWalkParams {
+                node_id: "cb28-r2".to_string(),
+                depth: Some(1),
+                compact: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&walked), "{}", text(&walked));
+        let parsed: serde_json::Value = serde_json::from_str(&raw_text(&walked)).unwrap();
+        let root_id = parsed["root"]["id"].as_str().unwrap().to_string();
+        let nodes = parsed["nodes"].as_array().unwrap();
+        assert!(
+            !nodes
+                .iter()
+                .any(|n| n.get("id").and_then(|id| id.as_str()) == Some(root_id.as_str())),
+            "root {root_id} must not appear among nodes"
+        );
+        assert_eq!(
+            parsed["node_count"].as_u64().unwrap() as usize,
+            nodes.len(),
+            "node_count must match nodes returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn intelligence_graph_walk_compact_false_returns_bodies() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let _agent_guard = AgentIdVar::set("agent-cb28-walk-full");
+
+        upsert_large_intel_node(
+            &handler,
+            "cb28-f1",
+            "CB28 full node",
+            "FULL-BODY-DISTINCTIVE",
+            None,
+        )
+        .await;
+
+        let walked = handler
+            .intelligence_graph_walk(Parameters(IntelligenceGraphWalkParams {
+                node_id: "cb28-f1".to_string(),
+                depth: Some(1),
+                compact: Some(false),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&walked), "{}", text(&walked));
+        assert!(
+            raw_text(&walked).contains("FULL-BODY-DISTINCTIVE"),
+            "compact: false must restore full bodies"
+        );
+    }
+
+    fn insert_standalone_spec(db: &Database, name: &str) -> LoopSpec {
+        let spec = LoopSpec {
+            id: uuid::Uuid::new_v4().to_string(),
+            loop_id: None,
+            name: name.to_string(),
+            description: Some(valid_spec_description()),
+            position: 0,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        db.insert_loop_spec(&spec).unwrap();
+        spec
+    }
+
+    fn spec_list_ids(body: &str) -> Vec<String> {
+        serde_json::from_str::<serde_json::Value>(body).unwrap()["specs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn spec_list_pagination_respects_limit_and_offset() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        for i in 0..10 {
+            insert_standalone_spec(&db, &format!("CB28 page spec {i:02}"));
+        }
+
+        let first = handler
+            .spec_list(Parameters(SpecListParams {
+                workdir: None,
+                status: None,
+                unassigned_only: None,
+                include_descriptions: None,
+                limit: Some(3),
+                offset: Some(0),
+            }))
+            .await
+            .unwrap();
+        let first_body = raw_text(&first);
+        let first_parsed: serde_json::Value = serde_json::from_str(&first_body).unwrap();
+        assert_eq!(first_parsed["returned"], 3);
+        assert_eq!(first_parsed["total"], 10);
+        assert_eq!(first_parsed["truncated"], true);
+        assert_eq!(first_parsed["omitted"], 7);
+        let first_ids = spec_list_ids(&first_body);
+        assert_eq!(first_ids.len(), 3);
+
+        let second = handler
+            .spec_list(Parameters(SpecListParams {
+                workdir: None,
+                status: None,
+                unassigned_only: None,
+                include_descriptions: None,
+                limit: Some(3),
+                offset: Some(3),
+            }))
+            .await
+            .unwrap();
+        let second_body = raw_text(&second);
+        let second_ids = spec_list_ids(&second_body);
+        assert_eq!(second_ids.len(), 3);
+        for id in &second_ids {
+            assert!(
+                !first_ids.contains(id),
+                "offset page must not repeat rows from the first page"
+            );
+        }
+
+        let last = handler
+            .spec_list(Parameters(SpecListParams {
+                workdir: None,
+                status: None,
+                unassigned_only: None,
+                include_descriptions: None,
+                limit: Some(3),
+                offset: Some(9),
+            }))
+            .await
+            .unwrap();
+        let last_body = raw_text(&last);
+        let last_parsed: serde_json::Value = serde_json::from_str(&last_body).unwrap();
+        assert_eq!(last_parsed["returned"], 1);
+        assert_eq!(last_parsed["total"], 10);
+        assert!(
+            last_parsed.get("truncated").is_none(),
+            "final page must not report truncation: {last_body}"
+        );
+        let last_ids = spec_list_ids(&last_body);
+        assert!(!first_ids.contains(&last_ids[0]));
+        assert!(!second_ids.contains(&last_ids[0]));
+    }
+
+    #[tokio::test]
+    async fn spec_list_default_page_fits_budget() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        let want = SPEC_LIST_DEFAULT_LIMIT as usize + 10;
+        for i in 0..want {
+            insert_standalone_spec(&db, &format!("CB28 budget probe spec {i:03}"));
+        }
+
+        let listed = handler
+            .spec_list(Parameters(SpecListParams {
+                workdir: None,
+                status: None,
+                unassigned_only: None,
+                include_descriptions: None,
+                limit: None,
+                offset: None,
+            }))
+            .await
+            .unwrap();
+        let body = raw_text(&listed);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            parsed["returned"].as_u64().unwrap() as usize,
+            SPEC_LIST_DEFAULT_LIMIT as usize,
+            "default page must return exactly the budget-derived default"
+        );
+        assert_eq!(parsed["total"].as_u64().unwrap() as usize, want);
+        assert_eq!(parsed["truncated"], true);
+        assert_eq!(
+            parsed["omitted"].as_u64().unwrap() as usize,
+            want - SPEC_LIST_DEFAULT_LIMIT as usize
+        );
+        assert!(
+            body.len() <= MCP_RESULT_BUDGET_BYTES,
+            "default spec_list page ({} bytes) must fit the {}-byte budget",
+            body.len(),
+            MCP_RESULT_BUDGET_BYTES
         );
     }
 
@@ -22669,6 +23089,8 @@ mod endpoint_tests {
                     status: None,
                     unassigned_only: None,
                     include_descriptions: Some(true),
+                    limit: None,
+                    offset: None,
                 }))
                 .await
                 .unwrap(),

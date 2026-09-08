@@ -289,6 +289,9 @@ pub struct IntelligenceGraphWalkParams {
     pub node_id: String,
     /// Maximum traversal depth.
     pub depth: Option<usize>,
+    /// Compact mode: omit `body` and `metadata` from returned nodes.
+    /// Defaults to true; pass false for full bodies.
+    pub compact: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -507,6 +510,12 @@ pub struct SpecListParams {
     pub unassigned_only: Option<bool>,
     /// Include full spec descriptions in the output. Default: false (compact — id, name, status, workdir, loop_id only).
     pub include_descriptions: Option<bool>,
+    /// Maximum number of specs to return. Defaults to a value that fits the
+    /// result budget, clamped to [1, 200].
+    pub limit: Option<u32>,
+    /// Number of specs to skip before returning `limit` more — page past the
+    /// default page. Defaults to 0.
+    pub offset: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
