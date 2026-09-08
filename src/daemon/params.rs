@@ -409,26 +409,35 @@ pub struct LoopCreateParams {
     pub infra_node_id: Option<String>,
 }
 
-/// Config for a loop hook — an agent-node-style payload
-/// (platform/model/timeout_minutes), but with its own `prompt` field rather
-/// than `prompt_template` since it has no spec/node graph context to
-/// template against. Used for every event via the `hooks` map on
-/// `loop_update`. See [`crate::loop_engine`]'s `render_hook_prompt` for the
-/// event-specific placeholders each event supports.
+/// Config for a loop hook — either an agent-node-style payload
+/// (platform/model/prompt) or a direct shell command. Exactly one mode must
+/// be configured; the engine refuses hooks that specify both or neither.
+/// Used for every event via the `hooks` map on `loop_update`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LoopCompletionHookParams {
     /// CLI platform to run the hook with (e.g. "mimo", "claude").
-    pub platform: String,
-    /// Optional model override.
+    /// Required for agent hooks; must be omitted for command hooks.
+    pub platform: Option<String>,
+    /// Optional model override (agent hooks only).
     pub model: Option<String>,
-    /// Optional effort level.
+    /// Optional effort level (agent hooks only).
     pub effort: Option<String>,
-    /// Hook prompt template. Supports {{loop_name}} and {{workdir}} on every
-    /// event, plus event-specific markers: {{completed_specs}} on on_completed,
-    /// {{spec_name}} and {{spec_id}} on on_spec_completed, {{blocker}} and
-    /// {{node}} on on_failed and on_blocked. A marker its event cannot bind
-    /// is refused and recorded as a failed hook run.
-    pub prompt: String,
+    /// Hook prompt template (agent hooks only). Supports {{loop_name}} and
+    /// {{workdir}} on every event, plus event-specific markers:
+    /// {{completed_specs}} on on_completed, {{spec_name}} and {{spec_id}} on
+    /// on_spec_completed, {{blocker}} and {{node}} on on_failed and
+    /// on_blocked. A marker its event cannot bind is refused and recorded as
+    /// a failed hook run.
+    pub prompt: Option<String>,
+    /// Shell command to run directly (command hooks only). Mutually exclusive
+    /// with platform/prompt. Supports the same `{{...}}` placeholders as the
+    /// hook's event, substituted before execution. WARNING: do not configure a
+    /// command that starts a canopy binary (e.g. `canopy loop run`). A
+    /// process that starts canopy triggers daemon-startup recovery, which
+    /// SIGTERMs live loop runs including the run that spawned the hook.
+    /// `on_spec_completed` fires while the loop is still running, so this is
+    /// not hypothetical. Use the native `loop_run` action instead.
+    pub command: Option<String>,
     /// Timeout in minutes for the hook's process (default: 30, same default
     /// as an agent node).
     pub timeout_minutes: Option<u64>,

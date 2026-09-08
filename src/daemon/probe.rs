@@ -478,8 +478,9 @@ pub(crate) fn distinct_targets_for_loop(details: &LoopDetails) -> Vec<LoopProbeT
 
     for (event, hooks) in &details.lp.hooks {
         for (idx, hook) in hooks.iter().enumerate() {
+            // Command hooks have no platform — they are not agent targets.
             record(
-                Some(hook.platform.as_str()),
+                hook.platform.as_deref(),
                 hook.model.as_deref(),
                 hook.effort.as_deref(),
                 format!("{} hook {}", event.as_str(), idx),
@@ -1034,10 +1035,11 @@ mod tests {
     #[test]
     fn distinct_targets_for_loop_includes_on_completed_hook() {
         let hook = crate::domain::loops::LoopCompletionHook {
-            platform: "mimo".to_string(),
+            platform: Some("mimo".to_string()),
             model: None,
             effort: None,
-            prompt: "done".to_string(),
+            prompt: Some("done".to_string()),
+            command: None,
             timeout_minutes: None,
         };
         let details = LoopDetails {
@@ -1062,30 +1064,33 @@ mod tests {
         hooks.insert(
             LoopHookEvent::OnCompleted,
             vec![LoopCompletionHook {
-                platform: "mimo".to_string(),
+                platform: Some("mimo".to_string()),
                 model: None,
                 effort: None,
-                prompt: "done".to_string(),
+                prompt: Some("done".to_string()),
+                command: None,
                 timeout_minutes: None,
             }],
         );
         hooks.insert(
             LoopHookEvent::OnFailed,
             vec![LoopCompletionHook {
-                platform: "mimo".to_string(),
+                platform: Some("mimo".to_string()),
                 model: None,
                 effort: None,
-                prompt: "failed {{blocker}}".to_string(),
+                prompt: Some("failed {{blocker}}".to_string()),
+                command: None,
                 timeout_minutes: None,
             }],
         );
         hooks.insert(
             LoopHookEvent::OnSpecCompleted,
             vec![LoopCompletionHook {
-                platform: "other-cli".to_string(),
+                platform: Some("other-cli".to_string()),
                 model: None,
                 effort: None,
-                prompt: "spec {{spec_name}}".to_string(),
+                prompt: Some("spec {{spec_name}}".to_string()),
+                command: None,
                 timeout_minutes: None,
             }],
         );

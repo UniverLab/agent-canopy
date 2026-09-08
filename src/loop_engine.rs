@@ -114,6 +114,27 @@ struct NodeExecution {
     summary: String,
 }
 
+/// Result of [`execute_shell_command`] — reused by both check nodes and
+/// command hooks so there is exactly one way to run a command in the
+/// codebase.
+struct ShellCommandResult {
+    status: LoopRunStatus,
+    /// Check-shaped output JSON, with `stdout`/`stderr` already truncated to
+    /// [`CHECK_OUTPUT_MAX_BYTES`] for storage (CB5 contract).
+    output: Value,
+    summary: String,
+    /// The command's *full*, untruncated stdout / stderr as it emitted them.
+    /// A check node evaluates its `success_condition` (`output_contains` /
+    /// `output_not_contains`) against everything the command wrote, not just
+    /// the tail kept in `output`. Empty when `timed_out` is set.
+    full_stdout: String,
+    full_stderr: String,
+    /// The command exceeded its timeout and its process group was killed.
+    /// A check node treats this as an unconditional fail (B28) rather than
+    /// evaluating its `success_condition` against the partial output.
+    timed_out: bool,
+}
+
 /// (B17) Distinct failure mode for [`LoopEngine::run_loop_dispatch`]'s launch
 /// guard: the loop's effective spec set (bound specs, or the given queue's
 /// pending members) was empty, so the run never actually launched. Unlike
@@ -745,46 +766,100 @@ impl LoopEngine {
                 continue;
             }
 
-            let execution = match Cli::resolve(Some(&hook.platform)) {
-                Ok(cli) => match render_hook_prompt(&event, ctx, &hook.prompt) {
-                    Ok(prompt) => {
-                        let mut strategy = cli.strategy();
-                        if prompt.len() > ARGV_SAFETY_THRESHOLD && !strategy.prompt_via_stdin {
-                            *strategy = strategy.with_stdin_forced();
-                        }
+            let execution = if hook.is_command() {
+                // Command hook: substitute placeholders, run via shared path
+                let raw_command = hook.command.as_deref().unwrap();
+                match render_hook_command(&event, ctx, raw_command) {
+                    Ok(command) => {
                         let timeout_minutes = hook.timeout_minutes.unwrap_or(30);
-
-                        run_completion_hook_process(
+                        let timeout_seconds = timeout_minutes * 60;
+                        match execute_shell_command(
                             &self.db,
                             &run_id,
-                            &cli,
-                            &strategy,
-                            &prompt,
-                            hook.model.as_deref(),
-                            hook.effort.as_deref(),
+                            &command,
                             ctx.workdir,
-                            timeout_minutes,
+                            timeout_seconds,
                         )
                         .await
+                        {
+                            Ok(r) => HookExecution {
+                                status: r.status,
+                                output: r.output,
+                                summary: r.summary,
+                            },
+                            Err(e) => HookExecution {
+                                status: LoopRunStatus::Fail,
+                                output: serde_json::json!({
+                                    "command": command,
+                                    "error": e.to_string(),
+                                }),
+                                summary: format!(
+                                    "{} hook command failed to execute: {e}",
+                                    event.as_str()
+                                ),
+                            },
+                        }
                     }
                     Err(error) => HookExecution {
                         status: LoopRunStatus::Fail,
                         output: serde_json::json!({
-                            "platform": hook.platform,
+                            "command": raw_command,
                             "error": error.to_string(),
                         }),
-                        summary: format!("{} hook prompt is invalid: {error}", event.as_str()),
+                        summary: format!("{} hook command is invalid: {error}", event.as_str()),
                     },
-                },
-                Err(error) => HookExecution {
-                    status: LoopRunStatus::Fail,
-                    output: serde_json::json!({ "platform": hook.platform, "error": error }),
-                    summary: format!(
-                        "{} hook has an invalid platform '{}': {error}",
-                        event.as_str(),
-                        hook.platform
-                    ),
-                },
+                }
+            } else {
+                // Agent hook: resolve CLI, render prompt, spawn
+                match Cli::resolve(hook.platform.as_deref()) {
+                    Ok(cli) => {
+                        match render_hook_prompt(&event, ctx, hook.prompt.as_deref().unwrap_or(""))
+                        {
+                            Ok(prompt) => {
+                                let mut strategy = cli.strategy();
+                                if prompt.len() > ARGV_SAFETY_THRESHOLD
+                                    && !strategy.prompt_via_stdin
+                                {
+                                    *strategy = strategy.with_stdin_forced();
+                                }
+                                let timeout_minutes = hook.timeout_minutes.unwrap_or(30);
+
+                                run_completion_hook_process(
+                                    &self.db,
+                                    &run_id,
+                                    &cli,
+                                    &strategy,
+                                    &prompt,
+                                    hook.model.as_deref(),
+                                    hook.effort.as_deref(),
+                                    ctx.workdir,
+                                    timeout_minutes,
+                                )
+                                .await
+                            }
+                            Err(error) => HookExecution {
+                                status: LoopRunStatus::Fail,
+                                output: serde_json::json!({
+                                    "platform": hook.platform,
+                                    "error": error.to_string(),
+                                }),
+                                summary: format!(
+                                    "{} hook prompt is invalid: {error}",
+                                    event.as_str()
+                                ),
+                            },
+                        }
+                    }
+                    Err(error) => HookExecution {
+                        status: LoopRunStatus::Fail,
+                        output: serde_json::json!({ "platform": hook.platform, "error": error }),
+                        summary: format!(
+                            "{} hook has an invalid platform '{}': {error}",
+                            event.as_str(),
+                            hook.platform.as_deref().unwrap_or("")
+                        ),
+                    },
+                }
             };
 
             let _ = self.db.update_loop_completion_hook_run_result(
@@ -3454,6 +3529,144 @@ async fn begin_infra_retry(
     Ok(run_id)
 }
 
+/// Run a shell command with the same capture contract as a check node:
+/// `command`, `exit_code`, `stdout`, `stderr`, `passed` in the output JSON,
+/// whether it succeeded or failed (CB5). Reused by command hooks so there
+/// is exactly one way to run a command in the codebase.
+async fn execute_shell_command(
+    db: &Database,
+    run_id: &str,
+    command: &str,
+    workdir: &str,
+    timeout_seconds: u64,
+) -> Result<ShellCommandResult> {
+    let mut process = shell_command(command);
+    process.current_dir(workdir);
+    let mut child = process
+        .spawn()
+        .with_context(|| format!("Failed to spawn command: {command}"))?;
+    let pid = child.id();
+    if let Some(pid) = pid {
+        let _ = db.set_loop_run_pid(run_id, pid as i64, crate::system::boot_id().as_deref());
+    }
+
+    let stdout_pipe = child.stdout.take().expect("shell_command pipes stdout");
+    let stderr_pipe = child.stderr.take().expect("shell_command pipes stderr");
+    let stdout_buf = Arc::new(std::sync::Mutex::new(String::new()));
+    let stderr_buf = Arc::new(std::sync::Mutex::new(String::new()));
+    let stdout_handle = spawn_check_output_reader(
+        stdout_pipe,
+        run_id.to_string(),
+        "stdout",
+        db.clone(),
+        stdout_buf.clone(),
+    );
+    let stderr_handle = spawn_check_output_reader(
+        stderr_pipe,
+        run_id.to_string(),
+        "stderr",
+        db.clone(),
+        stderr_buf.clone(),
+    );
+
+    let execution = async {
+        let status = child.wait().await?;
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let _ = stdout_handle.await;
+            let _ = stderr_handle.await;
+        })
+        .await
+        .is_ok();
+        Ok::<_, std::io::Error>((status, drained))
+    };
+    let timeout_result =
+        tokio::time::timeout(std::time::Duration::from_secs(timeout_seconds), execution).await;
+
+    let locked_stdout =
+        |buf: &Arc<std::sync::Mutex<String>>| buf.lock().map(|g| g.clone()).unwrap_or_default();
+
+    let (status_opt, drained) = match timeout_result {
+        Ok(result) => {
+            let (status, drained) = result?;
+            (Some(status), drained)
+        }
+        Err(_elapsed) => (None, false),
+    };
+    if status_opt.is_none() || !drained {
+        if let Some(pid) = pid {
+            crate::daemon::process::terminate_process_group_async(pid as i64, KILL_GRACE);
+        }
+        let partial_stdout = locked_stdout(&stdout_buf);
+        let partial_stderr = locked_stdout(&stderr_buf);
+        let (stdout_snap, _) = truncate_check_output(partial_stdout.trim().to_string());
+        let (stderr_snap, _) = truncate_check_output(partial_stderr.trim().to_string());
+        let _ = db.set_loop_run_tail_snapshot(run_id, Some(&stdout_snap), Some(&stderr_snap));
+        let output = serde_json::json!({
+            "kind": "check",
+            "command": command,
+            "error": "timed out",
+            "timeout_seconds": timeout_seconds,
+            "stdout": stdout_snap,
+            "stderr": stderr_snap,
+        });
+        let _ = db.update_loop_run_result(
+            run_id,
+            LoopRunStatus::Fail,
+            Some(&output),
+            Some(chrono::Utc::now()),
+        );
+        return Ok(ShellCommandResult {
+            status: LoopRunStatus::Fail,
+            output,
+            summary: format!("Command timed out after {timeout_seconds}s."),
+            full_stdout: String::new(),
+            full_stderr: String::new(),
+            timed_out: true,
+        });
+    }
+
+    let status = status_opt.expect("timeout arm returned above");
+    let exit_code = status.code().unwrap_or(-1);
+    let full_stdout = locked_stdout(&stdout_buf).trim().to_string();
+    let full_stderr = locked_stdout(&stderr_buf).trim().to_string();
+
+    // Truncate only what we persist and hand to the next node, keeping the
+    // tail where compilers and test runners put the failure summary. The
+    // full strings above go back to the caller for condition evaluation.
+    let (stdout, truncated_stdout) = truncate_check_output(full_stdout.clone());
+    let (stderr, truncated_stderr) = truncate_check_output(full_stderr.clone());
+    let truncated = truncated_stdout || truncated_stderr;
+
+    let mut output_json = serde_json::json!({
+        "kind": "check",
+        "command": command,
+        "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+        "passed": exit_code == 0,
+    });
+    if truncated {
+        output_json["truncated"] = serde_json::Value::Bool(true);
+    }
+
+    let _ = db.set_loop_run_tail_snapshot(run_id, Some(&stdout), Some(&stderr));
+
+    let status = if exit_code == 0 {
+        LoopRunStatus::Pass
+    } else {
+        LoopRunStatus::Fail
+    };
+
+    Ok(ShellCommandResult {
+        status,
+        output: output_json,
+        summary: format!("Command exited with code {exit_code}."),
+        full_stdout,
+        full_stderr,
+        timed_out: false,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_check_node(
     db: &Database,
@@ -3487,115 +3700,21 @@ async fn execute_check_node(
         .and_then(Value::as_u64)
         .unwrap_or(120);
 
-    let mut process = shell_command(&command);
-    process.current_dir(workdir);
-    let mut child = process
-        .spawn()
-        .with_context(|| format!("Check node '{}' failed to spawn.", node.name))?;
-    let pid = child.id();
-    if let Some(pid) = pid {
-        let _ = db.set_loop_run_pid(run_id, pid as i64, crate::system::boot_id().as_deref());
-    }
+    let result = execute_shell_command(db, run_id, &command, workdir, timeout_seconds).await?;
 
-    // CT3: stream piped stdout/stderr into `loop_run_output` while the node
-    // runs so the TUI tail dialog can follow it live. `shell_command` above
-    // always pipes both streams, so these takes cannot fail on either
-    // platform; the expect messages say where to look if that ever changes.
-    let stdout_pipe = child
-        .stdout
-        .take()
-        .expect("shell_command pipes check-node stdout");
-    let stderr_pipe = child
-        .stderr
-        .take()
-        .expect("shell_command pipes check-node stderr");
-    let stdout_buf = Arc::new(std::sync::Mutex::new(String::new()));
-    let stderr_buf = Arc::new(std::sync::Mutex::new(String::new()));
-    let stdout_handle = spawn_check_output_reader(
-        stdout_pipe,
-        run_id.to_string(),
-        "stdout",
-        db.clone(),
-        stdout_buf.clone(),
-    );
-    let stderr_handle = spawn_check_output_reader(
-        stderr_pipe,
-        run_id.to_string(),
-        "stderr",
-        db.clone(),
-        stderr_buf.clone(),
-    );
-
-    // The timeout covers the child AND the pipe drain. A forked grandchild
-    // that inherits the pipes (e.g. `( sleep 60 ) &`) keeps them open past
-    // the shell's own exit — `wait_with_output` used to block on that EOF
-    // inside the same timeout, so the drain must live inside it too.
-    // Without this bound the reader join below would hang and the process
-    // group would never be reaped (see
-    // `process_group_children_die_with_parent`).
-    let execution = async {
-        let status = child.wait().await?;
-        // Bounded drain: normally the pipes close with the child and the
-        // join below guarantees the DB has every byte before the success
-        // condition is evaluated. `false` means a daemonized descendant
-        // still holds the pipes — handled exactly like a timeout (kill the
-        // group, keep the partial output).
-        let drained = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            let _ = stdout_handle.await;
-            let _ = stderr_handle.await;
-        })
-        .await
-        .is_ok();
-        Ok::<_, std::io::Error>((status, drained))
-    };
-    let timeout_result =
-        tokio::time::timeout(std::time::Duration::from_secs(timeout_seconds), execution).await;
-
-    let locked_stdout =
-        |buf: &Arc<std::sync::Mutex<String>>| buf.lock().map(|g| g.clone()).unwrap_or_default();
-
-    // `None` status = the timeout fired (reader handles were dropped with
-    // the future; the detached readers exit on pipe close after the kill
-    // below, and the buffers below already hold everything streamed).
-    let (status_opt, drained) = match timeout_result {
-        Ok(result) => {
-            let (status, drained) = result?;
-            (Some(status), drained)
-        }
-        Err(_elapsed) => (None, false),
-    };
-    if status_opt.is_none() || !drained {
-        if let Some(pid) = pid {
-            crate::daemon::process::terminate_process_group_async(pid as i64, KILL_GRACE);
-        }
-        let partial_stdout = locked_stdout(&stdout_buf);
-        let partial_stderr = locked_stdout(&stderr_buf);
-        let (stdout_snap, _) = truncate_check_output(partial_stdout.trim().to_string());
-        let (stderr_snap, _) = truncate_check_output(partial_stderr.trim().to_string());
-        let _ = db.set_loop_run_tail_snapshot(run_id, Some(&stdout_snap), Some(&stderr_snap));
-        let output = serde_json::json!({
-            "kind": "check",
-            "loop_id": lp.id,
-            "spec_id": spec.id,
-            "node_id": node.id,
-            "command": command,
-            "error": "timed out",
-            "timeout_seconds": timeout_seconds,
-            "stdout": stdout_snap,
-            "stderr": stderr_snap,
-        });
-        let _ = db.update_loop_run_result(
-            run_id,
-            LoopRunStatus::Fail,
-            Some(&output),
-            Some(chrono::Utc::now()),
-        );
-        // B28: a timeout is a check fail, not a hard error — it must
-        // route through the fail edge like any other check failure,
-        // never abort the whole spec.
+    // B28: a timeout is a check fail, not a hard error and not something to
+    // run the success condition against — it must route through the fail
+    // edge like any other check failure, never abort the whole spec and
+    // never turn into a pass because a non-exit-code condition happened to
+    // match the partial output.
+    if result.timed_out {
+        let mut output_json = result.output;
+        output_json["loop_id"] = serde_json::json!(lp.id);
+        output_json["spec_id"] = serde_json::json!(spec.id);
+        output_json["node_id"] = serde_json::json!(node.id);
         return Ok(NodeExecution {
             status: LoopRunStatus::Fail,
-            output,
+            output: output_json,
             summary: format!(
                 "Check node '{}' timed out after {timeout_seconds}s.",
                 node.name
@@ -3603,55 +3722,40 @@ async fn execute_check_node(
         });
     }
 
-    let status = status_opt.expect("timeout arm returned above");
-    let exit_code = status.code().unwrap_or(-1);
-    let stdout = locked_stdout(&stdout_buf).trim().to_string();
-    let stderr = locked_stdout(&stderr_buf).trim().to_string();
-
-    // Evaluate the success condition against the *full* captured output —
-    // the `output_contains` / `output_not_contains` conditions must see
-    // everything the command emitted, not just the tail kept for storage below.
-    let combined = if stderr.is_empty() {
-        stdout.clone()
-    } else if stdout.is_empty() {
-        stderr.clone()
+    // Check nodes evaluate a success_condition against the *full* captured
+    // output — the `output_contains` / `output_not_contains` conditions must
+    // see everything the command emitted, not just the tail kept for storage.
+    let exit_code = result
+        .output
+        .get("exit_code")
+        .and_then(Value::as_i64)
+        .unwrap_or(-1) as i32;
+    let combined = if result.full_stderr.is_empty() {
+        result.full_stdout
+    } else if result.full_stdout.is_empty() {
+        result.full_stderr
     } else {
-        format!("{stdout}\n{stderr}")
+        format!("{}\n{}", result.full_stdout, result.full_stderr)
     };
     let passed = evaluate_success_condition(success_condition, exit_code, &combined)?;
 
-    // Truncate only what we persist and hand to the next node, keeping the
-    // tail where compilers and test runners put the failure summary.
-    let (stdout, truncated_stdout) = truncate_check_output(stdout);
-    let (stderr, truncated_stderr) = truncate_check_output(stderr);
-    let truncated = truncated_stdout || truncated_stderr;
+    // Build check-node-specific output with loop/spec/node metadata.
+    let mut output_json = result.output;
+    output_json["loop_id"] = serde_json::json!(lp.id);
+    output_json["spec_id"] = serde_json::json!(spec.id);
+    output_json["node_id"] = serde_json::json!(node.id);
+    output_json["success_condition"] = serde_json::json!(success_condition);
+    output_json["passed"] = serde_json::json!(passed);
 
-    let mut output_json = serde_json::json!({
-        "kind": "check",
-        "loop_id": lp.id,
-        "spec_id": spec.id,
-        "node_id": node.id,
-        "command": command,
-        "success_condition": success_condition,
-        "exit_code": exit_code,
-        "stdout": stdout,
-        "stderr": stderr,
-        "passed": passed,
-    });
-    if truncated {
-        output_json["truncated"] = serde_json::Value::Bool(true);
-    }
-
-    // CT3: cache the final tails for the post-completion dialog view. Best
-    // effort — a snapshot failure must never fail the node itself.
-    let _ = db.set_loop_run_tail_snapshot(run_id, Some(&stdout), Some(&stderr));
+    // Override the status from the success_condition evaluation.
+    let status = if passed {
+        LoopRunStatus::Pass
+    } else {
+        LoopRunStatus::Fail
+    };
 
     Ok(NodeExecution {
-        status: if passed {
-            LoopRunStatus::Pass
-        } else {
-            LoopRunStatus::Fail
-        },
+        status,
         output: output_json,
         summary: format!(
             "Check node '{}' {}.",
@@ -5824,6 +5928,47 @@ fn render_hook_prompt(
 
     Ok(crate::domain::prompts::render_template(
         prompt_template,
+        |raw| match raw {
+            "loop_name" => Some(ctx.loop_name.to_string()),
+            "workdir" => Some(ctx.workdir.to_string()),
+            "completed_specs" => Some(completed_specs_text.clone()),
+            "spec_name" => ctx.spec_name.map(str::to_string),
+            "spec_id" => ctx.spec_id.map(str::to_string),
+            "blocker" => ctx.blocker.map(str::to_string),
+            "node" => ctx.node_name.map(str::to_string),
+            _ => None,
+        },
+    ))
+}
+
+/// Render a hook command for the given event, binding only the placeholders
+/// that event supports. Returns `Err` if the template carries unbindable
+/// markers — the caller records a failed hook run instead of executing.
+fn render_hook_command(
+    event: &LoopHookEvent,
+    ctx: &HookContext<'_>,
+    command_template: &str,
+) -> Result<String> {
+    let bindings = hook_bindings_for_event(event);
+    refuse_unbindable_template(
+        &format!("{} hook command", event.as_str()),
+        command_template,
+        bindings,
+        None,
+    )?;
+
+    let completed_specs_text = if ctx.completed_specs.is_empty() {
+        "(none)".to_string()
+    } else {
+        ctx.completed_specs
+            .iter()
+            .map(|(name, summary)| format!("- {name}: {summary}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    Ok(crate::domain::prompts::render_template(
+        command_template,
         |raw| match raw {
             "loop_name" => Some(ctx.loop_name.to_string()),
             "workdir" => Some(ctx.workdir.to_string()),
@@ -13295,10 +13440,11 @@ echo done
 
         let marker_path = marker.to_string_lossy().to_string();
         let hook = crate::domain::loops::LoopCompletionHook {
-            platform: "test-cli".to_string(),
+            platform: Some("test-cli".to_string()),
             model: None,
             effort: None,
-            prompt: format!("touch \"{}\"", marker_path),
+            prompt: Some(format!("touch \"{}\"", marker_path)),
+            command: None,
             timeout_minutes: Some(1),
         };
         db.update_loop_completion_hook(&loop_id, Some(&hook))
@@ -13346,10 +13492,11 @@ echo done
 
         let marker_path = marker.to_string_lossy().to_string();
         let hook = crate::domain::loops::LoopCompletionHook {
-            platform: "test-cli".to_string(),
+            platform: Some("test-cli".to_string()),
             model: None,
             effort: None,
-            prompt: format!("touch \"{}\"", marker_path),
+            prompt: Some(format!("touch \"{}\"", marker_path)),
+            command: None,
             timeout_minutes: Some(1),
         };
         db.update_loop_completion_hook(&loop_id, Some(&hook))
@@ -13396,10 +13543,11 @@ echo done
 
         let marker_path = marker.to_string_lossy().to_string();
         let hook = crate::domain::loops::LoopCompletionHook {
-            platform: "test-cli".to_string(),
+            platform: Some("test-cli".to_string()),
             model: None,
             effort: None,
-            prompt: format!("echo fire >> \"{}\"", marker_path),
+            prompt: Some(format!("echo fire >> \"{}\"", marker_path)),
+            command: None,
             timeout_minutes: Some(1),
         };
         db.update_loop_completion_hook(&loop_id, Some(&hook))
@@ -14272,10 +14420,11 @@ echo done
 
         let marker_path = marker.to_string_lossy().to_string();
         let hook = crate::domain::loops::LoopCompletionHook {
-            platform: "test-cli".to_string(),
+            platform: Some("test-cli".to_string()),
             model: None,
             effort: None,
-            prompt: format!("touch \"{}\"", marker_path),
+            prompt: Some(format!("touch \"{}\"", marker_path)),
+            command: None,
             timeout_minutes: Some(1),
         };
         db.update_loop_completion_hook(&loop_id, Some(&hook))
@@ -14324,10 +14473,11 @@ echo done
 
         let marker_path = marker.to_string_lossy().to_string();
         let hook = crate::domain::loops::LoopCompletionHook {
-            platform: "test-cli".to_string(),
+            platform: Some("test-cli".to_string()),
             model: None,
             effort: None,
-            prompt: format!("touch \"{}\"", marker_path),
+            prompt: Some(format!("touch \"{}\"", marker_path)),
+            command: None,
             timeout_minutes: Some(1),
         };
         db.update_loop_completion_hook(&loop_id, Some(&hook))
@@ -14566,10 +14716,11 @@ echo done
 
         // Hook that always fails (exit 1).
         let hook = crate::domain::loops::LoopCompletionHook {
-            platform: "test-cli".to_string(),
+            platform: Some("test-cli".to_string()),
             model: None,
             effort: None,
-            prompt: "exit 1".to_string(),
+            prompt: Some("exit 1".to_string()),
+            command: None,
             timeout_minutes: Some(1),
         };
         db.update_loop_completion_hook(&loop_id, Some(&hook))
@@ -14619,10 +14770,11 @@ echo done
         // Marker path embeds {{spec_name}} so a passing run proves binding.
         let marker = dir.path().join("spec-Spec.marker");
         let hook = crate::domain::loops::LoopCompletionHook {
-            platform: "test-cli".to_string(),
+            platform: Some("test-cli".to_string()),
             model: None,
             effort: None,
-            prompt: format!("touch \"{}\"", marker.display()),
+            prompt: Some(format!("touch \"{}\"", marker.display())),
+            command: None,
             timeout_minutes: Some(1),
         };
         let mut hooks = std::collections::BTreeMap::new();
@@ -14678,10 +14830,11 @@ echo done
 
         let marker = dir.path().join("queue-spec.marker");
         let hook = crate::domain::loops::LoopCompletionHook {
-            platform: "test-cli".to_string(),
+            platform: Some("test-cli".to_string()),
             model: None,
             effort: None,
-            prompt: format!("touch \"{}\"", marker.display()),
+            prompt: Some(format!("touch \"{}\"", marker.display())),
+            command: None,
             timeout_minutes: Some(1),
         };
         let mut hooks = std::collections::BTreeMap::new();
@@ -14743,10 +14896,11 @@ echo done
         // If {{blocker}}/{{node}} were unbound the render would fail and the
         // hook run would be Fail; Pass proves both bound.
         let hook = crate::domain::loops::LoopCompletionHook {
-            platform: "test-cli".to_string(),
+            platform: Some("test-cli".to_string()),
             model: None,
             effort: None,
-            prompt: "echo \"{{blocker}} {{node}}\" > /dev/null".to_string(),
+            prompt: Some("echo \"{{blocker}} {{node}}\" > /dev/null".to_string()),
+            command: None,
             timeout_minutes: Some(1),
         };
         let mut hooks = std::collections::BTreeMap::new();
@@ -14808,10 +14962,11 @@ echo done
         })
         .unwrap();
         let hook = crate::domain::loops::LoopCompletionHook {
-            platform: "test-cli".to_string(),
+            platform: Some("test-cli".to_string()),
             model: None,
             effort: None,
-            prompt: "echo \"{{blocker}} {{node}}\" > /dev/null".to_string(),
+            prompt: Some("echo \"{{blocker}} {{node}}\" > /dev/null".to_string()),
+            command: None,
             timeout_minutes: Some(1),
         };
         let mut hooks = std::collections::BTreeMap::new();
@@ -14861,17 +15016,19 @@ echo done
 
         let marker = dir.path().join("second_hook.marker");
         let failing = crate::domain::loops::LoopCompletionHook {
-            platform: "test-cli".to_string(),
+            platform: Some("test-cli".to_string()),
             model: None,
             effort: None,
-            prompt: "exit 1".to_string(),
+            prompt: Some("exit 1".to_string()),
+            command: None,
             timeout_minutes: Some(1),
         };
         let passing = crate::domain::loops::LoopCompletionHook {
-            platform: "test-cli".to_string(),
+            platform: Some("test-cli".to_string()),
             model: None,
             effort: None,
-            prompt: format!("touch \"{}\"", marker.display()),
+            prompt: Some(format!("touch \"{}\"", marker.display())),
+            command: None,
             timeout_minutes: Some(1),
         };
         let mut hooks = std::collections::BTreeMap::new();
@@ -14936,10 +15093,11 @@ echo done
         // Register after the fact — must not fire retroactively.
         let marker = dir.path().join("late_hook.marker");
         let hook = crate::domain::loops::LoopCompletionHook {
-            platform: "test-cli".to_string(),
+            platform: Some("test-cli".to_string()),
             model: None,
             effort: None,
-            prompt: format!("touch \"{}\"", marker.display()),
+            prompt: Some(format!("touch \"{}\"", marker.display())),
+            command: None,
             timeout_minutes: Some(1),
         };
         let mut hooks = std::collections::BTreeMap::new();
@@ -14956,6 +15114,210 @@ echo done
             .unwrap()
             .is_empty());
         assert!(!marker.exists());
+    }
+
+    // ── CH2: command hook tests ────────────────────────────────────────
+
+    /// A command hook on `on_spec_completed` runs once per spec, in the
+    /// loop's workdir.
+    #[tokio::test]
+    async fn command_hook_on_spec_completed_runs_once_per_spec() {
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        // Second spec with its own check node.
+        let spec2 = crate::domain::loops::LoopSpec {
+            id: "spec-test-2".to_string(),
+            loop_id: Some(loop_id.clone()),
+            name: "Spec2".to_string(),
+            description: Some(
+                "Functional Requirements:\n- A\n\nNon-Functional Requirements:\n- B\n\nObjective:\n- C\n\nConstraints:\n- D\n\nGuidelines:\n- E\n\nIn Scope:\n- F\n\nOut of Scope:\n- G".to_string(),
+            ),
+            position: 2,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        db.insert_loop_spec(&spec2).unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-check-1".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check1".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-check-2".to_string(),
+            spec_id: Some("spec-test-2".to_string()),
+            loop_id: None,
+            name: "check2".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        // Command hook: touch a marker file named after the spec.
+        let hook = crate::domain::loops::LoopCompletionHook {
+            platform: None,
+            model: None,
+            effort: None,
+            prompt: None,
+            command: Some("touch \"{{spec_name}}.marker\"".to_string()),
+            timeout_minutes: Some(1),
+        };
+        let mut hooks = std::collections::BTreeMap::new();
+        hooks.insert(
+            crate::domain::loops::LoopHookEvent::OnSpecCompleted,
+            vec![hook],
+        );
+        db.update_loop_hooks(&loop_id, &hooks).unwrap();
+
+        let result = engine
+            .run_loop(loop_id.clone(), None, None, None, None)
+            .await;
+        result.unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Completed);
+
+        let spec1_marker = dir.path().join("Spec.marker");
+        let spec2_marker = dir.path().join("Spec2.marker");
+        assert!(
+            spec1_marker.exists(),
+            "on_spec_completed hook must have run for spec1"
+        );
+        assert!(
+            spec2_marker.exists(),
+            "on_spec_completed hook must have run for spec2"
+        );
+
+        let hook_runs = db.list_loop_completion_hook_runs(&loop_id).unwrap();
+        assert_eq!(hook_runs.len(), 2, "hook must fire once per spec");
+        assert!(hook_runs.iter().all(|r| r.status == LoopRunStatus::Pass));
+    }
+
+    /// A command hook exiting non-zero while writing to stdout and stderr
+    /// records all three, and the loop's status is untouched.
+    #[tokio::test]
+    async fn command_hook_nonzero_exit_records_output_and_does_not_affect_loop() {
+        let fake_home = setup_test_cli_home();
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        // Command hook that exits non-zero and writes to both streams.
+        let hook = crate::domain::loops::LoopCompletionHook {
+            platform: None,
+            model: None,
+            effort: None,
+            prompt: None,
+            command: Some("echo out; echo err >&2; exit 3".to_string()),
+            timeout_minutes: Some(1),
+        };
+        let mut hooks = std::collections::BTreeMap::new();
+        hooks.insert(crate::domain::loops::LoopHookEvent::OnCompleted, vec![hook]);
+        db.update_loop_hooks(&loop_id, &hooks).unwrap();
+
+        let _home = HomeGuard::set(fake_home.path());
+        let result = engine
+            .run_loop(loop_id.clone(), None, None, None, None)
+            .await;
+        drop(_home);
+        drop(fake_home);
+        result.unwrap();
+
+        // Loop completed successfully despite hook failure.
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Completed);
+
+        let hook_runs = db.list_loop_completion_hook_runs(&loop_id).unwrap();
+        assert_eq!(hook_runs.len(), 1);
+        assert_eq!(hook_runs[0].status, LoopRunStatus::Fail);
+
+        let output = hook_runs[0].output.as_ref().unwrap();
+        assert_eq!(output["exit_code"], 3);
+        assert_eq!(output["stdout"], "out");
+        assert_eq!(output["stderr"], "err");
+        assert_eq!(output["command"], "echo out; echo err >&2; exit 3");
+    }
+
+    /// A placeholder in the command is substituted before execution.
+    #[tokio::test]
+    async fn command_hook_placeholder_substitution() {
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let output_file = dir.path().join("placeholder_output");
+        let output_path = output_file.to_string_lossy().to_string();
+        let hook = crate::domain::loops::LoopCompletionHook {
+            platform: None,
+            model: None,
+            effort: None,
+            prompt: None,
+            command: Some(format!("echo {{{{spec_name}}}} > \"{}\"", output_path)),
+            timeout_minutes: Some(1),
+        };
+        let mut hooks = std::collections::BTreeMap::new();
+        hooks.insert(
+            crate::domain::loops::LoopHookEvent::OnSpecCompleted,
+            vec![hook],
+        );
+        db.update_loop_hooks(&loop_id, &hooks).unwrap();
+
+        let result = engine
+            .run_loop(loop_id.clone(), None, None, None, None)
+            .await;
+        result.unwrap();
+
+        let content = std::fs::read_to_string(&output_file).unwrap();
+        assert_eq!(content.trim(), "Spec", "placeholder must be substituted");
     }
 
     /// Process group children must die with the parent: spawn a check node
@@ -18838,6 +19200,56 @@ echo done
             "truncated stdout must be bounded, got len {}",
             stdout.len()
         );
+    }
+
+    /// A check node's `success_condition` is evaluated against the command's
+    /// *full* output, even when that output is large enough to be truncated
+    /// for storage. Regression guard for the CH2 refactor that routed check
+    /// nodes through `execute_shell_command`: if the condition were checked
+    /// against the stored (tail-only) `stdout` instead, this marker — emitted
+    /// first, then buried under >64KB — would be gone and the check would
+    /// wrongly fail.
+    #[tokio::test]
+    async fn check_node_success_condition_sees_full_output_not_just_truncated_tail() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-check-early-marker".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "early-marker-check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf 'EARLY_MARKER_77 '; head -c 70000 /dev/zero | tr '\\0' 'A'",
+                "success_condition": "exit_code_0_and_output_contains:EARLY_MARKER_77"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        engine
+            .run_loop(loop_id.clone(), None, None, None, None)
+            .await
+            .unwrap();
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        let run = runs
+            .iter()
+            .find(|r| r.node_id == "node-check-early-marker")
+            .unwrap();
+        assert_eq!(
+            run.status,
+            LoopRunStatus::Pass,
+            "condition must match the marker in the full output even though it is truncated for storage"
+        );
+        let out = run.output.as_ref().unwrap();
+        assert_eq!(out["truncated"], serde_json::Value::Bool(true));
+        assert_eq!(out["passed"], serde_json::Value::Bool(true));
+        // The stored stdout has lost the early marker to truncation — proof
+        // the pass above came from evaluating the full output, not this.
+        let stored_stdout = out["stdout"].as_str().unwrap();
+        assert!(!stored_stdout.contains("EARLY_MARKER_77"));
     }
 
     // ── CT3: live tailing — streaming, timeout, zero-output, truncation ──

@@ -502,19 +502,42 @@ pub struct Loop {
     pub infra_node_id: Option<String>,
 }
 
-/// Config for a loop's `on_completed` hook — deliberately shaped like an
-/// agent node's config (`platform`/`model`/`timeout_minutes`) so it reuses
-/// the same CLI-resolution and spawn path, but keeps its own `prompt` field
-/// (rather than `prompt_template`) since it has no spec/node graph context to
-/// template against — only the placeholders `render_completion_hook_prompt`
-/// documents.
+/// Config for a loop completion hook — either an agent payload
+/// (`platform`/`model`/`prompt`) or a direct shell command (`command`).
+/// Exactly one mode must be configured; the engine validates this at
+/// creation time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopCompletionHook {
-    pub platform: String,
+    /// CLI platform for agent hooks (e.g. "mimo", "claude"). `None` for
+    /// command hooks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
-    pub prompt: String,
+    /// Hook prompt template (agent hooks only). `None` for command hooks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// Shell command to run directly (command hooks only). Supports the same
+    /// `{{...}}` placeholders as the hook's event, substituted before
+    /// execution. WARNING: do not configure a command that starts a canopy
+    /// binary — it triggers daemon-startup recovery, which SIGTERMs live
+    /// loop runs including the run that spawned the hook.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
     pub timeout_minutes: Option<u64>,
+}
+
+impl LoopCompletionHook {
+    /// Whether this is a command hook (runs a shell command directly).
+    pub fn is_command(&self) -> bool {
+        self.command.is_some()
+    }
+
+    /// Whether this is an agent hook (launches a CLI process).
+    #[allow(dead_code)]
+    pub fn is_agent(&self) -> bool {
+        self.platform.is_some()
+    }
 }
 
 impl Loop {

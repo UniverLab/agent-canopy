@@ -6345,10 +6345,11 @@ mod hooks_tests {
 
     fn hook_fixture(platform: &str, prompt: &str) -> LoopCompletionHook {
         LoopCompletionHook {
-            platform: platform.to_string(),
+            platform: Some(platform.to_string()),
             model: Some("test-model".to_string()),
             effort: None,
-            prompt: prompt.to_string(),
+            prompt: Some(prompt.to_string()),
+            command: None,
             timeout_minutes: Some(5),
         }
     }
@@ -6424,7 +6425,7 @@ mod hooks_tests {
                 .first()
                 .unwrap()
                 .prompt,
-            "failed: {{blocker}}"
+            Some("failed: {{blocker}}".to_string())
         );
     }
 
@@ -6568,7 +6569,7 @@ mod hooks_tests {
             .get(&LoopHookEvent::OnCompleted)
             .expect("legacy hook must appear under on_completed");
         assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0].platform, "claude");
+        assert_eq!(completed[0].platform.as_deref(), Some("claude"));
     }
 
     #[test]
@@ -6589,7 +6590,7 @@ mod hooks_tests {
         let retrieved = db.get_loop("loop1").unwrap().unwrap();
         let completed = retrieved.hooks.get(&LoopHookEvent::OnCompleted).unwrap();
         assert_eq!(completed.len(), 2);
-        assert_eq!(completed[0].platform, "claude");
-        assert_eq!(completed[1].platform, "mimo");
+        assert_eq!(completed[0].platform.as_deref(), Some("claude"));
+        assert_eq!(completed[1].platform.as_deref(), Some("mimo"));
     }
 }

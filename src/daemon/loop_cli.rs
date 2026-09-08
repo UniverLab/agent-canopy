@@ -525,11 +525,18 @@ fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
         .get(&crate::domain::loops::LoopHookEvent::OnCompleted)
     {
         if let Some(hook) = hooks.first() {
-            println!(
-                " on_completed: {} ({})",
-                hook.platform,
-                hook.model.as_deref().unwrap_or("default model")
-            );
+            if hook.is_command() {
+                println!(
+                    " on_completed: command: {}",
+                    hook.command.as_deref().unwrap_or("")
+                );
+            } else {
+                println!(
+                    " on_completed: {} ({})",
+                    hook.platform.as_deref().unwrap_or(""),
+                    hook.model.as_deref().unwrap_or("default model")
+                );
+            }
         }
     }
     for (event, hooks) in &lp.hooks {
@@ -537,23 +544,41 @@ fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
         // list every event's hooks here so non-completion events are visible.
         if *event == crate::domain::loops::LoopHookEvent::OnCompleted {
             for (idx, hook) in hooks.iter().enumerate().skip(1) {
-                println!(
-                    " {}[{}]: {} ({})",
-                    event.as_str(),
-                    idx,
-                    hook.platform,
-                    hook.model.as_deref().unwrap_or("default model")
-                );
+                if hook.is_command() {
+                    println!(
+                        " {}[{}]: command: {}",
+                        event.as_str(),
+                        idx,
+                        hook.command.as_deref().unwrap_or("")
+                    );
+                } else {
+                    println!(
+                        " {}[{}]: {} ({})",
+                        event.as_str(),
+                        idx,
+                        hook.platform.as_deref().unwrap_or(""),
+                        hook.model.as_deref().unwrap_or("default model")
+                    );
+                }
             }
         } else {
             for (idx, hook) in hooks.iter().enumerate() {
-                println!(
-                    " {}[{}]: {} ({})",
-                    event.as_str(),
-                    idx,
-                    hook.platform,
-                    hook.model.as_deref().unwrap_or("default model")
-                );
+                if hook.is_command() {
+                    println!(
+                        " {}[{}]: command: {}",
+                        event.as_str(),
+                        idx,
+                        hook.command.as_deref().unwrap_or("")
+                    );
+                } else {
+                    println!(
+                        " {}[{}]: {} ({})",
+                        event.as_str(),
+                        idx,
+                        hook.platform.as_deref().unwrap_or(""),
+                        hook.model.as_deref().unwrap_or("default model")
+                    );
+                }
             }
         }
     }

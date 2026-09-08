@@ -205,40 +205,71 @@ pub(crate) fn build_loop_trigger(
 }
 
 /// Build a validated [`crate::domain::loops::LoopCompletionHook`] from MCP
-/// params — same shape of requirement as an agent node's config
-/// (`validate_node_config`'s `LoopNodeKind::Agent` arm): a non-empty
-/// `platform`. `prompt` is required outright (unlike a node's
-/// `prompt_template`, which defaults) since a completion hook has no
-/// spec/node graph context to fall back on.
+/// params — either an agent payload (platform + prompt) or a command.
+/// Exactly one mode must be configured; both or neither is rejected.
 fn build_loop_completion_hook(
     params: &LoopCompletionHookParams,
 ) -> Result<crate::domain::loops::LoopCompletionHook, String> {
-    let platform = params.platform.trim();
-    if platform.is_empty() {
-        return Err("on_completed hook 'platform' must not be empty.".to_string());
-    }
-    let prompt = params.prompt.trim();
-    if prompt.is_empty() {
-        return Err("on_completed hook 'prompt' must not be empty.".to_string());
-    }
-    let model = params
-        .model
+    let has_platform = params
+        .platform
         .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    let effort = params
-        .effort
+        .is_some_and(|s| !s.trim().is_empty());
+    let has_command = params
+        .command
         .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
+        .is_some_and(|s| !s.trim().is_empty());
 
+    if has_platform && has_command {
+        return Err("Hook cannot have both a 'command' and an agent payload \
+             ('platform'/'prompt'). Configure exactly one."
+            .to_string());
+    }
+    if !has_platform && !has_command {
+        return Err("Hook must have either a 'command' or an agent payload \
+             ('platform' + 'prompt'). Configure exactly one."
+            .to_string());
+    }
+
+    if has_platform {
+        let platform = params.platform.as_deref().unwrap().trim().to_string();
+        let prompt = params
+            .prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "Agent hook 'prompt' must not be empty.".to_string())?
+            .to_string();
+        let model = params
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let effort = params
+            .effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+
+        return Ok(crate::domain::loops::LoopCompletionHook {
+            platform: Some(platform),
+            model,
+            effort,
+            prompt: Some(prompt),
+            command: None,
+            timeout_minutes: params.timeout_minutes,
+        });
+    }
+
+    // Command mode
+    let command = params.command.as_deref().unwrap().trim().to_string();
     Ok(crate::domain::loops::LoopCompletionHook {
-        platform: platform.to_string(),
-        model,
-        effort,
-        prompt: prompt.to_string(),
+        platform: None,
+        model: None,
+        effort: None,
+        prompt: None,
+        command: Some(command),
         timeout_minutes: params.timeout_minutes,
     })
 }
@@ -8894,6 +8925,7 @@ fn loop_completion_hook_json(hook: &crate::domain::loops::LoopCompletionHook) ->
         "model": hook.model,
         "effort": hook.effort,
         "prompt": hook.prompt,
+        "command": hook.command,
         "timeout_minutes": hook.timeout_minutes,
     })
 }
@@ -12463,36 +12495,39 @@ mod tests {
     #[test]
     fn build_loop_completion_hook_rejects_empty_platform() {
         let params = LoopCompletionHookParams {
-            platform: "".to_string(),
+            platform: Some("".to_string()),
             model: None,
             effort: None,
-            prompt: "run tests".to_string(),
+            prompt: Some("run tests".to_string()),
+            command: None,
             timeout_minutes: None,
         };
         let err = build_loop_completion_hook(&params).unwrap_err();
-        assert!(err.contains("platform"), "{err}");
+        assert!(err.contains("must have either"), "{err}");
     }
 
     #[test]
     fn build_loop_completion_hook_rejects_whitespace_platform() {
         let params = LoopCompletionHookParams {
-            platform: "   ".to_string(),
+            platform: Some("   ".to_string()),
             model: None,
             effort: None,
-            prompt: "run tests".to_string(),
+            prompt: Some("run tests".to_string()),
+            command: None,
             timeout_minutes: None,
         };
         let err = build_loop_completion_hook(&params).unwrap_err();
-        assert!(err.contains("platform"), "{err}");
+        assert!(err.contains("must have either"), "{err}");
     }
 
     #[test]
     fn build_loop_completion_hook_rejects_empty_prompt() {
         let params = LoopCompletionHookParams {
-            platform: "claude".to_string(),
+            platform: Some("claude".to_string()),
             model: None,
             effort: None,
-            prompt: "".to_string(),
+            prompt: Some("".to_string()),
+            command: None,
             timeout_minutes: None,
         };
         let err = build_loop_completion_hook(&params).unwrap_err();
@@ -12502,10 +12537,11 @@ mod tests {
     #[test]
     fn build_loop_completion_hook_rejects_whitespace_prompt() {
         let params = LoopCompletionHookParams {
-            platform: "claude".to_string(),
+            platform: Some("claude".to_string()),
             model: None,
             effort: None,
-            prompt: "  \t  ".to_string(),
+            prompt: Some("  \t  ".to_string()),
+            command: None,
             timeout_minutes: None,
         };
         let err = build_loop_completion_hook(&params).unwrap_err();
@@ -12515,41 +12551,44 @@ mod tests {
     #[test]
     fn build_loop_completion_hook_accepts_valid_config() {
         let params = LoopCompletionHookParams {
-            platform: "claude".to_string(),
+            platform: Some("claude".to_string()),
             model: Some("opus-4".to_string()),
             effort: None,
-            prompt: "{{loop_name}} completed".to_string(),
+            prompt: Some("{{loop_name}} completed".to_string()),
+            command: None,
             timeout_minutes: Some(10),
         };
         let hook = build_loop_completion_hook(&params).unwrap();
-        assert_eq!(hook.platform, "claude");
+        assert_eq!(hook.platform.as_deref(), Some("claude"));
         assert_eq!(hook.model, Some("opus-4".to_string()));
-        assert_eq!(hook.prompt, "{{loop_name}} completed");
+        assert_eq!(hook.prompt.as_deref(), Some("{{loop_name}} completed"));
         assert_eq!(hook.timeout_minutes, Some(10));
     }
 
     #[test]
     fn build_loop_completion_hook_strips_whitespace() {
         let params = LoopCompletionHookParams {
-            platform: "  claude  ".to_string(),
+            platform: Some("  claude  ".to_string()),
             model: Some("  opus  ".to_string()),
             effort: None,
-            prompt: "  test  ".to_string(),
+            prompt: Some("  test  ".to_string()),
+            command: None,
             timeout_minutes: None,
         };
         let hook = build_loop_completion_hook(&params).unwrap();
-        assert_eq!(hook.platform, "claude");
+        assert_eq!(hook.platform.as_deref(), Some("claude"));
         assert_eq!(hook.model, Some("opus".to_string()));
-        assert_eq!(hook.prompt, "test");
+        assert_eq!(hook.prompt.as_deref(), Some("test"));
     }
 
     #[test]
     fn build_loop_completion_hook_empty_model_becomes_none() {
         let params = LoopCompletionHookParams {
-            platform: "claude".to_string(),
+            platform: Some("claude".to_string()),
             model: Some("  ".to_string()),
             effort: None,
-            prompt: "test".to_string(),
+            prompt: Some("test".to_string()),
+            command: None,
             timeout_minutes: None,
         };
         let hook = build_loop_completion_hook(&params).unwrap();
@@ -12557,6 +12596,66 @@ mod tests {
     }
 
     // ── member_node_config ──────────────────────────────────────────
+
+    #[test]
+    fn build_loop_completion_hook_rejects_both_command_and_agent() {
+        let params = LoopCompletionHookParams {
+            platform: Some("claude".to_string()),
+            model: None,
+            effort: None,
+            prompt: Some("test".to_string()),
+            command: Some("echo hi".to_string()),
+            timeout_minutes: None,
+        };
+        let err = build_loop_completion_hook(&params).unwrap_err();
+        assert!(err.contains("command"), "{err}");
+        assert!(err.contains("platform"), "{err}");
+    }
+
+    #[test]
+    fn build_loop_completion_hook_rejects_neither_command_nor_agent() {
+        let params = LoopCompletionHookParams {
+            platform: None,
+            model: None,
+            effort: None,
+            prompt: None,
+            command: None,
+            timeout_minutes: None,
+        };
+        let err = build_loop_completion_hook(&params).unwrap_err();
+        assert!(err.contains("either"), "{err}");
+    }
+
+    #[test]
+    fn build_loop_completion_hook_accepts_command_only() {
+        let params = LoopCompletionHookParams {
+            platform: None,
+            model: None,
+            effort: None,
+            prompt: None,
+            command: Some("echo hello".to_string()),
+            timeout_minutes: Some(5),
+        };
+        let hook = build_loop_completion_hook(&params).unwrap();
+        assert_eq!(hook.command.as_deref(), Some("echo hello"));
+        assert!(hook.platform.is_none());
+        assert!(hook.prompt.is_none());
+        assert_eq!(hook.timeout_minutes, Some(5));
+    }
+
+    #[test]
+    fn build_loop_completion_hook_command_strips_whitespace() {
+        let params = LoopCompletionHookParams {
+            platform: None,
+            model: None,
+            effort: None,
+            prompt: None,
+            command: Some("  echo hello  ".to_string()),
+            timeout_minutes: None,
+        };
+        let hook = build_loop_completion_hook(&params).unwrap();
+        assert_eq!(hook.command.as_deref(), Some("echo hello"));
+    }
 
     #[test]
     fn member_node_config_produces_correct_shape() {
@@ -13890,10 +13989,11 @@ mod additional_tests {
     #[test]
     fn build_loop_completion_hook_none_model_becomes_none() {
         let params = LoopCompletionHookParams {
-            platform: "claude".to_string(),
+            platform: Some("claude".to_string()),
             model: None,
             effort: None,
-            prompt: "test".to_string(),
+            prompt: Some("test".to_string()),
+            command: None,
             timeout_minutes: None,
         };
         let hook = build_loop_completion_hook(&params).unwrap();
@@ -13903,10 +14003,11 @@ mod additional_tests {
     #[test]
     fn build_loop_completion_hook_timeout_passthrough() {
         let params = LoopCompletionHookParams {
-            platform: "mimo".to_string(),
+            platform: Some("mimo".to_string()),
             model: None,
             effort: None,
-            prompt: "do stuff".to_string(),
+            prompt: Some("do stuff".to_string()),
+            command: None,
             timeout_minutes: Some(45),
         };
         let hook = build_loop_completion_hook(&params).unwrap();
@@ -15367,10 +15468,11 @@ mod coverage_tests {
     #[test]
     fn hook_json_full() {
         let hook = LoopCompletionHook {
-            platform: "claude".into(),
+            platform: Some("claude".into()),
             model: Some("opus-4".into()),
             effort: None,
-            prompt: "{{loop_name}} done".into(),
+            prompt: Some("{{loop_name}} done".into()),
+            command: None,
             timeout_minutes: Some(10),
         };
         let json = super::loop_completion_hook_json(&hook);
@@ -15382,10 +15484,11 @@ mod coverage_tests {
     #[test]
     fn hook_json_no_model() {
         let hook = LoopCompletionHook {
-            platform: "mimo".into(),
+            platform: Some("mimo".into()),
             model: None,
             effort: None,
-            prompt: "t".into(),
+            prompt: Some("t".into()),
+            command: None,
             timeout_minutes: None,
         };
         let json = super::loop_completion_hook_json(&hook);
