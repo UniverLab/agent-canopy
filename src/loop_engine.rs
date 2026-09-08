@@ -10,8 +10,9 @@ use crate::application::notification_service::{LoopFinishOutcome, NotificationSe
 use crate::daemon::process::KILL_GRACE;
 use crate::db::Database;
 use crate::domain::loops::{
-    EnsembleDetails, EnsembleKind, EnsembleMember, LoopEdge, LoopEdgeCondition, LoopNode,
-    LoopNodeKind, LoopNodeRun, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus, RouterRoute,
+    EnsembleDetails, EnsembleKind, EnsembleMember, Loop, LoopCompletionHookRun, LoopEdge,
+    LoopEdgeCondition, LoopHookEvent, LoopNode, LoopNodeKind, LoopNodeRun, LoopRunStatus, LoopSpec,
+    LoopSpecStatus, LoopStatus, RouterRoute,
 };
 use crate::domain::models::Cli;
 use crate::domain::sandbox::Sandbox;
@@ -206,7 +207,9 @@ impl LoopEngine {
                     tracing::error!("Loop '{}' launch refused: {error:#}", loop_id);
                 } else {
                     tracing::error!("Loop '{}' failed to run: {error:#}", loop_id);
-                    let _ = self.fail_loop(&loop_id, None, None, &error.to_string());
+                    let _ = self
+                        .fail_loop(&loop_id, None, None, &error.to_string())
+                        .await;
                 }
             }
         });
@@ -440,6 +443,7 @@ impl LoopEngine {
                             {
                                 SpecExecutionOutcome::Completed { summary } => {
                                     completed_specs.push((spec.name.clone(), summary));
+                                    self.fire_on_spec_completed_hooks(&lp, &spec).await;
                                 }
                                 // B42: a superseded run is silent — a newer
                                 // dispatch now owns this loop, so stop without
@@ -453,11 +457,13 @@ impl LoopEngine {
                                         Some(claimed_at),
                                         Some(&spec.name),
                                         &summary,
-                                    )?;
+                                    )
+                                    .await?;
                                     return Ok(());
                                 }
                                 SpecExecutionOutcome::Blocked(blocker) => {
-                                    self.block_loop(&loop_id, Some(claimed_at), &blocker)?;
+                                    self.block_loop(&loop_id, Some(claimed_at), &blocker)
+                                        .await?;
                                     return Ok(());
                                 }
                             }
@@ -487,17 +493,20 @@ impl LoopEngine {
                     {
                         SpecExecutionOutcome::Completed { summary } => {
                             completed_specs.push((spec.name.clone(), summary));
+                            self.fire_on_spec_completed_hooks(&lp, &spec).await;
                             continue;
                         }
                         SpecExecutionOutcome::Paused | SpecExecutionOutcome::Superseded => {
                             return Ok(())
                         }
                         SpecExecutionOutcome::Failed(summary) => {
-                            self.fail_loop(&loop_id, Some(claimed_at), Some(&spec.name), &summary)?;
+                            self.fail_loop(&loop_id, Some(claimed_at), Some(&spec.name), &summary)
+                                .await?;
                             return Ok(());
                         }
                         SpecExecutionOutcome::Blocked(blocker) => {
-                            self.block_loop(&loop_id, Some(claimed_at), &blocker)?;
+                            self.block_loop(&loop_id, Some(claimed_at), &blocker)
+                                .await?;
                             return Ok(());
                         }
                     }
@@ -549,12 +558,14 @@ impl LoopEngine {
                         // this before the claim. Unwind the claim rather than
                         // leaving the loop `Running` with nothing to execute.
                         let message = self.empty_spec_set_message(&lp, None)?;
-                        self.fail_loop(&loop_id, Some(claimed_at), None, &message)?;
+                        self.fail_loop(&loop_id, Some(claimed_at), None, &message)
+                            .await?;
                         return Err(EmptySpecSetError(message).into());
                     };
                     if idea_text.trim().is_empty() {
                         let message = self.empty_spec_set_message(&lp, None)?;
-                        self.fail_loop(&loop_id, Some(claimed_at), None, &message)?;
+                        self.fail_loop(&loop_id, Some(claimed_at), None, &message)
+                            .await?;
                         return Err(EmptySpecSetError(message).into());
                     }
                     let mut placeholder = no_spec_placeholder(&loop_id);
@@ -576,17 +587,20 @@ impl LoopEngine {
                     match self.run_spec(&lp, &spec, &workdir, is_resume, None).await? {
                         SpecExecutionOutcome::Completed { summary } => {
                             completed_specs.push((spec.name.clone(), summary));
+                            self.fire_on_spec_completed_hooks(&lp, &spec).await;
                             continue;
                         }
                         SpecExecutionOutcome::Paused | SpecExecutionOutcome::Superseded => {
                             return Ok(())
                         }
                         SpecExecutionOutcome::Failed(summary) => {
-                            self.fail_loop(&loop_id, Some(claimed_at), Some(&spec.name), &summary)?;
+                            self.fail_loop(&loop_id, Some(claimed_at), Some(&spec.name), &summary)
+                                .await?;
                             return Ok(());
                         }
                         SpecExecutionOutcome::Blocked(blocker) => {
-                            self.block_loop(&loop_id, Some(claimed_at), &blocker)?;
+                            self.block_loop(&loop_id, Some(claimed_at), &blocker)
+                                .await?;
                             return Ok(());
                         }
                     }
@@ -640,7 +654,11 @@ impl LoopEngine {
         // under it) still legitimately transitions to `Completed`, but must
         // never fire `on_completed` for work it didn't do.
         let executed_any_spec = !completed_specs.is_empty();
-        let hook_launched = executed_any_spec && lp.on_completed.is_some();
+        let hook_launched = executed_any_spec
+            && lp
+                .hooks
+                .get(&LoopHookEvent::OnCompleted)
+                .is_some_and(|hooks| !hooks.is_empty());
         self.notification_service.notify_loop_finished(
             &lp.name,
             LoopFinishOutcome::Completed {
@@ -683,6 +701,113 @@ impl LoopEngine {
         Ok(())
     }
 
+    /// Fire all hooks registered for `event`, in declaration order. Each
+    /// hook gets its own `LoopCompletionHookRun` row (visible via
+    /// `loop_get`/`canopy loop info`), and a failed hook is recorded and
+    /// never stops the remaining hooks of that event from running. Never
+    /// returns an `Err` — a malformed hook config or a failed process must
+    /// never propagate past the caller.
+    async fn fire_hooks(&self, lp: &Loop, event: LoopHookEvent, ctx: &HookContext<'_>) {
+        let Some(hooks) = lp.hooks.get(&event) else {
+            return;
+        };
+        if hooks.is_empty() {
+            return;
+        }
+
+        for (idx, hook) in hooks.iter().enumerate() {
+            // Recorded the moment the hook fires — even a platform that fails
+            // to resolve below still shows up in `loop_get`/`canopy loop info`
+            // as a failed firing, rather than silently vanishing.
+            let run_id = uuid::Uuid::new_v4().to_string();
+            if let Err(error) = self
+                .db
+                .insert_loop_completion_hook_run(&LoopCompletionHookRun {
+                    id: run_id.clone(),
+                    loop_id: lp.id.clone(),
+                    event,
+                    hook_index: idx as i64,
+                    status: LoopRunStatus::Running,
+                    output: None,
+                    summary: None,
+                    started_at: chrono::Utc::now(),
+                    completed_at: None,
+                    pid: None,
+                    boot_id: None,
+                })
+            {
+                tracing::warn!(
+                    "Loop '{}' failed to record {} hook run (index {idx}): {:#}",
+                    lp.name,
+                    event.as_str(),
+                    error
+                );
+                continue;
+            }
+
+            let execution = match Cli::resolve(Some(&hook.platform)) {
+                Ok(cli) => match render_hook_prompt(&event, ctx, &hook.prompt) {
+                    Ok(prompt) => {
+                        let mut strategy = cli.strategy();
+                        if prompt.len() > ARGV_SAFETY_THRESHOLD && !strategy.prompt_via_stdin {
+                            *strategy = strategy.with_stdin_forced();
+                        }
+                        let timeout_minutes = hook.timeout_minutes.unwrap_or(30);
+
+                        run_completion_hook_process(
+                            &self.db,
+                            &run_id,
+                            &cli,
+                            &strategy,
+                            &prompt,
+                            hook.model.as_deref(),
+                            hook.effort.as_deref(),
+                            ctx.workdir,
+                            timeout_minutes,
+                        )
+                        .await
+                    }
+                    Err(error) => HookExecution {
+                        status: LoopRunStatus::Fail,
+                        output: serde_json::json!({
+                            "platform": hook.platform,
+                            "error": error.to_string(),
+                        }),
+                        summary: format!("{} hook prompt is invalid: {error}", event.as_str()),
+                    },
+                },
+                Err(error) => HookExecution {
+                    status: LoopRunStatus::Fail,
+                    output: serde_json::json!({ "platform": hook.platform, "error": error }),
+                    summary: format!(
+                        "{} hook has an invalid platform '{}': {error}",
+                        event.as_str(),
+                        hook.platform
+                    ),
+                },
+            };
+
+            let _ = self.db.update_loop_completion_hook_run_result(
+                &run_id,
+                execution.status,
+                Some(&execution.output),
+                Some(&execution.summary),
+                Some(chrono::Utc::now()),
+            );
+
+            if execution.status != LoopRunStatus::Pass {
+                tracing::warn!(
+                    "Loop '{}' {} hook (index {idx}) failed: {}",
+                    lp.name,
+                    event.as_str(),
+                    execution.summary
+                );
+                self.notification_service
+                    .notify_loop_completion_hook_failed(&lp.name, &execution.summary);
+            }
+        }
+    }
+
     /// Fire `lp`'s `on_completed` hook (N2), if configured — a no-op
     /// otherwise. Runs through the same spawn path as a loop agent node
     /// ([`run_agent_process`]/[`spawn_and_wait_cli_process`]), records the
@@ -697,99 +822,16 @@ impl LoopEngine {
         workdir: &str,
         completed_specs: &[(String, String)],
     ) {
-        let Some(hook) = lp.on_completed.as_ref() else {
-            return;
+        let ctx = HookContext {
+            loop_name: &lp.name,
+            workdir,
+            completed_specs,
+            spec_name: None,
+            spec_id: None,
+            blocker: None,
+            node_name: None,
         };
-
-        // Recorded the moment the hook fires — even a platform that fails to
-        // resolve below still shows up in `loop_get`/`canopy loop info` as a
-        // failed firing, exactly like a spawn failure would, rather than
-        // silently vanishing.
-        let run_id = uuid::Uuid::new_v4().to_string();
-        if let Err(error) =
-            self.db
-                .insert_loop_completion_hook_run(&crate::domain::loops::LoopCompletionHookRun {
-                    id: run_id.clone(),
-                    loop_id: lp.id.clone(),
-                    status: LoopRunStatus::Running,
-                    output: None,
-                    summary: None,
-                    started_at: chrono::Utc::now(),
-                    completed_at: None,
-                    pid: None,
-                    boot_id: None,
-                })
-        {
-            tracing::warn!(
-                "Loop '{}' failed to record on_completed hook run: {:#}",
-                lp.name,
-                error
-            );
-        }
-
-        let execution = match Cli::resolve(Some(&hook.platform)) {
-            Ok(cli) => {
-                match render_completion_hook_prompt(lp, workdir, completed_specs, &hook.prompt) {
-                    Ok(prompt) => {
-                        let mut strategy = cli.strategy();
-                        // Same E2BIG safety net as an agent node (see
-                        // `execute_agent_node`): an oversized `{{completed_specs}}`
-                        // list must not crash the spawn.
-                        if prompt.len() > ARGV_SAFETY_THRESHOLD && !strategy.prompt_via_stdin {
-                            *strategy = strategy.with_stdin_forced();
-                        }
-                        let timeout_minutes = hook.timeout_minutes.unwrap_or(30);
-
-                        run_completion_hook_process(
-                            &self.db,
-                            &run_id,
-                            &cli,
-                            &strategy,
-                            &prompt,
-                            hook.model.as_deref(),
-                            hook.effort.as_deref(),
-                            workdir,
-                            timeout_minutes,
-                        )
-                        .await
-                    }
-                    Err(error) => HookExecution {
-                        status: LoopRunStatus::Fail,
-                        output: serde_json::json!({
-                            "platform": hook.platform,
-                            "error": error.to_string(),
-                        }),
-                        summary: format!("on_completed hook prompt is invalid: {error}"),
-                    },
-                }
-            }
-            Err(error) => HookExecution {
-                status: LoopRunStatus::Fail,
-                output: serde_json::json!({ "platform": hook.platform, "error": error }),
-                summary: format!(
-                    "on_completed hook has an invalid platform '{}': {error}",
-                    hook.platform
-                ),
-            },
-        };
-
-        let _ = self.db.update_loop_completion_hook_run_result(
-            &run_id,
-            execution.status,
-            Some(&execution.output),
-            Some(&execution.summary),
-            Some(chrono::Utc::now()),
-        );
-
-        if execution.status != LoopRunStatus::Pass {
-            tracing::warn!(
-                "Loop '{}' on_completed hook failed: {}",
-                lp.name,
-                execution.summary
-            );
-            self.notification_service
-                .notify_loop_completion_hook_failed(&lp.name, &execution.summary);
-        }
+        self.fire_hooks(lp, LoopHookEvent::OnCompleted, &ctx).await;
     }
 
     /// (CB22) Whether `spec` carries usable content: a trimmed non-empty
@@ -1035,7 +1077,9 @@ impl LoopEngine {
                     tracing::error!("Loop '{}' launch refused: {error:#}", loop_id);
                 } else {
                     tracing::error!("Loop '{}' failed to run: {error:#}", loop_id);
-                    let _ = self.fail_loop(&loop_id, None, None, &error.to_string());
+                    let _ = self
+                        .fail_loop(&loop_id, None, None, &error.to_string())
+                        .await;
                 }
             }
         });
@@ -2946,7 +2990,7 @@ impl LoopEngine {
     /// unwound out of `run_loop_dispatch`'s scope) — decision-4's broadened
     /// `run_was_terminated_out_of_band` check is what keeps a stale run's
     /// completion from reaching either of those paths in the first place.
-    fn fail_loop(
+    async fn fail_loop(
         &self,
         loop_id: &str,
         dispatch_started_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -2971,6 +3015,9 @@ impl LoopEngine {
 
         self.db
             .update_loop_status(loop_id, LoopStatus::Failed, None, Some(chrono::Utc::now()))?;
+        // Resolve the human-readable ending node name BEFORE sweeping the
+        // running runs below — afterwards there is nothing left to resolve.
+        let ending_node = self.ending_node_name(loop_id, spec_name);
         // B12 catch-all: whatever hard-error path got us here (a node
         // timeout already kills its own process before bubbling up, but a
         // DB error or any other error class reaching this point wouldn't
@@ -2982,6 +3029,21 @@ impl LoopEngine {
         for run in self.db.list_running_loop_runs(loop_id).unwrap_or_default() {
             self.terminate_run(&run, "loop run failed");
         }
+
+        // Fire `on_failed` hooks if any are registered.
+        if let Ok(Some(lp)) = self.db.get_loop(loop_id) {
+            let ctx = HookContext {
+                loop_name: &lp.name,
+                workdir: &lp.workdir,
+                completed_specs: &[],
+                spec_name: None,
+                spec_id: None,
+                blocker: Some(summary),
+                node_name: ending_node.as_deref(),
+            };
+            self.fire_hooks(&lp, LoopHookEvent::OnFailed, &ctx).await;
+        }
+
         let loop_name = self
             .db
             .get_loop(loop_id)?
@@ -3001,7 +3063,7 @@ impl LoopEngine {
     /// (which owns that state transition itself — pausing the loop,
     /// recording the blocker on the run) and by [`Self::block_loop`] (C19),
     /// so there is one notification path for every way a loop can end up
-    /// blocked.
+    /// blocked. Also fires `on_blocked` hooks if any are registered.
     pub fn notify_blocked(&self, loop_id: &str, summary: &str) -> Result<()> {
         let loop_name = self
             .db
@@ -3011,6 +3073,74 @@ impl LoopEngine {
         self.notification_service
             .notify_loop_finished(&loop_name, LoopFinishOutcome::Blocked { summary });
         Ok(())
+    }
+
+    /// Fire `on_blocked` hooks for `loop_id` — called after the loop has
+    /// been transitioned to `Paused` and the blocker recorded. Separated
+    /// from [`Self::notify_blocked`] because it needs async I/O. Shares the
+    /// post-transition firing path with [`Self::block_loop`]: both call this
+    /// exactly once per blocker transition, so a blocker never double-fires.
+    pub async fn fire_on_blocked_hooks(
+        &self,
+        loop_id: &str,
+        blocker: &str,
+        node_name: Option<&str>,
+    ) {
+        // Clone the owned values the async ctx borrows from out of the
+        // short-lived `get_loop` guard so the ctx can borrow them.
+        let owned: Option<(Loop, String, Option<String>)> =
+            self.db.get_loop(loop_id).ok().flatten().map(|lp| {
+                let blocker_owned = blocker.to_string();
+                let node_owned = node_name
+                    .map(str::to_string)
+                    .or_else(|| self.ending_node_name(loop_id, None));
+                (lp, blocker_owned, node_owned)
+            });
+        if let Some((lp, blocker_owned, node_owned)) = owned.as_ref() {
+            let ctx = HookContext {
+                loop_name: &lp.name,
+                workdir: &lp.workdir,
+                completed_specs: &[],
+                spec_name: None,
+                spec_id: None,
+                blocker: Some(blocker_owned.as_str()),
+                node_name: node_owned.as_deref(),
+            };
+            self.fire_hooks(lp, LoopHookEvent::OnBlocked, &ctx).await;
+        }
+    }
+
+    /// Human-readable name of the node that ended the run for `loop_id`:
+    /// the first still-`running` row's node name, falling back to
+    /// `fallback` (usually the spec name the dispatcher was working) and
+    /// finally to the raw node id when the node row is gone. Returns `None`
+    /// only when there is no running run and no fallback — callers firing
+    /// `on_failed`/`on_blocked` should always have one of the two.
+    fn ending_node_name(&self, loop_id: &str, fallback: Option<&str>) -> Option<String> {
+        if let Ok(runs) = self.db.list_running_loop_runs(loop_id) {
+            if let Some(run) = runs.into_iter().next() {
+                if let Ok(Some(node)) = self.db.get_loop_node(&run.node_id) {
+                    return Some(node.name);
+                }
+                return Some(run.node_id);
+            }
+        }
+        fallback.map(str::to_string)
+    }
+
+    /// Fire `on_spec_completed` hooks for a just-completed spec.
+    pub async fn fire_on_spec_completed_hooks(&self, lp: &Loop, spec: &LoopSpec) {
+        let ctx = HookContext {
+            loop_name: &lp.name,
+            workdir: &lp.workdir,
+            completed_specs: &[],
+            spec_name: Some(&spec.name),
+            spec_id: Some(&spec.id),
+            blocker: None,
+            node_name: None,
+        };
+        self.fire_hooks(lp, LoopHookEvent::OnSpecCompleted, &ctx)
+            .await;
     }
 
     /// C19: the `Blocked` counterpart to [`Self::fail_loop`] — same
@@ -3027,7 +3157,7 @@ impl LoopEngine {
     /// the daemon's `loop_run` tool) — exactly the "not started again until
     /// a human clears it" FR4 asks for, reusing the loop_report_blocker
     /// mechanism wholesale rather than inventing a parallel one.
-    fn block_loop(
+    async fn block_loop(
         &self,
         loop_id: &str,
         dispatch_started_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -3049,12 +3179,19 @@ impl LoopEngine {
             }
         }
 
+        // Resolve the ending node BEFORE sweeping running runs, then share
+        // the single post-transition blocked helper with `loop_report_blocker`
+        // (notification + exactly one `on_blocked` firing per transition).
+        let ending_node = self.ending_node_name(loop_id, None);
         self.db
             .update_loop_status(loop_id, LoopStatus::Paused, None, None)?;
         for run in self.db.list_running_loop_runs(loop_id).unwrap_or_default() {
             self.terminate_run(&run, "spec exceeded cross-run attempt budget");
         }
-        self.notify_blocked(loop_id, blocker)
+        self.notify_blocked(loop_id, blocker)?;
+        self.fire_on_blocked_hooks(loop_id, blocker, ending_node.as_deref())
+            .await;
+        Ok(())
     }
 
     /// `(done, total)` specs for `loop_id`'s current run — the loop's bound
@@ -5590,6 +5727,7 @@ const RESUME_PROMPT_BINDINGS: &[&str] = &[
 ///   *in this run* (the final node's own summary text), one per line;
 ///   `(none)` if this run completed zero specs (e.g. every spec was already
 ///   `completed`/`skipped` before this run started).
+#[allow(dead_code)]
 fn render_completion_hook_prompt(
     lp: &crate::domain::loops::Loop,
     workdir: &str,
@@ -5627,7 +5765,77 @@ fn render_completion_hook_prompt(
 /// The only `{{...}}` markers [`render_completion_hook_prompt`] can bind; a
 /// hook prompt carrying anything else is refused (CP1) and the firing is
 /// recorded as failed rather than sent.
+#[allow(dead_code)]
 const COMPLETION_HOOK_BINDINGS: &[&str] = &["loop_name", "workdir", "completed_specs"];
+
+/// Context passed to [`LoopEngine::fire_hooks`] so the renderer can bind
+/// event-specific placeholders into the hook prompt. All events share
+/// `loop_name` and `workdir`; the remaining fields are event-specific.
+struct HookContext<'a> {
+    loop_name: &'a str,
+    workdir: &'a str,
+    /// `on_completed`: name + summary of each spec completed this dispatch.
+    completed_specs: &'a [(String, String)],
+    /// `on_spec_completed`: the spec that just completed.
+    spec_name: Option<&'a str>,
+    spec_id: Option<&'a str>,
+    /// `on_failed` / `on_blocked`: blocker description and the node that
+    /// ended the run.
+    blocker: Option<&'a str>,
+    node_name: Option<&'a str>,
+}
+
+/// The supported `{{...}}` markers per event.
+fn hook_bindings_for_event(event: &LoopHookEvent) -> &'static [&'static str] {
+    match event {
+        LoopHookEvent::OnCompleted => &["loop_name", "workdir", "completed_specs"],
+        LoopHookEvent::OnFailed | LoopHookEvent::OnBlocked => {
+            &["loop_name", "workdir", "blocker", "node"]
+        }
+        LoopHookEvent::OnSpecCompleted => &["loop_name", "workdir", "spec_name", "spec_id"],
+    }
+}
+
+/// Render a hook prompt for the given event, binding only the placeholders
+/// that event supports. Returns `Err` if the template carries unbindable
+/// markers — the caller records a failed hook run instead of spawning.
+fn render_hook_prompt(
+    event: &LoopHookEvent,
+    ctx: &HookContext<'_>,
+    prompt_template: &str,
+) -> Result<String> {
+    let bindings = hook_bindings_for_event(event);
+    refuse_unbindable_template(
+        &format!("{} hook", event.as_str()),
+        prompt_template,
+        bindings,
+        None,
+    )?;
+
+    let completed_specs_text = if ctx.completed_specs.is_empty() {
+        "(none)".to_string()
+    } else {
+        ctx.completed_specs
+            .iter()
+            .map(|(name, summary)| format!("- {name}: {summary}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    Ok(crate::domain::prompts::render_template(
+        prompt_template,
+        |raw| match raw {
+            "loop_name" => Some(ctx.loop_name.to_string()),
+            "workdir" => Some(ctx.workdir.to_string()),
+            "completed_specs" => Some(completed_specs_text.clone()),
+            "spec_name" => ctx.spec_name.map(str::to_string),
+            "spec_id" => ctx.spec_id.map(str::to_string),
+            "blocker" => ctx.blocker.map(str::to_string),
+            "node" => ctx.node_name.map(str::to_string),
+            _ => None,
+        },
+    ))
+}
 
 /// The workdir's current `git rev-parse HEAD`, or `None` if it isn't a git
 /// repo (or the command otherwise fails). Never errors the caller — a check
@@ -5977,7 +6185,7 @@ mod tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         };
         let spec = crate::domain::loops::LoopSpec {
             id: "spec-test".to_string(),
@@ -6173,7 +6381,7 @@ mod tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         };
         let spec = crate::domain::loops::LoopSpec {
             id: "spec-test".to_string(),
@@ -7498,7 +7706,7 @@ mod tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         };
         let spec = LoopSpec {
             id: "spec".to_string(),
@@ -7573,7 +7781,7 @@ mod tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         };
         let mut spec = LoopSpec {
             id: "spec".to_string(),
@@ -7763,7 +7971,7 @@ mod tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         };
         let spec = LoopSpec {
             id: "spec".to_string(),
@@ -10513,7 +10721,7 @@ echo done
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         };
         db.insert_loop(&lp)?;
         Ok((
@@ -10791,7 +10999,7 @@ echo done
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         };
         db.insert_loop(&lp).unwrap();
         let spec = standalone_spec("bound-spec", 1);
@@ -11310,7 +11518,7 @@ echo done
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         };
         let spec = LoopSpec {
             id: "spec".to_string(),
@@ -12109,6 +12317,7 @@ echo done
                 Some("spec"),
                 "dispatch A's late failure",
             )
+            .await
             .unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
@@ -12164,6 +12373,7 @@ echo done
 
         engine
             .fail_loop(&loop_id, Some(claim), Some("spec"), "genuine failure")
+            .await
             .unwrap();
 
         let lp = db.get_loop(&loop_id).unwrap().unwrap();
@@ -14168,7 +14378,7 @@ echo done
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         };
         let completed_specs = vec![
             ("Spec-A".to_string(), "summary A".to_string()),
@@ -14209,13 +14419,127 @@ echo done
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         };
 
         let result =
             render_completion_hook_prompt(&lp, &lp.workdir, &[], "{{completed_specs}}").unwrap();
 
         assert_eq!(result, "(none)");
+    }
+
+    // --- CH1: renderer validation tests for event-specific hooks ---
+
+    #[test]
+    fn render_hook_prompt_on_completed_binds_loop_name_workdir_completed_specs() {
+        let ctx = HookContext {
+            loop_name: "TestLoop",
+            workdir: "/tmp/test",
+            completed_specs: &[("SpecA".into(), "done".into())],
+            spec_name: None,
+            spec_id: None,
+            blocker: None,
+            node_name: None,
+        };
+        let result = render_hook_prompt(
+            &LoopHookEvent::OnCompleted,
+            &ctx,
+            "{{loop_name}} {{workdir}} {{completed_specs}}",
+        )
+        .unwrap();
+        assert_eq!(result, "TestLoop /tmp/test - SpecA: done");
+    }
+
+    #[test]
+    fn render_hook_prompt_on_failed_binds_blocker_and_node() {
+        let ctx = HookContext {
+            loop_name: "TestLoop",
+            workdir: "/tmp/test",
+            completed_specs: &[],
+            spec_name: None,
+            spec_id: None,
+            blocker: Some("quota exceeded"),
+            node_name: Some("agent-1"),
+        };
+        let result =
+            render_hook_prompt(&LoopHookEvent::OnFailed, &ctx, "{{blocker}} on {{node}}").unwrap();
+        assert_eq!(result, "quota exceeded on agent-1");
+    }
+
+    #[test]
+    fn render_hook_prompt_on_blocked_binds_blocker() {
+        let ctx = HookContext {
+            loop_name: "TestLoop",
+            workdir: "/tmp/test",
+            completed_specs: &[],
+            spec_name: None,
+            spec_id: None,
+            blocker: Some("needs human review"),
+            node_name: None,
+        };
+        let result =
+            render_hook_prompt(&LoopHookEvent::OnBlocked, &ctx, "Blocked: {{blocker}}").unwrap();
+        assert_eq!(result, "Blocked: needs human review");
+    }
+
+    #[test]
+    fn render_hook_prompt_on_spec_completed_binds_spec_name_and_id() {
+        let ctx = HookContext {
+            loop_name: "TestLoop",
+            workdir: "/tmp/test",
+            completed_specs: &[],
+            spec_name: Some("Auth Spec"),
+            spec_id: Some("spec-abc"),
+            blocker: None,
+            node_name: None,
+        };
+        let result = render_hook_prompt(
+            &LoopHookEvent::OnSpecCompleted,
+            &ctx,
+            "Spec {{spec_name}} ({{spec_id}}) done",
+        )
+        .unwrap();
+        assert_eq!(result, "Spec Auth Spec (spec-abc) done");
+    }
+
+    #[test]
+    fn render_hook_prompt_rejects_unbindable_marker() {
+        let ctx = HookContext {
+            loop_name: "TestLoop",
+            workdir: "/tmp/test",
+            completed_specs: &[],
+            spec_name: None,
+            spec_id: None,
+            blocker: None,
+            node_name: None,
+        };
+        // {{unknown}} is not supported by on_completed
+        let result = render_hook_prompt(
+            &LoopHookEvent::OnCompleted,
+            &ctx,
+            "{{loop_name}} {{unknown}}",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn render_hook_prompt_cross_event_marker_rejected() {
+        let ctx = HookContext {
+            loop_name: "TestLoop",
+            workdir: "/tmp/test",
+            completed_specs: &[],
+            spec_name: None,
+            spec_id: None,
+            blocker: None,
+            node_name: None,
+        };
+        // {{completed_specs}} is not supported by on_failed
+        let result = render_hook_prompt(
+            &LoopHookEvent::OnFailed,
+            &ctx,
+            "{{loop_name}} {{completed_specs}}",
+        );
+        assert!(result.is_err());
     }
 
     /// A hook failure does not change the loop's already-final status — the
@@ -14269,6 +14593,369 @@ echo done
         let hook_runs = db.list_loop_completion_hook_runs(&loop_id).unwrap();
         assert_eq!(hook_runs.len(), 1);
         assert_eq!(hook_runs[0].status, LoopRunStatus::Fail);
+    }
+
+    /// CH1: `on_spec_completed` fires once per bound spec completing, with
+    /// `{{spec_name}}` bound to that spec.
+    #[tokio::test]
+    async fn loop_engine_on_spec_completed_fires_once_with_spec_name() {
+        let fake_home = setup_test_cli_home();
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        // Marker path embeds {{spec_name}} so a passing run proves binding.
+        let marker = dir.path().join("spec-Spec.marker");
+        let hook = crate::domain::loops::LoopCompletionHook {
+            platform: "test-cli".to_string(),
+            model: None,
+            effort: None,
+            prompt: format!("touch \"{}\"", marker.display()),
+            timeout_minutes: Some(1),
+        };
+        let mut hooks = std::collections::BTreeMap::new();
+        hooks.insert(
+            crate::domain::loops::LoopHookEvent::OnSpecCompleted,
+            vec![hook],
+        );
+        db.update_loop_hooks(&loop_id, &hooks).unwrap();
+
+        let _home = HomeGuard::set(fake_home.path());
+        let result = engine
+            .run_loop(loop_id.clone(), None, None, None, None)
+            .await;
+        drop(_home);
+        drop(fake_home);
+        result.unwrap();
+
+        assert!(marker.exists(), "on_spec_completed hook must have run");
+        let hook_runs = db.list_loop_completion_hook_runs(&loop_id).unwrap();
+        assert_eq!(hook_runs.len(), 1);
+        assert_eq!(
+            hook_runs[0].event,
+            crate::domain::loops::LoopHookEvent::OnSpecCompleted
+        );
+        assert_eq!(hook_runs[0].hook_index, 0);
+        assert_eq!(hook_runs[0].status, LoopRunStatus::Pass);
+    }
+
+    /// CH1: `on_spec_completed` fires once per queue member completing, with
+    /// `{{spec_name}}` bound to that spec.
+    #[tokio::test]
+    async fn loop_engine_on_spec_completed_fires_for_queue_member() {
+        let fake_home = setup_test_cli_home();
+        let (dir, db, engine, loop_id) = bare_loop_fixture().unwrap();
+        let spec = standalone_spec("queue-spec", 1);
+        db.insert_loop_spec(&spec).unwrap();
+        insert_queue_with_members(&db, "queue-1", &[&spec.id]);
+
+        db.insert_loop_node(&LoopNode {
+            id: "loop-check".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let marker = dir.path().join("queue-spec.marker");
+        let hook = crate::domain::loops::LoopCompletionHook {
+            platform: "test-cli".to_string(),
+            model: None,
+            effort: None,
+            prompt: format!("touch \"{}\"", marker.display()),
+            timeout_minutes: Some(1),
+        };
+        let mut hooks = std::collections::BTreeMap::new();
+        hooks.insert(
+            crate::domain::loops::LoopHookEvent::OnSpecCompleted,
+            vec![hook],
+        );
+        db.update_loop_hooks(&loop_id, &hooks).unwrap();
+
+        let _home = HomeGuard::set(fake_home.path());
+        let result = engine
+            .run_loop(
+                loop_id.clone(),
+                Some("queue-1".to_string()),
+                None,
+                None,
+                None,
+            )
+            .await;
+        drop(_home);
+        drop(fake_home);
+        result.unwrap();
+
+        assert!(
+            marker.exists(),
+            "on_spec_completed hook must have run for queue member"
+        );
+        let hook_runs = db.list_loop_completion_hook_runs(&loop_id).unwrap();
+        assert_eq!(hook_runs.len(), 1);
+        assert_eq!(
+            hook_runs[0].event,
+            crate::domain::loops::LoopHookEvent::OnSpecCompleted
+        );
+        assert_eq!(hook_runs[0].hook_index, 0);
+        assert_eq!(hook_runs[0].status, LoopRunStatus::Pass);
+    }
+
+    /// CH1: a loop reaching `failed` fires `on_failed` with `{{blocker}}`
+    /// and `{{node}}` bound; the loop stays `Failed`.
+    #[tokio::test]
+    async fn loop_engine_on_failed_fires_with_blocker_and_node() {
+        let fake_home = setup_test_cli_home();
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "exit 1",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        // If {{blocker}}/{{node}} were unbound the render would fail and the
+        // hook run would be Fail; Pass proves both bound.
+        let hook = crate::domain::loops::LoopCompletionHook {
+            platform: "test-cli".to_string(),
+            model: None,
+            effort: None,
+            prompt: "echo \"{{blocker}} {{node}}\" > /dev/null".to_string(),
+            timeout_minutes: Some(1),
+        };
+        let mut hooks = std::collections::BTreeMap::new();
+        hooks.insert(crate::domain::loops::LoopHookEvent::OnFailed, vec![hook]);
+        db.update_loop_hooks(&loop_id, &hooks).unwrap();
+
+        let _home = HomeGuard::set(fake_home.path());
+        engine
+            .run_loop(loop_id.clone(), None, None, None, None)
+            .await
+            .unwrap();
+        drop(_home);
+        drop(fake_home);
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Failed);
+        let hook_runs = db.list_loop_completion_hook_runs(&loop_id).unwrap();
+        assert_eq!(hook_runs.len(), 1);
+        assert_eq!(
+            hook_runs[0].event,
+            crate::domain::loops::LoopHookEvent::OnFailed
+        );
+        assert_eq!(hook_runs[0].hook_index, 0);
+        assert_eq!(hook_runs[0].status, LoopRunStatus::Pass);
+    }
+
+    /// CH1: `block_loop` fires `on_blocked` once with the ending node name.
+    #[tokio::test]
+    async fn loop_engine_on_blocked_fires_once_with_node_name() {
+        let fake_home = setup_test_cli_home();
+        let (_dir, db, engine, loop_id, _spec_id) = loop_fixture().unwrap();
+        // Seed a loop-level agent node + a running run so `ending_node_name`
+        // resolves to a human-readable name.
+        db.insert_loop_node(&LoopNode {
+            id: "node-agent".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "reviewer".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "test-cli", "prompt": "hi"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_run(&crate::domain::loops::LoopNodeRun {
+            id: "run-1".to_string(),
+            loop_id: loop_id.clone(),
+            spec_id: "spec-test".to_string(),
+            node_id: "node-agent".to_string(),
+            status: LoopRunStatus::Running,
+            iteration: 1,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            pid: None,
+            boot_id: crate::system::boot_id(),
+            session_id: None,
+        })
+        .unwrap();
+        let hook = crate::domain::loops::LoopCompletionHook {
+            platform: "test-cli".to_string(),
+            model: None,
+            effort: None,
+            prompt: "echo \"{{blocker}} {{node}}\" > /dev/null".to_string(),
+            timeout_minutes: Some(1),
+        };
+        let mut hooks = std::collections::BTreeMap::new();
+        hooks.insert(crate::domain::loops::LoopHookEvent::OnBlocked, vec![hook]);
+        db.update_loop_hooks(&loop_id, &hooks).unwrap();
+
+        let _home = HomeGuard::set(fake_home.path());
+        engine
+            .block_loop(&loop_id, None, "needs human ruling")
+            .await
+            .unwrap();
+        drop(_home);
+        drop(fake_home);
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Paused);
+        let hook_runs = db.list_loop_completion_hook_runs(&loop_id).unwrap();
+        assert_eq!(hook_runs.len(), 1);
+        assert_eq!(
+            hook_runs[0].event,
+            crate::domain::loops::LoopHookEvent::OnBlocked
+        );
+        assert_eq!(hook_runs[0].hook_index, 0);
+        assert_eq!(hook_runs[0].status, LoopRunStatus::Pass);
+    }
+
+    /// CH1: two hooks on one event both run in declaration order; the first
+    /// failing neither stops the second nor changes the loop's status.
+    #[tokio::test]
+    async fn loop_engine_two_hooks_run_in_order_despite_first_failing() {
+        let fake_home = setup_test_cli_home();
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let marker = dir.path().join("second_hook.marker");
+        let failing = crate::domain::loops::LoopCompletionHook {
+            platform: "test-cli".to_string(),
+            model: None,
+            effort: None,
+            prompt: "exit 1".to_string(),
+            timeout_minutes: Some(1),
+        };
+        let passing = crate::domain::loops::LoopCompletionHook {
+            platform: "test-cli".to_string(),
+            model: None,
+            effort: None,
+            prompt: format!("touch \"{}\"", marker.display()),
+            timeout_minutes: Some(1),
+        };
+        let mut hooks = std::collections::BTreeMap::new();
+        hooks.insert(
+            crate::domain::loops::LoopHookEvent::OnCompleted,
+            vec![failing, passing],
+        );
+        db.update_loop_hooks(&loop_id, &hooks).unwrap();
+
+        let _home = HomeGuard::set(fake_home.path());
+        engine
+            .run_loop(loop_id.clone(), None, None, None, None)
+            .await
+            .unwrap();
+        drop(_home);
+        drop(fake_home);
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert_eq!(lp.status, LoopStatus::Completed);
+        assert!(
+            marker.exists(),
+            "second hook must run despite first failing"
+        );
+        let hook_runs = db.list_loop_completion_hook_runs(&loop_id).unwrap();
+        assert_eq!(hook_runs.len(), 2);
+        assert_eq!(hook_runs[0].hook_index, 0);
+        assert_eq!(hook_runs[0].status, LoopRunStatus::Fail);
+        assert_eq!(hook_runs[1].hook_index, 1);
+        assert_eq!(hook_runs[1].status, LoopRunStatus::Pass);
+    }
+
+    /// CH1: a hook registered after its event already fired does not run.
+    #[tokio::test]
+    async fn loop_engine_hook_registered_after_completion_does_not_fire() {
+        let fake_home = setup_test_cli_home();
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        // Complete first with no hooks configured.
+        engine
+            .run_loop(loop_id.clone(), None, None, None, None)
+            .await
+            .unwrap();
+        assert!(db
+            .list_loop_completion_hook_runs(&loop_id)
+            .unwrap()
+            .is_empty());
+
+        // Register after the fact — must not fire retroactively.
+        let marker = dir.path().join("late_hook.marker");
+        let hook = crate::domain::loops::LoopCompletionHook {
+            platform: "test-cli".to_string(),
+            model: None,
+            effort: None,
+            prompt: format!("touch \"{}\"", marker.display()),
+            timeout_minutes: Some(1),
+        };
+        let mut hooks = std::collections::BTreeMap::new();
+        hooks.insert(crate::domain::loops::LoopHookEvent::OnCompleted, vec![hook]);
+        db.update_loop_hooks(&loop_id, &hooks).unwrap();
+
+        let _home = HomeGuard::set(fake_home.path());
+        drop(_home);
+        drop(fake_home);
+        // No further dispatch happens here; the registration itself must not
+        // create a run.
+        assert!(db
+            .list_loop_completion_hook_runs(&loop_id)
+            .unwrap()
+            .is_empty());
+        assert!(!marker.exists());
     }
 
     /// Process group children must die with the parent: spawn a check node
@@ -16220,7 +16907,7 @@ echo done
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         };
         db.insert_loop(&lp).unwrap();
         let engine = LoopEngine::new(Arc::clone(&db), Arc::new(DefaultNotificationService));
@@ -17560,7 +18247,7 @@ echo done
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         };
         let spec_a = LoopSpec {
             id: "spec-graph-a".to_string(),
@@ -17637,7 +18324,7 @@ echo done
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         };
         let spec_b = LoopSpec {
             id: "spec-graph-b".to_string(),
@@ -17782,7 +18469,7 @@ echo done
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         };
         let spec_a = LoopSpec {
             id: "spec-signal-a".to_string(),
@@ -17854,7 +18541,7 @@ echo done
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         };
         let spec_b = LoopSpec {
             id: "spec-signal-b".to_string(),
@@ -18374,7 +19061,7 @@ echo done
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         };
         let spec = LoopSpec {
             id: "spec".to_string(),
@@ -18451,7 +19138,7 @@ echo done
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         };
         let spec = LoopSpec {
             id: "spec".to_string(),
@@ -18529,7 +19216,7 @@ echo done
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         };
         let spec = LoopSpec {
             id: "spec".to_string(),
@@ -18615,7 +19302,7 @@ echo done
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         };
         let spec = LoopSpec {
             id: "spec".to_string(),
@@ -18736,7 +19423,7 @@ echo done
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         };
         let spec = LoopSpec {
             id: "spec".to_string(),
@@ -18816,7 +19503,7 @@ echo done
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         };
         let spec = LoopSpec {
             id: "spec".to_string(),
@@ -18886,7 +19573,7 @@ echo done
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         };
         let spec = LoopSpec {
             id: "spec".to_string(),
@@ -19234,7 +19921,7 @@ exit 0
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         };
         let tagged_body = "<spec>\n  <objective>Ship it.</objective>\n  <functional_requirements>Does thing.</functional_requirements>\n  <non_functional_requirements>Fast.</non_functional_requirements>\n  <constraints>None.</constraints>\n  <guidelines>Style.</guidelines>\n  <in_scope>This.</in_scope>\n  <out_of_scope>Nothing.</out_of_scope>\n</spec>";
         let spec = LoopSpec {

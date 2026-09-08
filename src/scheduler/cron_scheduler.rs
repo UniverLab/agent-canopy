@@ -974,7 +974,7 @@ mod tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1117,7 +1117,7 @@ mod tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         })
         .unwrap();
         db.insert_loop_spec(&LoopSpec {
@@ -1219,7 +1219,7 @@ mod tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         })
         .unwrap();
         // One failed spec — will be reset and resumed.
@@ -1530,7 +1530,7 @@ mod tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         })
         .unwrap();
 
@@ -1634,7 +1634,7 @@ mod tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: Some("queue-1".to_string()),
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         })
         .unwrap();
 
@@ -1896,7 +1896,7 @@ mod tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         })
         .unwrap();
         db.insert_loop_spec(&LoopSpec {
@@ -2009,7 +2009,7 @@ mod tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         })
         .unwrap();
         db.insert_loop_spec(&LoopSpec {

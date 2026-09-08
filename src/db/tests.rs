@@ -111,7 +111,7 @@ fn sample_loop(id: &str) -> Loop {
         auto_continue_at: None,
         auto_continue_action: None,
         active_run_queue_id: None,
-        on_completed: None,
+        hooks: std::collections::BTreeMap::new(),
     }
 }
 
@@ -6333,4 +6333,263 @@ fn cm9_retype_backlog_nodes() {
             .kind,
         "project"
     );
+}
+
+#[cfg(test)]
+mod hooks_tests {
+    use super::*;
+    use crate::domain::loops::{
+        Loop, LoopCompletionHook, LoopCompletionHookRun, LoopHookEvent, LoopRunStatus, LoopStatus,
+    };
+    use std::collections::BTreeMap;
+
+    fn hook_fixture(platform: &str, prompt: &str) -> LoopCompletionHook {
+        LoopCompletionHook {
+            platform: platform.to_string(),
+            model: Some("test-model".to_string()),
+            effort: None,
+            prompt: prompt.to_string(),
+            timeout_minutes: Some(5),
+        }
+    }
+
+    fn loop_with_hooks(id: &str, hooks: BTreeMap<LoopHookEvent, Vec<LoopCompletionHook>>) -> Loop {
+        Loop {
+            archived: false,
+            paused_by_reconciliation: false,
+            infra_node_id: None,
+            id: id.to_string(),
+            name: format!("Loop {id}"),
+            description: None,
+            workdir: "/tmp/test".to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            hooks,
+        }
+    }
+
+    fn sample_hook_run(event: LoopHookEvent, hook_index: i64) -> LoopCompletionHookRun {
+        LoopCompletionHookRun {
+            id: uuid::Uuid::new_v4().to_string(),
+            loop_id: "test-loop".to_string(),
+            event,
+            hook_index,
+            status: LoopRunStatus::Running,
+            output: None,
+            summary: None,
+            started_at: Utc::now(),
+            completed_at: None,
+            pid: None,
+            boot_id: None,
+        }
+    }
+
+    #[test]
+    fn insert_and_get_loop_with_hooks() {
+        let db = test_db();
+        let mut hooks = BTreeMap::new();
+        hooks.insert(
+            LoopHookEvent::OnCompleted,
+            vec![hook_fixture("claude", "done: {{loop_name}}")],
+        );
+        hooks.insert(
+            LoopHookEvent::OnFailed,
+            vec![hook_fixture("mimo", "failed: {{blocker}}")],
+        );
+        let lp = loop_with_hooks("loop1", hooks);
+        db.insert_loop(&lp).unwrap();
+
+        let retrieved = db.get_loop("loop1").unwrap().unwrap();
+        assert_eq!(retrieved.hooks.len(), 2);
+        assert_eq!(
+            retrieved
+                .hooks
+                .get(&LoopHookEvent::OnCompleted)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            retrieved
+                .hooks
+                .get(&LoopHookEvent::OnFailed)
+                .unwrap()
+                .first()
+                .unwrap()
+                .prompt,
+            "failed: {{blocker}}"
+        );
+    }
+
+    #[test]
+    fn empty_hooks_map_roundtrips() {
+        let db = test_db();
+        let lp = loop_with_hooks("loop1", BTreeMap::new());
+        db.insert_loop(&lp).unwrap();
+
+        let retrieved = db.get_loop("loop1").unwrap().unwrap();
+        assert!(retrieved.hooks.is_empty());
+    }
+
+    #[test]
+    fn update_loop_hooks_replaces_map() {
+        let db = test_db();
+        let lp = loop_with_hooks("loop1", BTreeMap::new());
+        db.insert_loop(&lp).unwrap();
+
+        let mut new_hooks = BTreeMap::new();
+        new_hooks.insert(
+            LoopHookEvent::OnBlocked,
+            vec![hook_fixture("opencode", "blocked: {{blocker}}")],
+        );
+        db.update_loop_hooks("loop1", &new_hooks).unwrap();
+
+        let retrieved = db.get_loop("loop1").unwrap().unwrap();
+        assert_eq!(retrieved.hooks.len(), 1);
+        assert!(retrieved.hooks.contains_key(&LoopHookEvent::OnBlocked));
+        assert!(!retrieved.hooks.contains_key(&LoopHookEvent::OnCompleted));
+    }
+
+    #[test]
+    fn update_loop_completion_hook_preserves_other_events() {
+        let db = test_db();
+        let mut hooks = BTreeMap::new();
+        hooks.insert(
+            LoopHookEvent::OnFailed,
+            vec![hook_fixture("mimo", "failed")],
+        );
+        let lp = loop_with_hooks("loop1", hooks);
+        db.insert_loop(&lp).unwrap();
+
+        // Update only on_completed via the legacy path
+        db.update_loop_completion_hook("loop1", Some(&hook_fixture("claude", "completed")))
+            .unwrap();
+
+        let retrieved = db.get_loop("loop1").unwrap().unwrap();
+        // on_completed should be set
+        assert!(retrieved.hooks.contains_key(&LoopHookEvent::OnCompleted));
+        // on_failed should still be there
+        assert!(retrieved.hooks.contains_key(&LoopHookEvent::OnFailed));
+    }
+
+    #[test]
+    fn hook_run_includes_event_and_index() {
+        let db = test_db();
+        let lp = loop_with_hooks("loop1", BTreeMap::new());
+        db.insert_loop(&lp).unwrap();
+
+        let mut run = sample_hook_run(LoopHookEvent::OnCompleted, 0);
+        run.loop_id = "loop1".to_string();
+        db.insert_loop_completion_hook_run(&run).unwrap();
+
+        let runs = db.list_loop_completion_hook_runs("loop1").unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].event, LoopHookEvent::OnCompleted);
+        assert_eq!(runs[0].hook_index, 0);
+    }
+
+    #[test]
+    fn multiple_hook_runs_ordered_by_started_at() {
+        let db = test_db();
+        let lp = loop_with_hooks("loop1", BTreeMap::new());
+        db.insert_loop(&lp).unwrap();
+
+        let mut run1 = sample_hook_run(LoopHookEvent::OnCompleted, 0);
+        run1.loop_id = "loop1".to_string();
+        run1.started_at = Utc::now() - chrono::Duration::seconds(10);
+        db.insert_loop_completion_hook_run(&run1).unwrap();
+
+        let mut run2 = sample_hook_run(LoopHookEvent::OnFailed, 0);
+        run2.loop_id = "loop1".to_string();
+        run2.started_at = Utc::now();
+        db.insert_loop_completion_hook_run(&run2).unwrap();
+
+        let runs = db.list_loop_completion_hook_runs("loop1").unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].event, LoopHookEvent::OnCompleted);
+        assert_eq!(runs[1].event, LoopHookEvent::OnFailed);
+    }
+
+    #[test]
+    fn hook_run_update_records_result() {
+        let db = test_db();
+        let lp = loop_with_hooks("loop1", BTreeMap::new());
+        db.insert_loop(&lp).unwrap();
+
+        let mut run = sample_hook_run(LoopHookEvent::OnSpecCompleted, 2);
+        run.loop_id = "loop1".to_string();
+        db.insert_loop_completion_hook_run(&run).unwrap();
+
+        let output = serde_json::json!({"result": "ok"});
+        db.update_loop_completion_hook_run_result(
+            &run.id,
+            LoopRunStatus::Pass,
+            Some(&output),
+            Some("hook succeeded"),
+            Some(Utc::now()),
+        )
+        .unwrap();
+
+        let runs = db.list_loop_completion_hook_runs("loop1").unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, LoopRunStatus::Pass);
+        assert_eq!(runs[0].event, LoopHookEvent::OnSpecCompleted);
+        assert_eq!(runs[0].hook_index, 2);
+        assert_eq!(runs[0].summary.as_deref(), Some("hook succeeded"));
+    }
+
+    #[test]
+    fn legacy_on_completed_column_falls_back_to_hooks_map() {
+        let db = test_db();
+        let lp = loop_with_hooks("loop1", BTreeMap::new());
+        db.insert_loop(&lp).unwrap();
+        // Simulate a pre-CH1 row: hooks NULL, legacy on_completed set.
+        let legacy = serde_json::to_string(&hook_fixture("claude", "done: {{loop_name}}")).unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE loops SET hooks = NULL, on_completed = ?1 WHERE id = 'loop1'",
+                rusqlite::params![legacy],
+            )
+            .unwrap();
+        }
+
+        let retrieved = db.get_loop("loop1").unwrap().unwrap();
+        assert_eq!(retrieved.hooks.len(), 1);
+        let completed = retrieved
+            .hooks
+            .get(&LoopHookEvent::OnCompleted)
+            .expect("legacy hook must appear under on_completed");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].platform, "claude");
+    }
+
+    #[test]
+    fn multiple_hooks_preserve_declaration_order() {
+        let db = test_db();
+        let lp = loop_with_hooks("loop1", BTreeMap::new());
+        db.insert_loop(&lp).unwrap();
+        let mut hooks = BTreeMap::new();
+        hooks.insert(
+            LoopHookEvent::OnCompleted,
+            vec![
+                hook_fixture("claude", "first"),
+                hook_fixture("mimo", "second"),
+            ],
+        );
+        db.update_loop_hooks("loop1", &hooks).unwrap();
+
+        let retrieved = db.get_loop("loop1").unwrap().unwrap();
+        let completed = retrieved.hooks.get(&LoopHookEvent::OnCompleted).unwrap();
+        assert_eq!(completed.len(), 2);
+        assert_eq!(completed[0].platform, "claude");
+        assert_eq!(completed[1].platform, "mimo");
+    }
 }

@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -466,16 +468,14 @@ pub struct Loop {
     /// which writes `None`) replaces it.
     #[serde(default)]
     pub active_run_queue_id: Option<String>,
-    /// Optional post-completion hook (N2): an agent-node-style config the
-    /// engine fires exactly once, right after a run transitions to
-    /// `Completed` — never on `failed`/`paused`, never retroactively, and
-    /// never more than once per completing run (a completed→reset→completed
-    /// cycle fires again, once per completion). `None` preserves pre-N2
-    /// behavior exactly. See [`crate::loop_engine::LoopEngine`]'s
-    /// `run_loop_dispatch` for where it fires and
-    /// `render_completion_hook_prompt` for its placeholders.
-    #[serde(default)]
-    pub on_completed: Option<LoopCompletionHook>,
+    /// Event-keyed hooks: an ordered map from event name to the list of
+    /// hooks registered for that event. Each hook is an agent-node-style
+    /// config (platform/model/effort/prompt/timeout_minutes). An empty map
+    /// preserves pre-N2 behavior exactly (no hooks fire). See
+    /// [`crate::loop_engine::LoopEngine`]'s `run_loop_dispatch` for where
+    /// events fire and `render_hook_prompt` for placeholders.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub hooks: BTreeMap<LoopHookEvent, Vec<LoopCompletionHook>>,
     /// Archived loops leave every browsing listing (sidebar, `canopy loop
     /// list`, MCP `loop_list`) but keep their row, specs, and full run
     /// history — a deliberate, reversible, always-counted alternative to
@@ -729,15 +729,19 @@ pub struct LoopNodeRun {
     pub session_id: Option<String>,
 }
 
-/// One firing of a loop's `on_completed` hook (N2). Deliberately its own
-/// table/type rather than a `LoopNodeRun` — a hook run belongs to no spec and
-/// no graph node (`loop_runs.spec_id`/`node_id` are `NOT NULL` FKs into
-/// exactly those), and its outcome must never feed back into the run's
-/// routing or final status the way a node run's does.
+/// One firing of a loop hook. Deliberately its own table/type rather than
+/// a `LoopNodeRun` — a hook run belongs to no spec and no graph node
+/// (`loop_runs.spec_id`/`node_id` are `NOT NULL` FKs into exactly those),
+/// and its outcome must never feed back into the run's routing or final
+/// status the way a node run's does.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopCompletionHookRun {
     pub id: String,
     pub loop_id: String,
+    /// Which event produced this run.
+    pub event: LoopHookEvent,
+    /// Zero-based index within the event's hook list (declaration order).
+    pub hook_index: i64,
     pub status: LoopRunStatus,
     pub output: Option<Value>,
     pub summary: Option<String>,
@@ -764,8 +768,8 @@ pub struct LoopDetails {
     pub graph_nodes: Vec<LoopNode>,
     pub graph_edges: Vec<LoopEdge>,
     pub specs: Vec<LoopSpecDetails>,
-    /// Every past firing of `on_completed` (oldest first) — populated only
-    /// when the loop has completed at least once with a hook configured.
+    /// Every past hook firing (oldest first) — populated only when the loop
+    /// has fired at least one hook.
     pub completion_hook_runs: Vec<LoopCompletionHookRun>,
 }
 
@@ -814,6 +818,46 @@ impl EnsembleKind {
             "parallel" => Some(EnsembleKind::Parallel),
             "cascade" => Some(EnsembleKind::Cascade),
             "round_robin" => Some(EnsembleKind::RoundRobin),
+            _ => None,
+        }
+    }
+}
+
+/// The four events a loop hook can fire on. Key name for the event-keyed
+/// hooks map on [`Loop`]. Event names are the public vocabulary of the
+/// hooks feature — chosen once here; CH2, CH3 and CH4 reuse them without
+/// renaming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(clippy::enum_variant_names)]
+pub enum LoopHookEvent {
+    /// Fires when a loop transitions to `Completed`.
+    OnCompleted,
+    /// Fires when a loop transitions to `Failed`.
+    OnFailed,
+    /// Fires when a loop stops with a blocker set (transition to `Paused`).
+    OnBlocked,
+    /// Fires once per spec reaching `completed`, whether from bound specs
+    /// or from a queue.
+    OnSpecCompleted,
+}
+
+impl LoopHookEvent {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::OnCompleted => "on_completed",
+            Self::OnFailed => "on_failed",
+            Self::OnBlocked => "on_blocked",
+            Self::OnSpecCompleted => "on_spec_completed",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "on_completed" => Some(Self::OnCompleted),
+            "on_failed" => Some(Self::OnFailed),
+            "on_blocked" => Some(Self::OnBlocked),
+            "on_spec_completed" => Some(Self::OnSpecCompleted),
             _ => None,
         }
     }
@@ -1067,7 +1111,7 @@ mod tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         }
     }
 
@@ -2463,5 +2507,52 @@ mod tests {
         // its own, `router-1` is still in the valid "not yet wired" state.
         let edges = vec![route_edge("e1", "other-node", "retry")];
         assert!(validate_router_route_coverage(&two_routes(), "router-1", &edges).is_ok());
+    }
+
+    #[test]
+    fn loop_hook_event_as_str_roundtrip() {
+        assert_eq!(super::LoopHookEvent::OnCompleted.as_str(), "on_completed");
+        assert_eq!(super::LoopHookEvent::OnFailed.as_str(), "on_failed");
+        assert_eq!(super::LoopHookEvent::OnBlocked.as_str(), "on_blocked");
+        assert_eq!(
+            super::LoopHookEvent::OnSpecCompleted.as_str(),
+            "on_spec_completed"
+        );
+    }
+
+    #[test]
+    fn loop_hook_event_from_str() {
+        assert_eq!(
+            super::LoopHookEvent::from_str("on_completed"),
+            Some(super::LoopHookEvent::OnCompleted)
+        );
+        assert_eq!(
+            super::LoopHookEvent::from_str("on_failed"),
+            Some(super::LoopHookEvent::OnFailed)
+        );
+        assert_eq!(
+            super::LoopHookEvent::from_str("on_blocked"),
+            Some(super::LoopHookEvent::OnBlocked)
+        );
+        assert_eq!(
+            super::LoopHookEvent::from_str("on_spec_completed"),
+            Some(super::LoopHookEvent::OnSpecCompleted)
+        );
+        assert_eq!(super::LoopHookEvent::from_str("invalid"), None);
+    }
+
+    #[test]
+    fn loop_hook_event_serde_roundtrip() {
+        let events = [
+            super::LoopHookEvent::OnCompleted,
+            super::LoopHookEvent::OnFailed,
+            super::LoopHookEvent::OnBlocked,
+            super::LoopHookEvent::OnSpecCompleted,
+        ];
+        for event in events {
+            let json = serde_json::to_string(&event).unwrap();
+            let deserialized: super::LoopHookEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(event, deserialized);
+        }
     }
 }

@@ -518,12 +518,44 @@ fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
             format_relative_duration(at - Utc::now())
         );
     }
-    if let Some(hook) = &lp.on_completed {
-        println!(
-            " on_completed: {} ({})",
-            hook.platform,
-            hook.model.as_deref().unwrap_or("default model")
-        );
+    // Event-keyed hooks: the legacy singular display stays for old users,
+    // with the full event-keyed listing as the authoritative detail.
+    if let Some(hooks) = lp
+        .hooks
+        .get(&crate::domain::loops::LoopHookEvent::OnCompleted)
+    {
+        if let Some(hook) = hooks.first() {
+            println!(
+                " on_completed: {} ({})",
+                hook.platform,
+                hook.model.as_deref().unwrap_or("default model")
+            );
+        }
+    }
+    for (event, hooks) in &lp.hooks {
+        // The legacy line above already showed the first on_completed hook;
+        // list every event's hooks here so non-completion events are visible.
+        if *event == crate::domain::loops::LoopHookEvent::OnCompleted {
+            for (idx, hook) in hooks.iter().enumerate().skip(1) {
+                println!(
+                    " {}[{}]: {} ({})",
+                    event.as_str(),
+                    idx,
+                    hook.platform,
+                    hook.model.as_deref().unwrap_or("default model")
+                );
+            }
+        } else {
+            for (idx, hook) in hooks.iter().enumerate() {
+                println!(
+                    " {}[{}]: {} ({})",
+                    event.as_str(),
+                    idx,
+                    hook.platform,
+                    hook.model.as_deref().unwrap_or("default model")
+                );
+            }
+        }
     }
 
     let specs = db.list_loop_specs(&lp.id)?;
@@ -651,11 +683,13 @@ fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
     }
 
     if !hook_runs.is_empty() {
-        println!("\n\x1b[1m── on_completed Hook Runs ─────────────────────────────────────\x1b[0m");
+        println!("\n\x1b[1m── Hook Runs ────────────────────────────────────────────────\x1b[0m");
         for run in hook_runs.iter().rev().take(5) {
             println!(
-                " {} {}",
+                " {} {}[{}] {}",
                 run_status_icon(run.status, run.output.as_ref()),
+                run.event.as_str(),
+                run.hook_index,
                 format_dt(run.started_at)
             );
         }
@@ -1180,7 +1214,7 @@ mod tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         }
     }
 

@@ -8,8 +8,8 @@ use std::io::{Error as IoError, ErrorKind};
 use crate::db::Database;
 use crate::domain::loops::{
     ArchiveLoopOutcome, Loop, LoopCompletionHook, LoopCompletionHookRun, LoopDetails, LoopEdge,
-    LoopEdgeCondition, LoopNode, LoopNodeKind, LoopNodeRun, LoopResetOutcome, LoopRunStatus,
-    LoopSpec, LoopSpecDetails, LoopSpecStatus, LoopStatus, SpecAdminStatusOutcome,
+    LoopEdgeCondition, LoopHookEvent, LoopNode, LoopNodeKind, LoopNodeRun, LoopResetOutcome,
+    LoopRunStatus, LoopSpec, LoopSpecDetails, LoopSpecStatus, LoopStatus, SpecAdminStatusOutcome,
 };
 use crate::domain::models::Trigger;
 
@@ -29,10 +29,15 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let (trigger_type, trigger_config) = encode_loop_trigger(lp.trigger.as_ref())?;
-        let on_completed = encode_loop_completion_hook(lp.on_completed.as_ref())?;
+        let on_completed = encode_loop_completion_hook(
+            lp.hooks
+                .get(&LoopHookEvent::OnCompleted)
+                .and_then(|v| v.first()),
+        )?;
+        let hooks = encode_loop_hooks(&lp.hooks)?;
         conn.execute(
-            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation, infra_node_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation, infra_node_id, hooks)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 &lp.id,
                 &lp.name,
@@ -52,6 +57,7 @@ impl Database {
                 lp.archived,
                 lp.paused_by_reconciliation,
                 &lp.infra_node_id,
+                hooks,
             ],
         )?;
         Ok(())
@@ -92,7 +98,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation, infra_node_id
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation, infra_node_id, hooks
              FROM loops WHERE autorun_at IS NOT NULL",
         )?;
         let rows = stmt.query_map([], map_loop_row)?;
@@ -147,7 +153,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation, infra_node_id
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation, infra_node_id, hooks
              FROM loops WHERE auto_continue_at IS NOT NULL",
         )?;
         let rows = stmt.query_map([], map_loop_row)?;
@@ -172,7 +178,9 @@ impl Database {
 
     /// Replace a loop's `on_completed` hook config (N2). Passing `None`
     /// clears it, making the loop's completion behave exactly as it did
-    /// before N2 (no hook).
+    /// before N2 (no hook). Writes both the legacy `on_completed` column
+    /// and the new `hooks` map for rollback compatibility. Preserves
+    /// hooks registered for other events.
     pub fn update_loop_completion_hook(
         &self,
         loop_id: &str,
@@ -183,9 +191,54 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let on_completed = encode_loop_completion_hook(hook)?;
+        // Read the current hooks map, update on_completed, write it back
+        let current_hooks_json: Option<String> = conn
+            .query_row(
+                "SELECT hooks FROM loops WHERE id = ?1",
+                params![loop_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let mut hooks_map: std::collections::BTreeMap<LoopHookEvent, Vec<LoopCompletionHook>> =
+            current_hooks_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str(raw).ok())
+                .unwrap_or_default();
+        if let Some(h) = hook {
+            hooks_map.insert(LoopHookEvent::OnCompleted, vec![h.clone()]);
+        } else {
+            hooks_map.remove(&LoopHookEvent::OnCompleted);
+        }
+        let hooks_json = encode_loop_hooks(&hooks_map)?;
         let rows = conn.execute(
-            "UPDATE loops SET on_completed = ?1 WHERE id = ?2",
-            params![on_completed, loop_id],
+            "UPDATE loops SET on_completed = ?1, hooks = ?2 WHERE id = ?3",
+            params![on_completed, hooks_json, loop_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Replace the full hooks map for a loop. Used by MCP loop_update with
+    /// the new event-keyed `hooks` parameter.
+    pub fn update_loop_hooks(
+        &self,
+        loop_id: &str,
+        hooks: &std::collections::BTreeMap<LoopHookEvent, Vec<LoopCompletionHook>>,
+    ) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let hooks_json = encode_loop_hooks(hooks)?;
+        // Also sync the legacy `on_completed` column for rollback compat
+        let on_completed_legacy = hooks
+            .get(&LoopHookEvent::OnCompleted)
+            .and_then(|v| v.first())
+            .map(serde_json::to_string)
+            .transpose()?;
+        let rows = conn.execute(
+            "UPDATE loops SET hooks = ?1, on_completed = ?2 WHERE id = ?3",
+            params![hooks_json, on_completed_legacy, loop_id],
         )?;
         Ok(rows > 0)
     }
@@ -206,7 +259,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation, infra_node_id
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation, infra_node_id, hooks
              FROM loops WHERE trigger_type = ?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![trigger_type], map_loop_row)?;
@@ -267,7 +320,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation, infra_node_id
+            "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation, infra_node_id, hooks
              FROM loops WHERE id = ?1",
         )?;
 
@@ -296,12 +349,12 @@ impl Database {
         };
         let sql = if workdir.is_some() {
             format!(
-                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation, infra_node_id
+                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation, infra_node_id, hooks
                  FROM loops WHERE workdir = ?1{archived_clause} ORDER BY created_at DESC"
             )
         } else {
             format!(
-                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation, infra_node_id
+                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation, infra_node_id, hooks
                  FROM loops WHERE 1=1{archived_clause} ORDER BY created_at DESC"
             )
         };
@@ -1695,8 +1748,8 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         conn.execute(
-            "INSERT INTO loop_completion_hook_runs (id, loop_id, status, output, summary, started_at, completed_at, pid, boot_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO loop_completion_hook_runs (id, loop_id, status, output, summary, started_at, completed_at, pid, boot_id, event, hook_index)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 &run.id,
                 &run.loop_id,
@@ -1707,6 +1760,8 @@ impl Database {
                 run.completed_at.map(|value| value.timestamp()),
                 run.pid,
                 &run.boot_id,
+                run.event.as_str(),
+                run.hook_index,
             ],
         )?;
         Ok(())
@@ -1762,7 +1817,7 @@ impl Database {
         Ok(rows > 0)
     }
 
-    /// Every past `on_completed` firing for a loop, oldest first — surfaced
+    /// Every past hook firing for a loop, oldest first — surfaced
     /// via `loop_get`/`canopy loop info` alongside the graph's node runs.
     pub fn list_loop_completion_hook_runs(
         &self,
@@ -1773,8 +1828,8 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, loop_id, status, output, summary, started_at, completed_at, pid, boot_id
-             FROM loop_completion_hook_runs WHERE loop_id = ?1 ORDER BY started_at ASC",
+            "SELECT id, loop_id, status, output, summary, started_at, completed_at, pid, boot_id, event, hook_index
+             FROM loop_completion_hook_runs WHERE loop_id = ?1 ORDER BY started_at ASC, rowid ASC",
         )?;
         let rows = stmt.query_map(params![loop_id], map_loop_completion_hook_run_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1853,7 +1908,7 @@ impl Database {
 
         let orphaned: Vec<Loop> = {
             let mut stmt = tx.prepare(
-                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation, infra_node_id
+                "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation, infra_node_id, hooks
                  FROM loops WHERE status = ?1",
             )?;
             let rows = stmt.query_map(params![LoopStatus::Running.as_str()], map_loop_row)?;
@@ -2273,6 +2328,10 @@ fn map_loop_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Loop> {
         .as_deref()
         .map(decode_loop_trigger)
         .transpose()?;
+    let hooks = decode_loop_hooks(
+        row.get::<_, Option<String>>(17)?.as_deref(),
+        row.get::<_, Option<String>>(11)?.as_deref(),
+    )?;
     Ok(Loop {
         id: row.get(0)?,
         name: row.get(1)?,
@@ -2294,11 +2353,7 @@ fn map_loop_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Loop> {
             .map(from_timestamp)
             .transpose()?,
         active_run_queue_id: row.get(10)?,
-        on_completed: row
-            .get::<_, Option<String>>(11)?
-            .as_deref()
-            .map(decode_loop_completion_hook)
-            .transpose()?,
+        hooks,
         auto_continue_at: row
             .get::<_, Option<i64>>(12)?
             .map(from_timestamp)
@@ -2328,6 +2383,44 @@ fn decode_loop_trigger(raw: &str) -> rusqlite::Result<Trigger> {
     serde_json::from_str(raw).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(error))
     })
+}
+
+/// Encode a loop's hooks map as JSON for the `hooks` column. `None` (no
+/// hooks configured) stores `NULL` — exactly today's (pre-N2) row shape.
+fn encode_loop_hooks(
+    hooks: &std::collections::BTreeMap<LoopHookEvent, Vec<LoopCompletionHook>>,
+) -> Result<Option<String>> {
+    if hooks.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::to_string(hooks)?))
+}
+
+/// Decode the `hooks` column JSON back into the event-keyed map. Falls
+/// back to the legacy `on_completed` column when `hooks` is NULL/empty.
+fn decode_loop_hooks(
+    hooks_raw: Option<&str>,
+    on_completed_raw: Option<&str>,
+) -> rusqlite::Result<std::collections::BTreeMap<LoopHookEvent, Vec<LoopCompletionHook>>> {
+    if let Some(raw) = hooks_raw {
+        if !raw.is_empty() {
+            return serde_json::from_str(raw).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    11,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            });
+        }
+    }
+    // Fallback: legacy `on_completed` column
+    if let Some(raw) = on_completed_raw {
+        let hook = decode_loop_completion_hook(raw)?;
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(LoopHookEvent::OnCompleted, vec![hook]);
+        return Ok(map);
+    }
+    Ok(std::collections::BTreeMap::new())
 }
 
 /// Encode a loop's `on_completed` hook config as JSON for the `on_completed`
@@ -2473,9 +2566,22 @@ fn map_loop_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LoopNodeRun> {
 fn map_loop_completion_hook_run_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<LoopCompletionHookRun> {
+    let event_str: String = row.get(9)?;
+    let event = LoopHookEvent::from_str(&event_str).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            9,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid loop hook event",
+            )),
+        )
+    })?;
     Ok(LoopCompletionHookRun {
         id: row.get(0)?,
         loop_id: row.get(1)?,
+        event,
+        hook_index: row.get(10)?,
         status: LoopRunStatus::from_str(&row.get::<_, String>(2)?),
         output: row
             .get::<_, Option<String>>(3)?
@@ -2517,6 +2623,7 @@ mod tests {
     use super::*;
     use crate::domain::loops::{Loop, LoopStatus};
     use chrono::Utc;
+    use std::collections::BTreeMap;
     use tempfile::tempdir;
 
     fn test_db() -> Database {
@@ -2542,7 +2649,7 @@ mod tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: BTreeMap::new(),
         }
     }
 

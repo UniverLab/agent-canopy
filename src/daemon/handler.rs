@@ -53,9 +53,9 @@ use crate::domain::blueprints::{merge_blueprint_config, validate_blueprint_delet
 use crate::domain::loops::{
     validate_router_edges_declared, validate_router_route_coverage, validate_router_routes,
     validate_spec_description_template, ArchiveLoopOutcome, Ensemble, EnsembleKind, EnsembleMember,
-    EnsembleMemberSpec, Loop, LoopDetails, LoopEdge, LoopEdgeCondition, LoopNode, LoopNodeKind,
-    LoopNodeRun, LoopResetOutcome, LoopRunStatus, LoopSpec, LoopSpecStatus, LoopStatus,
-    RouterRoute, SpecAdminStatusOutcome,
+    EnsembleMemberSpec, Loop, LoopCompletionHook, LoopDetails, LoopEdge, LoopEdgeCondition,
+    LoopHookEvent, LoopNode, LoopNodeKind, LoopNodeRun, LoopResetOutcome, LoopRunStatus, LoopSpec,
+    LoopSpecStatus, LoopStatus, RouterRoute, SpecAdminStatusOutcome,
 };
 use crate::domain::models::{Agent, Trigger};
 use crate::domain::queues::{Queue, QueueDetails};
@@ -4075,7 +4075,8 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "loop_create",
-        description = "Create a loop container for a background graph of specs and nodes."
+        description = "Create a loop container for a background graph of specs and nodes. \
+        Hooks are not retroactive — a hook registered after its event has already happened does not fire."
     )]
     async fn loop_create(
         &self,
@@ -4117,7 +4118,7 @@ impl TaskTriggerHandler {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         };
 
         self.db.insert_loop(&lp).map_err(internal_error)?;
@@ -4133,7 +4134,8 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "loop_update",
-        description = "Update loop metadata such as name, description, or workdir."
+        description = "Update loop metadata such as name, description, or workdir. \
+        Hooks are not retroactive — a hook registered after its event has already happened does not fire."
     )]
     async fn loop_update(
         &self,
@@ -4198,6 +4200,33 @@ impl TaskTriggerHandler {
             },
         };
 
+        // Parse the new event-keyed `hooks` parameter. Each key must be a
+        // valid event name; each value is an ordered array of hook configs.
+        let new_hooks = match &params.hooks {
+            None => None,
+            Some(map) => {
+                let mut parsed =
+                    std::collections::BTreeMap::<LoopHookEvent, Vec<LoopCompletionHook>>::new();
+                for (event_name, hooks) in map {
+                    let Some(event) = LoopHookEvent::from_str(event_name) else {
+                        return Ok(error_result(&format!(
+                            "Invalid hook event '{}'. Must be one of: on_completed, on_failed, on_blocked, on_spec_completed.",
+                            event_name
+                        )));
+                    };
+                    let mut hook_list = Vec::new();
+                    for hook_params in hooks {
+                        match build_loop_completion_hook(hook_params) {
+                            Ok(hook) => hook_list.push(hook),
+                            Err(e) => return Ok(error_result(&e)),
+                        }
+                    }
+                    parsed.insert(event, hook_list);
+                }
+                Some(parsed)
+            }
+        };
+
         let new_infra_node_id = match &params.infra_node_id {
             None => None,
             Some(None) => Some(None),
@@ -4218,6 +4247,7 @@ impl TaskTriggerHandler {
                 workdir.is_some(),
                 new_trigger.is_some(),
                 new_completion_hook.is_some(),
+                new_hooks.is_some(),
                 new_infra_node_id.is_some(),
             ],
             "loop_update",
@@ -4239,7 +4269,23 @@ impl TaskTriggerHandler {
             }
         }
 
-        if let Some(hook) = new_completion_hook {
+        if let Some(hooks_map) = new_hooks {
+            // Merge legacy `on_completed` into the hooks map if both are provided
+            let mut final_hooks = hooks_map;
+            if let Some(Some(hook)) = new_completion_hook {
+                final_hooks
+                    .entry(LoopHookEvent::OnCompleted)
+                    .or_default()
+                    .push(hook);
+            } else if let Some(None) = new_completion_hook {
+                // Explicitly clear on_completed when legacy param is null
+                final_hooks.remove(&LoopHookEvent::OnCompleted);
+            }
+            self.db
+                .update_loop_hooks(&loop_id, &final_hooks)
+                .map_err(internal_error)?;
+        } else if let Some(hook) = new_completion_hook {
+            // Legacy path: only update on_completed, preserve other events
             self.db
                 .update_loop_completion_hook(&loop_id, hook.as_ref())
                 .map_err(internal_error)?;
@@ -6449,7 +6495,7 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "loop_get",
-        description = "Return a loop with its ordered specs, nodes, and edges."
+        description = "Return a loop with its ordered specs, nodes, and edges. Hooks are not retroactive — a hook registered after its event has already happened does not fire."
     )]
     async fn loop_get(
         &self,
@@ -6606,7 +6652,7 @@ impl TaskTriggerHandler {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         };
 
         self.db
@@ -7790,6 +7836,18 @@ impl TaskTriggerHandler {
         self.loop_engine
             .notify_blocked(&run.loop_id, &params.description)
             .map_err(internal_error)?;
+        // Resolve the human-readable node name for {{node}} before firing,
+        // falling back to the raw node id when the node row is gone.
+        let node_name = self
+            .db
+            .get_loop_node(&run.node_id)
+            .ok()
+            .flatten()
+            .map(|node| node.name)
+            .unwrap_or_else(|| run.node_id.clone());
+        self.loop_engine
+            .fire_on_blocked_hooks(&run.loop_id, &params.description, Some(&node_name))
+            .await;
 
         Ok(success_result("Loop blocker recorded and loop paused."))
     }
@@ -8776,7 +8834,15 @@ fn loop_details_json(db: &Database, lp: &LoopDetails) -> anyhow::Result<serde_js
             "ensembles": ensembles,
         },
         "specs": specs,
-        "on_completed": lp.lp.on_completed.as_ref().map(loop_completion_hook_json),
+        "on_completed": lp.lp.hooks.get(&crate::domain::loops::LoopHookEvent::OnCompleted)
+            .and_then(|hooks| hooks.first())
+            .map(loop_completion_hook_json),
+        "hooks": lp.lp.hooks.iter().map(|(event, hooks)| {
+            serde_json::json!({
+                "event": event.as_str(),
+                "hooks": hooks.iter().map(loop_completion_hook_json).collect::<Vec<_>>(),
+            })
+        }).collect::<Vec<_>>(),
         "completion_hook_runs": lp
             .completion_hook_runs
             .iter()
@@ -8826,6 +8892,7 @@ fn loop_completion_hook_json(hook: &crate::domain::loops::LoopCompletionHook) ->
     serde_json::json!({
         "platform": hook.platform,
         "model": hook.model,
+        "effort": hook.effort,
         "prompt": hook.prompt,
         "timeout_minutes": hook.timeout_minutes,
     })
@@ -8837,6 +8904,8 @@ fn loop_completion_hook_run_json(
     serde_json::json!({
         "id": run.id,
         "loop_id": run.loop_id,
+        "event": run.event.as_str(),
+        "hook_index": run.hook_index,
         "status": run.status.as_str(),
         "output": run.output,
         "summary": run.summary,
@@ -9722,7 +9791,7 @@ mod tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         })
         .unwrap();
         (dir, db, loop_id)
@@ -9978,7 +10047,7 @@ mod tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: Some("queue-1".to_string()),
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         })
         .unwrap();
 
@@ -10826,7 +10895,7 @@ mod tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         })
         .unwrap();
     }
@@ -11274,7 +11343,7 @@ mod tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         })
         .unwrap();
         db.insert_loop_node(&LoopNode {
@@ -11323,7 +11392,7 @@ mod tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         })
         .unwrap();
         db.insert_loop_node(&LoopNode {
@@ -11376,7 +11445,7 @@ mod tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         })
         .unwrap();
 
@@ -11419,7 +11488,7 @@ mod tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         }
     }
 
@@ -11930,7 +11999,7 @@ mod tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         })
         .unwrap();
         db.insert_loop_node(&u10_agent(
@@ -13089,7 +13158,7 @@ mod tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         }
     }
 
@@ -13449,7 +13518,7 @@ mod additional_tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         })
         .unwrap();
     }
@@ -14666,7 +14735,7 @@ mod additional_tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         };
         let json = loop_trigger_json(&lp);
         assert_eq!(json["type"], "manual");
@@ -14694,7 +14763,7 @@ mod additional_tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         };
         let json = loop_trigger_json(&lp);
         assert_eq!(json["type"], "cron");
@@ -14849,7 +14918,7 @@ mod coverage_tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         }
     }
 
@@ -15331,6 +15400,8 @@ mod coverage_tests {
         let run = LoopCompletionHookRun {
             id: "chr1".into(),
             loop_id: "l1".into(),
+            event: crate::domain::loops::LoopHookEvent::OnCompleted,
+            hook_index: 0,
             status: LoopRunStatus::Pass,
             output: Some(serde_json::json!({"summary": "done"})),
             summary: Some("ok".into()),
@@ -15350,6 +15421,8 @@ mod coverage_tests {
         let run = LoopCompletionHookRun {
             id: "chr2".into(),
             loop_id: "l1".into(),
+            event: crate::domain::loops::LoopHookEvent::OnFailed,
+            hook_index: 1,
             status: LoopRunStatus::Running,
             output: None,
             summary: None,
@@ -17180,6 +17253,7 @@ mod endpoint_tests {
                 workdir: None,
                 trigger: None,
                 on_completed: None,
+                hooks: None,
                 infra_node_id: None,
             }))
             .await
@@ -17868,6 +17942,7 @@ mod endpoint_tests {
                 workdir: None,
                 trigger: None,
                 on_completed: None,
+                hooks: None,
                 infra_node_id: None,
             }))
             .await
@@ -17883,6 +17958,7 @@ mod endpoint_tests {
                 workdir: None,
                 trigger: None,
                 on_completed: None,
+                hooks: None,
                 infra_node_id: None,
             }))
             .await
@@ -17909,7 +17985,7 @@ mod endpoint_tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         };
         db.insert_loop(&lp).unwrap();
         lp
@@ -22900,7 +22976,7 @@ mod endpoint_tests {
             completed_at: None,
             autorun_at: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
             auto_continue_at: None,
             auto_continue_action: None,
             archived: false,

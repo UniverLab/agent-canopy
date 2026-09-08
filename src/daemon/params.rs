@@ -409,12 +409,12 @@ pub struct LoopCreateParams {
     pub infra_node_id: Option<String>,
 }
 
-/// Config for a loop's `on_completed` hook (N2) — an agent-node-style
-/// payload (platform/model/timeout_minutes), but with its own `prompt` field
-/// rather than a node's `prompt_template` since the hook has no spec/node
-/// graph context to template against. See [`crate::loop_engine`]'s
-/// `render_completion_hook_prompt` for the placeholders `prompt` supports:
-/// `{{loop_name}}`, `{{completed_specs}}`, `{{workdir}}`.
+/// Config for a loop hook — an agent-node-style payload
+/// (platform/model/timeout_minutes), but with its own `prompt` field rather
+/// than `prompt_template` since it has no spec/node graph context to
+/// template against. Used for every event via the `hooks` map on
+/// `loop_update`. See [`crate::loop_engine`]'s `render_hook_prompt` for the
+/// event-specific placeholders each event supports.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LoopCompletionHookParams {
     /// CLI platform to run the hook with (e.g. "mimo", "claude").
@@ -423,8 +423,11 @@ pub struct LoopCompletionHookParams {
     pub model: Option<String>,
     /// Optional effort level.
     pub effort: Option<String>,
-    /// Hook prompt template. Supports {{loop_name}}, {{completed_specs}},
-    /// {{workdir}}.
+    /// Hook prompt template. Supports {{loop_name}} and {{workdir}} on every
+    /// event, plus event-specific markers: {{completed_specs}} on on_completed,
+    /// {{spec_name}} and {{spec_id}} on on_spec_completed, {{blocker}} and
+    /// {{node}} on on_failed and on_blocked. A marker its event cannot bind
+    /// is refused and recorded as a failed hook run.
     pub prompt: String,
     /// Timeout in minutes for the hook's process (default: 30, same default
     /// as an agent node).
@@ -445,10 +448,18 @@ pub struct LoopUpdateParams {
     /// leave the current trigger unchanged.
     pub trigger: Option<LoopTriggerParams>,
     /// New `on_completed` post-completion hook config, or null to clear it.
-    /// Omit to leave the current hook unchanged. Fires at most once per run,
-    /// exactly when the loop transitions to `completed` (never on
-    /// failed/paused, never retroactively).
+    /// Omit to leave the current hook unchanged. This is a compatibility
+    /// alias — prefer `hooks` for event-keyed hook management. Legacy update
+    /// replaces/registers only `on_completed` and does not clear other events.
     pub on_completed: Option<Option<LoopCompletionHookParams>>,
+    /// Event-keyed hooks. Replace the full hooks map with this map. Each key
+    /// is an event name (`on_completed`, `on_failed`, `on_blocked`,
+    /// `on_spec_completed`), and each value is an ordered array of hook
+    /// configs. Hooks are not retroactive — a hook registered after its
+    /// event has already happened does not fire. Omit to leave unchanged.
+    /// When `on_completed` is also provided, it is merged into this map
+    /// under the `on_completed` key.
+    pub hooks: Option<std::collections::BTreeMap<String, Vec<LoopCompletionHookParams>>>,
     /// New pre-wired target for infrastructure failures (`Break` edges), or
     /// null to clear. Omit to leave unchanged.
     pub infra_node_id: Option<Option<String>>,

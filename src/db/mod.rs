@@ -402,7 +402,8 @@ impl Database {
                 active_run_queue_id TEXT,
                 on_completed TEXT,
                 auto_continue_at INTEGER,
-                auto_continue_action TEXT
+                auto_continue_action TEXT,
+                hooks TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_loops_workdir_created
@@ -500,7 +501,9 @@ impl Database {
                 started_at INTEGER NOT NULL,
                 completed_at INTEGER,
                 pid INTEGER,
-                boot_id TEXT
+                boot_id TEXT,
+                event TEXT NOT NULL DEFAULT 'on_completed',
+                hook_index INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE INDEX IF NOT EXISTS idx_loop_completion_hook_runs_loop_started
@@ -1394,6 +1397,57 @@ impl Database {
                 .unwrap_or(false);
             if !has_column {
                 let sql = format!("ALTER TABLE loop_runs ADD COLUMN {column} TEXT");
+                conn.execute(&sql, [])
+                    .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+            }
+        }
+
+        // Event-keyed hooks (CH1): the loop's hooks stored as a JSON map
+        // from event name to an ordered array of agent payloads, while
+        // retaining `on_completed` for rollback/old fixtures. On database
+        // open, add `hooks` if missing and idempotently backfill every
+        // non-NULL legacy `on_completed` object as
+        // `{"on_completed":[object]}`. Reads use `hooks` with a fallback
+        // to the legacy column.
+        let has_hooks: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loops') WHERE name = 'hooks'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_hooks {
+            conn.execute("ALTER TABLE loops ADD COLUMN hooks TEXT", [])
+                .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+        // Backfill (unconditional): covers databases where `hooks` already
+        // exists but legacy `on_completed` rows were never migrated.
+        conn.execute(
+            "UPDATE loops SET hooks = json_object('on_completed', json_array(json(on_completed)))
+             WHERE on_completed IS NOT NULL AND (hooks IS NULL OR hooks = '')",
+            [],
+        )
+        .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+
+        // `event`/`hook_index` on `loop_completion_hook_runs` (CH1):
+        // every new hook run records which event it served and its
+        // position within that event's hook list. Old rows default to
+        // `on_completed`/`0` — the only event that existed before CH1.
+        for (column, definition) in [
+            ("event", "TEXT NOT NULL DEFAULT 'on_completed'"),
+            ("hook_index", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            let has_column: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('loop_completion_hook_runs') WHERE name = ?1",
+                    [column],
+                    |row| Ok(row.get::<_, i32>(0)? > 0),
+                )
+                .unwrap_or(false);
+            if !has_column {
+                let sql = format!(
+                    "ALTER TABLE loop_completion_hook_runs ADD COLUMN {column} {definition}"
+                );
                 conn.execute(&sql, [])
                     .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
             }

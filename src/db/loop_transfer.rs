@@ -5,9 +5,10 @@
 //! one transaction, so an import can never leave a half-created loop behind
 //! (spec decision 5: "no partially-created loop is ever left behind").
 //!
-//! An imported loop never carries a trigger or an `on_completed` hook (the
-//! export document has no field for either — see spec decision 1), so
-//! unlike [`Database::insert_loop`] this never needs to encode one.
+//! An imported loop never carries a trigger or any hooks (all four hook
+//! events — the export document has no field for either — see spec
+//! decision 1), so unlike [`Database::insert_loop`] this never needs to
+//! encode one.
 
 use anyhow::{anyhow, Result};
 use rusqlite::{params, Transaction};
@@ -25,8 +26,8 @@ impl Database {
         let tx = conn.transaction()?;
 
         tx.execute(
-            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation, infra_node_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            "INSERT INTO loops (id, name, description, workdir, status, trigger_type, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation, infra_node_id, hooks)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 &lp.id,
                 &lp.name,
@@ -46,6 +47,7 @@ impl Database {
                 lp.archived,
                 lp.paused_by_reconciliation,
                 &lp.infra_node_id,
+                Option::<String>::None,
             ],
         )?;
 
@@ -172,7 +174,7 @@ mod tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         }
     }
 

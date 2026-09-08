@@ -446,7 +446,7 @@ pub(crate) struct LoopProbeTarget {
 
 /// Walk a loop's agent nodes (loop-level graph and every spec's graph —
 /// ensemble members are themselves ordinary [`LoopNodeKind::Agent`] rows, so
-/// no separate ensemble query is needed) plus its `on_completed` hook, and
+/// no separate ensemble query is needed) plus every hook in every event, and
 /// return the distinct platform+model pairs they reference. A platform used
 /// by five nodes appears once, with all five names attached.
 pub(crate) fn distinct_targets_for_loop(details: &LoopDetails) -> Vec<LoopProbeTarget> {
@@ -476,13 +476,15 @@ pub(crate) fn distinct_targets_for_loop(details: &LoopDetails) -> Vec<LoopProbeT
             }
         };
 
-    if let Some(hook) = &details.lp.on_completed {
-        record(
-            Some(hook.platform.as_str()),
-            hook.model.as_deref(),
-            hook.effort.as_deref(),
-            "on_completed hook".to_string(),
-        );
+    for (event, hooks) in &details.lp.hooks {
+        for (idx, hook) in hooks.iter().enumerate() {
+            record(
+                Some(hook.platform.as_str()),
+                hook.model.as_deref(),
+                hook.effort.as_deref(),
+                format!("{} hook {}", event.as_str(), idx),
+            );
+        }
     }
 
     let all_nodes = details
@@ -966,6 +968,10 @@ mod tests {
     fn sample_loop(
         on_completed: Option<crate::domain::loops::LoopCompletionHook>,
     ) -> crate::domain::loops::Loop {
+        let mut hooks = std::collections::BTreeMap::new();
+        if let Some(hook) = on_completed {
+            hooks.insert(crate::domain::loops::LoopHookEvent::OnCompleted, vec![hook]);
+        }
         crate::domain::loops::Loop {
             archived: false,
             paused_by_reconciliation: false,
@@ -983,7 +989,7 @@ mod tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed,
+            hooks,
         }
     }
 
@@ -1045,7 +1051,69 @@ mod tests {
         let targets = distinct_targets_for_loop(&details);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].target.platform, "mimo");
-        assert_eq!(targets[0].used_by, vec!["on_completed hook"]);
+        assert_eq!(targets[0].used_by, vec!["on_completed hook 0"]);
+    }
+
+    #[test]
+    fn distinct_targets_for_loop_includes_all_hook_events_and_dedups() {
+        use crate::domain::loops::{LoopCompletionHook, LoopHookEvent};
+        use std::collections::BTreeMap;
+        let mut hooks: BTreeMap<LoopHookEvent, Vec<LoopCompletionHook>> = BTreeMap::new();
+        hooks.insert(
+            LoopHookEvent::OnCompleted,
+            vec![LoopCompletionHook {
+                platform: "mimo".to_string(),
+                model: None,
+                effort: None,
+                prompt: "done".to_string(),
+                timeout_minutes: None,
+            }],
+        );
+        hooks.insert(
+            LoopHookEvent::OnFailed,
+            vec![LoopCompletionHook {
+                platform: "mimo".to_string(),
+                model: None,
+                effort: None,
+                prompt: "failed {{blocker}}".to_string(),
+                timeout_minutes: None,
+            }],
+        );
+        hooks.insert(
+            LoopHookEvent::OnSpecCompleted,
+            vec![LoopCompletionHook {
+                platform: "other-cli".to_string(),
+                model: None,
+                effort: None,
+                prompt: "spec {{spec_name}}".to_string(),
+                timeout_minutes: None,
+            }],
+        );
+        let mut lp = sample_loop(None);
+        lp.hooks = hooks;
+        let details = LoopDetails {
+            lp,
+            graph_nodes: vec![],
+            graph_edges: vec![],
+            specs: vec![],
+            completion_hook_runs: vec![],
+        };
+
+        let targets = distinct_targets_for_loop(&details);
+        assert_eq!(targets.len(), 2);
+        let mimo = targets
+            .iter()
+            .find(|t| t.target.platform == "mimo")
+            .unwrap();
+        assert_eq!(
+            mimo.used_by,
+            vec!["on_completed hook 0", "on_failed hook 0"]
+        );
+        let other = targets
+            .iter()
+            .find(|t| t.target.platform == "other-cli")
+            .unwrap();
+        assert_eq!(other.used_by, vec!["on_spec_completed hook 0"]);
     }
 
     #[test]

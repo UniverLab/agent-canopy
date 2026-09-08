@@ -1268,7 +1268,7 @@ mod tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         })
         .unwrap();
         db.insert_loop_spec(&crate::domain::loops::LoopSpec {
@@ -1480,7 +1480,7 @@ mod tests {
             auto_continue_at: None,
             auto_continue_action: None,
             active_run_queue_id: None,
-            on_completed: None,
+            hooks: std::collections::BTreeMap::new(),
         })
         .unwrap();
 

@@ -241,31 +241,46 @@ doing so is deliberately out of scope. Point concurrent loops at
 different working directories (or at worktrees of the same repo) and
 they run independently with no coordination required from you.
 
-## `on_completed` hook
+## Event-keyed hooks
 
-A loop can carry one optional `on_completed` hook: an agent-node-style
-config (`platform`, `model`, `prompt`, `timeout_minutes`) set via
-`loop_update`. The engine fires it exactly once, right when a run
-transitions to `completed` — never on `failed` or `paused`, never
-retroactively for a loop that completed before the hook was configured,
-and never twice for the same completion. A completed → `loop_reset` →
-completed cycle fires it again, once per completing run.
+A loop carries hooks keyed by event, over four events: `on_completed`,
+`on_failed`, `on_blocked`, `on_spec_completed`. More than one hook may be
+registered for a single event, via `loop_update`'s `hooks` map (each key is
+an event name, each value is an ordered array of agent-shaped configs with
+`platform`, `model`, `prompt`, `timeout_minutes`). Hooks registered for one
+event run in declaration order.
 
-The hook's `prompt` supports its own small placeholder set (not the
-full node template-variable list above):
+- `on_completed` fires exactly once when a run transitions to `completed`
+  (only when the dispatch completed at least one spec). A completed →
+  `loop_reset` → completed cycle fires it again, once per completing run.
+- `on_failed` fires when the loop reaches `failed`.
+- `on_blocked` fires when it stops with a blocker set (transition to
+  `paused` with blocker data).
+- `on_spec_completed` fires once per spec reaching `completed`, whether the
+  specs come from the loop's own bound specs or from a queue.
 
-- `{{loop_name}}` — the loop's name.
-- `{{workdir}}` — the loop's working directory.
-- `{{completed_specs}}` — name + one-line summary of each spec this run
-  completed, one per line (`(none)` if the run completed zero specs).
+**Hooks are not retroactive** — a hook registered after its event has
+already happened does not fire. A hook that fails is recorded and never
+changes the loop's own status, and never stops the remaining hooks of that
+event from running.
 
-It runs through the same spawn path as a loop agent node (detached,
-process-group tracked), and its run is recorded and visible in
-`loop_get` / `canopy loop info` alongside the graph's node runs — but
-its pass/fail never changes the loop's final status, since the run is
-already `completed` by the time it fires. A hook failure logs a
-warning and sends a desktop notification if available; the
-loop-completed notification itself notes when a hook was launched.
+Every hook run records the event it served and which hook of that event it
+was (`event`, `hook_index`), and is readable from `loop_get`'s
+`completion_hook_runs` and `canopy loop info`'s hook-runs listing alongside
+the graph's node runs.
+
+Each event exposes what its consumer needs, in addition to `{{loop_name}}`
+and `{{workdir}}`: `on_completed` keeps `{{completed_specs}}` (name +
+one-line summary of each spec this run completed, one per line, `(none)` if
+the run completed zero specs); `on_spec_completed` gets `{{spec_name}}` and
+`{{spec_id}}`; `on_failed` and `on_blocked` get `{{blocker}}` and `{{node}}`
+(the name of the node that ended the run). A prompt carrying a marker its
+event cannot bind is refused and recorded as a failed hook run.
+
+The existing configuration keeps working, unchanged and unattended:
+whatever a loop has in its `on_completed` column becomes a hook on the
+`on_completed` event with no user action and no loss, and a `loop_update`
+call passing today's `on_completed` shape still registers that hook.
 
 The first intended use is a documentation-maintenance agent: on
 completion, review the specs this run closed, the resulting code, and
