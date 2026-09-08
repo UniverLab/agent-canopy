@@ -9482,6 +9482,7 @@ fn loop_node_run_summary_json(
             .flatten()
             .map(|s| s.name);
         serde_json::json!({
+            "id": run.id,
             "node_name": node_name,
             "status": run.status.as_str(),
             "iteration": run.iteration,
@@ -17106,7 +17107,7 @@ mod coverage_tests {
     }
 
     #[test]
-    fn loop_node_run_summary_json_compact_mode_omits_ids() {
+    fn loop_node_run_summary_json_compact_mode_keeps_id_omits_internal_ids() {
         let dir = tempdir().unwrap();
         let db = Database::new(&dir.path().join("test.db")).unwrap();
         db.insert_loop_spec(&standalone_spec("spec-1")).unwrap();
@@ -17114,7 +17115,7 @@ mod coverage_tests {
         let run = loop_run_row("run-1", "loop-1", "spec-1", LoopRunStatus::Pass);
 
         let compact = loop_node_run_summary_json(&db, &run, true);
-        assert!(compact.get("id").is_none(), "compact must omit id");
+        assert_eq!(compact["id"], "run-1", "compact must include id");
         assert!(
             compact.get("spec_id").is_none(),
             "compact must omit spec_id"
@@ -17131,6 +17132,8 @@ mod coverage_tests {
         assert_eq!(compact["node_name"], "node-1");
         assert_eq!(compact["status"], "pass");
         assert_eq!(compact["iteration"], 1);
+        assert!(compact.get("input").is_none(), "compact must omit input");
+        assert!(compact.get("output").is_none(), "compact must omit output");
 
         let full = loop_node_run_summary_json(&db, &run, false);
         assert_eq!(full["id"], "run-1");
@@ -23952,13 +23955,71 @@ mod endpoint_tests {
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         let runs = parsed["runs"].as_array().unwrap();
         assert_eq!(runs.len(), 1);
-        assert!(runs[0].get("id").is_none(), "compact mode must omit id");
+        assert!(runs[0].get("id").is_some(), "compact mode must include id");
         assert!(
             runs[0].get("spec_id").is_none(),
             "compact mode must omit spec_id"
         );
         assert_eq!(runs[0]["spec_name"], "Test Spec");
         assert_eq!(runs[0]["node_name"], "builder");
+    }
+
+    #[tokio::test]
+    async fn loop_node_runs_list_compact_id_feeds_loop_node_run_get() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let node = insert_named_node(&db, &spec.id, "builder", 1);
+        let run = insert_finalized_node_run(
+            &db,
+            &lp.id,
+            &spec.id,
+            &node.id,
+            LoopRunStatus::Pass,
+            Some(serde_json::json!({"reported_output": "ok"})),
+            chrono::Utc::now(),
+        );
+
+        let listed = handler
+            .loop_node_runs_list(Parameters(LoopNodeRunsListParams {
+                loop_id: lp.id.clone(),
+                spec_id: None,
+                node_id: None,
+                limit: None,
+                offset: None,
+                compact: Some(true),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&listed), "{}", text(&listed));
+        let body = raw_text(&listed);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let runs = parsed["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 1);
+        let compact_id = runs[0]
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(!compact_id.is_empty(), "compact listing must carry an id");
+        assert_eq!(compact_id, run.id);
+        assert!(
+            runs[0].get("input").is_none(),
+            "compact mode must omit input"
+        );
+        assert!(
+            runs[0].get("output").is_none(),
+            "compact mode must omit output"
+        );
+
+        let got = handler
+            .loop_node_run_get(Parameters(LoopNodeRunGetParams {
+                run_id: compact_id.to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&got), "{}", text(&got));
+        let detail: serde_json::Value = serde_json::from_str(&raw_text(&got)).unwrap();
+        assert_eq!(detail["id"], run.id);
     }
 
     #[tokio::test]

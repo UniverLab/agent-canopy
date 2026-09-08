@@ -1018,7 +1018,7 @@ pub struct LoopNodeRunsListParams {
     /// page past the default page (e.g. `offset: 20` for the next page after
     /// the default). Defaults to 0.
     pub offset: Option<u32>,
-    /// Compact mode: emit only node_name, status, iteration, spec_name, started_at, completed_at. Default: false.
+    /// Compact mode: emit id, node_name, status, iteration, spec_name, started_at, completed_at. Default: false.
     pub compact: Option<bool>,
 }
 
