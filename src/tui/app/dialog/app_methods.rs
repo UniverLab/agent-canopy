@@ -695,11 +695,7 @@ impl App {
             }),
             cli,
             model,
-            effort: if dialog.effort.trim().is_empty() {
-                None
-            } else {
-                Some(dialog.effort.clone())
-            },
+            effort: None,
             working_dir: Some(working_dir),
             enabled: true,
             enable_at: None,
@@ -748,11 +744,7 @@ impl App {
             }),
             cli,
             model,
-            effort: if dialog.effort.trim().is_empty() {
-                None
-            } else {
-                Some(dialog.effort.clone())
-            },
+            effort: None,
             working_dir: None,
             enabled: true,
             enable_at: None,
@@ -869,7 +861,6 @@ fn populate_dialog_from_agent(dialog: &mut NewAgentDialog, a: &crate::domain::mo
     dialog.prompt_cursor = a.prompt.chars().count();
     dialog.prompt_scroll = 0;
     dialog.model = a.model.clone().unwrap_or_default();
-    dialog.effort = a.effort.clone().unwrap_or_default();
     dialog.working_dir = a.working_dir.clone().unwrap_or_default();
     dialog.field = 2;
 
@@ -1589,5 +1580,32 @@ mod tests {
         populate_dialog_from_agent(&mut dialog, &agent);
         // cli_index stays at 0 (default) since unknown-cli is not in available_clis
         assert_eq!(dialog.cli_index, 0);
+    }
+
+    #[test]
+    fn editing_agent_preserves_existing_effort() {
+        let db = test_db();
+        let mut agent = cron_agent("effort-1");
+        agent.effort = Some("high".to_string());
+        db.upsert_agent(&agent).expect("seed");
+
+        let data_dir = tempdir().expect("data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("app");
+        app.agents = vec![AgentEntry::Agent(agent)];
+        app.selected = 0;
+
+        app.open_edit_dialog();
+        {
+            let dialog = app.new_agent_dialog.as_mut().unwrap();
+            dialog.prompt = "changed prompt".to_string();
+        }
+        app.launch_new_agent().expect("save");
+
+        let stored = db.get_agent("effort-1").unwrap().expect("agent exists");
+        assert_eq!(
+            stored.effort.as_deref(),
+            Some("high"),
+            "edit must not clear effort"
+        );
     }
 }

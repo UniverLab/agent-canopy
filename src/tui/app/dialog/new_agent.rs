@@ -55,7 +55,6 @@ pub struct NewAgentDialog {
     pub cli_configs: Vec<Option<crate::domain::cli_config::CliConfig>>,
     pub working_dir: String,
     pub model: String,
-    pub effort: String,
     pub prompt: String,
     /// Cursor position (char index) inside `prompt`.
     pub prompt_cursor: usize,
@@ -150,7 +149,6 @@ impl NewAgentDialog {
             },
             working_dir: cwd.clone(),
             model: String::new(),
-            effort: String::new(),
             prompt: String::new(),
             prompt_cursor: 0,
             prompt_scroll: 0,

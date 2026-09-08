@@ -127,9 +127,9 @@ fn dialog_height(dialog: &NewAgentDialog, filtered_clis: &[usize]) -> u16 {
         0
     };
     let base_height = match dialog.task_type {
-        NewTaskType::Interactive => 14 + dir_rows,
+        NewTaskType::Interactive => 12 + dir_rows,
         NewTaskType::Terminal => 10 + dir_rows,
-        NewTaskType::Background => 15 + dir_rows + prompt_rows,
+        NewTaskType::Background => 13 + dir_rows + prompt_rows,
     };
 
     base_height
@@ -430,7 +430,6 @@ fn append_interactive_sections(
     append_cli_section(lines, dialog, accent, filtered_clis, layout.cli, theme);
     append_session_picker_rows(lines, dialog, theme);
     append_identity_section(lines, dialog, accent, layout.identity, theme);
-    append_effort_section(lines, dialog, theme);
     append_yolo_section(lines, dialog, accent, layout.yolo, theme);
     append_sandbox_section(lines, dialog, accent, layout.sandbox, theme);
     append_directory_section(lines, dialog, accent, layout.dir, false, layout.dir, theme);
@@ -468,7 +467,6 @@ fn append_background_sections(
     append_trigger_section(lines, dialog, accent, theme);
     append_cli_section(lines, dialog, accent, filtered_clis, layout.cli, theme);
     append_model_section(lines, dialog, accent, layout.model, theme);
-    append_effort_section(lines, dialog, theme);
     append_prompt_section(lines, dialog, accent, layout, field_width, theme);
 
     let hide_dir = dialog.background_trigger == BackgroundTrigger::Watch;
@@ -677,19 +675,6 @@ fn model_value(dialog: &NewAgentDialog) -> String {
     } else {
         format!("{}▏", dialog.model)
     }
-}
-
-fn append_effort_section(lines: &mut Vec<Line<'static>>, dialog: &NewAgentDialog, theme: &Theme) {
-    let value = if dialog.effort.is_empty() {
-        "-".to_string()
-    } else {
-        dialog.effort.clone()
-    };
-    lines.push(Line::from(vec![
-        Span::styled("  Effort: ", Style::default().fg(theme.dim_text)),
-        Span::styled(value, Style::default().fg(Color::White)),
-    ]));
-    lines.push(Line::from(""));
 }
 
 fn append_model_picker_rows(
@@ -1818,5 +1803,35 @@ mod tests {
     #[test]
     fn filter_display_special_chars() {
         assert_eq!(filter_display("test@#$%"), "test@#$%");
+    }
+
+    #[test]
+    fn dialog_renders_no_effort_field() {
+        let mut d = NewAgentDialog::new(Some("."));
+        // Interactive dialog
+        d.task_type = NewTaskType::Interactive;
+        let lines = build_dialog_lines(&d, Color::White, &[], 40, &Theme::classic());
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            !text.contains("Effort"),
+            "interactive dialog must not show effort field"
+        );
+
+        // Background dialog
+        d.task_type = NewTaskType::Background;
+        let lines = build_dialog_lines(&d, Color::White, &[], 40, &Theme::classic());
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            !text.contains("Effort"),
+            "background dialog must not show effort field"
+        );
     }
 }
