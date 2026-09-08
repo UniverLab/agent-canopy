@@ -929,6 +929,7 @@ const AGENT_CONFIG_KEYS: &[&str] = &[
     "prompt_preset",
     "require_report",
     "commit_rights",
+    "skills",
 ];
 /// Every config key a `check` node is read for — see `execute_check_node`.
 const CHECK_CONFIG_KEYS: &[&str] = &[
@@ -6281,6 +6282,14 @@ impl TaskTriggerHandler {
                 Ok(document) => document,
                 Err(e) => return Ok(error_result(&e)),
             };
+
+        for node in &document.nodes {
+            if let Some(map) = node.config.as_object() {
+                if let Err(e) = validate_known_config_keys(node.kind, map) {
+                    return Ok(error_result(&e));
+                }
+            }
+        }
 
         let desired_name = params
             .name
@@ -17978,6 +17987,291 @@ mod endpoint_tests {
             .await
             .unwrap();
         assert!(is_err(&missing));
+    }
+
+    #[tokio::test]
+    async fn loop_add_node_accepts_skills_on_agent_and_preserves_order() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+
+        let mut config = agent_node_config("claude");
+        config.insert(
+            "skills".to_string(),
+            serde_json::json!(["alpha", "beta", "gamma"]),
+        );
+
+        let added = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Implementer".to_string(),
+                kind: Some("agent".to_string()),
+                config: Some(config),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&added), "{}", text(&added));
+        let node_id = extract_id(&added, "node_id");
+
+        let stored = db.get_loop_node(&node_id).unwrap().unwrap();
+        let skills = stored.config["skills"].as_array().unwrap();
+        assert_eq!(skills.len(), 3);
+        assert_eq!(skills[0].as_str().unwrap(), "alpha");
+        assert_eq!(skills[1].as_str().unwrap(), "beta");
+        assert_eq!(skills[2].as_str().unwrap(), "gamma");
+
+        // Spec FR4: the names must reach the engine's resolution path in
+        // listed order. `node_pinned_skills` (loop_engine.rs) is private, so
+        // replicate its exact extraction from the persisted config here.
+        let resolved: Vec<&str> = stored.config["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(resolved, ["alpha", "beta", "gamma"]);
+    }
+
+    #[tokio::test]
+    async fn loop_update_node_accepts_skills_on_agent_and_preserves_order() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+
+        let added = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Implementer".to_string(),
+                kind: Some("agent".to_string()),
+                config: Some(agent_node_config("claude")),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        let node_id = extract_id(&added, "node_id");
+
+        let mut new_config = agent_node_config("claude");
+        new_config.insert(
+            "skills".to_string(),
+            serde_json::json!(["delta", "epsilon"]),
+        );
+
+        let updated = handler
+            .loop_update_node(Parameters(LoopUpdateNodeParams {
+                node_id: node_id.clone(),
+                name: None,
+                kind: None,
+                config: Some(new_config),
+                position: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&updated), "{}", text(&updated));
+
+        let stored = db.get_loop_node(&node_id).unwrap().unwrap();
+        let skills = stored.config["skills"].as_array().unwrap();
+        assert_eq!(skills.len(), 2);
+        assert_eq!(skills[0].as_str().unwrap(), "delta");
+        assert_eq!(skills[1].as_str().unwrap(), "epsilon");
+    }
+
+    #[tokio::test]
+    async fn loop_import_preserves_skills_on_agent_nodes() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let workdir = dir.path().to_string_lossy().to_string();
+        let (source_loop_id, ..) = build_simple_loop(&handler, &workdir, "Source Loop").await;
+
+        let exported = handler
+            .loop_export(Parameters(LoopExportParams {
+                loop_id: source_loop_id.clone(),
+                with_models: Some(true),
+            }))
+            .await
+            .unwrap();
+        let mut document: serde_json::Value = serde_json::from_str(&raw_text(&exported)).unwrap();
+
+        let nodes = document["nodes"].as_array_mut().unwrap();
+        for node in nodes.iter_mut() {
+            if node["name"] == "implementer" {
+                node["config"]["skills"] = serde_json::json!(["skill-a", "skill-b"]);
+            }
+        }
+
+        let imported = handler
+            .loop_import(Parameters(LoopImportParams {
+                document,
+                workdir: workdir.clone(),
+                name: Some("Imported Loop".to_string()),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&imported), "{}", text(&imported));
+        let body: serde_json::Value = serde_json::from_str(&raw_text(&imported)).unwrap();
+        let new_loop_id = body["loop_id"].as_str().unwrap().to_string();
+
+        let nodes = db.list_loop_nodes_for_loop(&new_loop_id).unwrap();
+        let implementer = nodes.iter().find(|n| n.name == "implementer").unwrap();
+        let skills = implementer.config["skills"].as_array().unwrap();
+        assert_eq!(skills.len(), 2);
+        assert_eq!(skills[0].as_str().unwrap(), "skill-a");
+        assert_eq!(skills[1].as_str().unwrap(), "skill-b");
+    }
+
+    #[tokio::test]
+    async fn loop_add_node_rejects_skills_on_check_gate_router() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+
+        for (kind, base_config) in [
+            ("check", check_node_config("cargo test")),
+            ("gate", {
+                let mut m = serde_json::Map::new();
+                m.insert(
+                    "evaluate".to_string(),
+                    serde_json::Value::String("pass".to_string()),
+                );
+                m
+            }),
+            ("router", {
+                let mut m = serde_json::Map::new();
+                m.insert("routes".to_string(), serde_json::json!(["a", "b"]));
+                m
+            }),
+        ] {
+            let mut config = base_config;
+            config.insert("skills".to_string(), serde_json::json!(["alpha", "beta"]));
+
+            let rejected = handler
+                .loop_add_node(Parameters(LoopAddNodeParams {
+                    spec_id: Some(spec.id.clone()),
+                    loop_id: None,
+                    name: format!("Node-{kind}"),
+                    kind: Some(kind.to_string()),
+                    config: Some(config),
+                    blueprint: None,
+                    config_overrides: None,
+                }))
+                .await
+                .unwrap();
+            assert!(is_err(&rejected), "kind={kind} should reject skills");
+            // Must be the pre-existing generic unknown-key message for this
+            // kind — not a new skills-specific special case (spec FR3).
+            let msg = text(&rejected);
+            assert!(
+                msg.contains(&format!("kind '{kind}'"))
+                    && msg.contains("unrecognized key 'skills'")
+                    && msg.contains("Accepted keys:"),
+                "kind={kind}: {msg}"
+            );
+        }
+
+        assert!(db.list_loop_nodes(&spec.id).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn loop_import_rejects_skills_on_non_agent_nodes() {
+        let (dir, _db, handler) = endpoint_test_handler();
+        let workdir = dir.path().to_string_lossy().to_string();
+        let (source_loop_id, ..) = build_simple_loop(&handler, &workdir, "Source Loop").await;
+
+        let exported = handler
+            .loop_export(Parameters(LoopExportParams {
+                loop_id: source_loop_id.clone(),
+                with_models: Some(true),
+            }))
+            .await
+            .unwrap();
+        let mut document: serde_json::Value = serde_json::from_str(&raw_text(&exported)).unwrap();
+
+        let nodes = document["nodes"].as_array_mut().unwrap();
+        for node in nodes.iter_mut() {
+            if node["name"] == "gate" {
+                node["config"]["skills"] = serde_json::json!(["alpha"]);
+            }
+        }
+
+        let rejected = handler
+            .loop_import(Parameters(LoopImportParams {
+                document,
+                workdir: workdir.clone(),
+                name: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&rejected), "{}", text(&rejected));
+        // The node named "gate" in `build_simple_loop` is a `check` kind, so
+        // import must reject it with the same generic unknown-key message
+        // `loop_add_node`/`loop_update_node` produce (spec FR3).
+        let msg = text(&rejected);
+        assert!(
+            msg.contains("kind 'check'")
+                && msg.contains("unrecognized key 'skills'")
+                && msg.contains("Accepted keys:"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_add_node_tolerates_malformed_skills_values() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+
+        let mut config_string = agent_node_config("claude");
+        config_string.insert(
+            "skills".to_string(),
+            serde_json::Value::String("not-an-array".to_string()),
+        );
+
+        let added_string = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "StringSkills".to_string(),
+                kind: Some("agent".to_string()),
+                config: Some(config_string),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&added_string), "{}", text(&added_string));
+        let node_id_string = extract_id(&added_string, "node_id");
+        let stored_string = db.get_loop_node(&node_id_string).unwrap().unwrap();
+        assert!(stored_string.config["skills"].is_string());
+
+        let mut config_mixed = agent_node_config("claude");
+        config_mixed.insert(
+            "skills".to_string(),
+            serde_json::json!(["alpha", 42, "beta"]),
+        );
+
+        let added_mixed = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "MixedSkills".to_string(),
+                kind: Some("agent".to_string()),
+                config: Some(config_mixed),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&added_mixed), "{}", text(&added_mixed));
+        let node_id_mixed = extract_id(&added_mixed, "node_id");
+        let stored_mixed = db.get_loop_node(&node_id_mixed).unwrap().unwrap();
+        let skills = stored_mixed.config["skills"].as_array().unwrap();
+        assert_eq!(skills.len(), 3);
+        assert_eq!(skills[0].as_str().unwrap(), "alpha");
+        assert!(skills[1].is_number());
+        assert_eq!(skills[2].as_str().unwrap(), "beta");
     }
 
     // ── loop_add_edge / loop_update_edge ──────────────────────────
