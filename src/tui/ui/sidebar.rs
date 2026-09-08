@@ -947,6 +947,7 @@ fn draw_project_loop_card(
 fn loop_status_icon(lp: &Loop, meta: &LoopSidebarMeta, theme: &Theme) -> (&'static str, Color) {
     match lp.status {
         LoopStatus::Running => ("▶", STATUS_RUNNING),
+        LoopStatus::Pausing => ("⏸", theme.warning),
         LoopStatus::Paused if meta.blocked => ("⛔", STATUS_FAIL),
         LoopStatus::Paused => ("⏸", theme.warning),
         LoopStatus::Draft => ("○", theme.dim_text),

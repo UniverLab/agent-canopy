@@ -390,7 +390,9 @@ impl Database {
         let Some((status, archived)) = row else {
             return Ok(ArchiveLoopOutcome::NotFound);
         };
-        if LoopStatus::from_str(&status) == LoopStatus::Running {
+        if LoopStatus::from_str(&status) == LoopStatus::Running
+            || LoopStatus::from_str(&status) == LoopStatus::Pausing
+        {
             return Ok(ArchiveLoopOutcome::Running);
         }
         if archived != 0 {
@@ -464,6 +466,35 @@ impl Database {
                 completed_at.map(|value| value.timestamp()),
                 loop_id,
             ],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Mark a running loop as pausing (pause requested). Returns true if the
+    /// loop was running and is now pausing, false otherwise. Does NOT terminate
+    /// running nodes — the engine checks this state between node executions.
+    pub fn request_pause_pending(&self, loop_id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE loops SET status = ?1 WHERE id = ?2 AND status = 'running'",
+            params![LoopStatus::Pausing.as_str(), loop_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Transition a loop from pausing to paused. Called by the engine after
+    /// the running node completes naturally.
+    pub fn complete_pause(&self, loop_id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE loops SET status = ?1 WHERE id = ?2 AND status = 'pausing'",
+            params![LoopStatus::Paused.as_str(), loop_id],
         )?;
         Ok(rows > 0)
     }
@@ -1640,6 +1671,113 @@ impl Database {
         Ok(rows > 0)
     }
 
+    /// Mark a running node run as interrupted by an operator. Does NOT kill
+    /// the process — the caller is responsible for termination.
+    pub fn interrupt_loop_run(&self, run_id: &str, reason: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE loop_runs
+             SET status = ?1,
+                 output = ?2,
+                 completed_at = ?3,
+                 pid = NULL
+             WHERE id = ?4 AND status = 'running'",
+            params![
+                LoopRunStatus::Interrupted.as_str(),
+                serde_json::to_string(&serde_json::json!({
+                    "interrupted": true,
+                    "reason": reason
+                }))?,
+                chrono::Utc::now().timestamp(),
+                run_id,
+            ],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// CB31: flag every run of `node_ids` under `spec_id` at `iteration` as
+    /// `paused_through` — the node(s) finalized with their own verdict while a
+    /// wait-for-completion `loop_pause` was pending. A single node has one such
+    /// row; an ensemble step has one per member plus its join. The flag tells
+    /// [`Self::last_spec_node_run_was_operator_paused`] that `loop_continue`
+    /// re-executing this cursor must reuse the same iteration number rather
+    /// than spend a fresh one. Returns the number of rows flagged.
+    pub fn mark_spec_node_runs_paused_through(
+        &self,
+        spec_id: &str,
+        node_ids: &[String],
+        iteration: i64,
+    ) -> Result<usize> {
+        if node_ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let placeholders = vec!["?"; node_ids.len()].join(",");
+        let sql = format!(
+            "UPDATE loop_runs SET paused_through = 1
+             WHERE spec_id = ?1 AND iteration = ?2 AND node_id IN ({placeholders})"
+        );
+        let mut sql_params: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(spec_id.to_string()), Box::new(iteration)];
+        for id in node_ids {
+            sql_params.push(Box::new(id.clone()));
+        }
+        let refs: Vec<&dyn rusqlite::ToSql> = sql_params.iter().map(|b| b.as_ref()).collect();
+        let rows = conn.execute(&sql, refs.as_slice())?;
+        Ok(rows)
+    }
+
+    /// CB31: whether the most recent run among `node_ids` under `spec_id` was
+    /// ended by an operator rather than by the node's own work — recorded
+    /// `Interrupted` (explicit `loop_pause(interrupt: true)`), or finalized
+    /// with its own verdict while a wait-for-completion pause was pending
+    /// (`paused_through`). The engine consults this before incrementing the
+    /// per-node iteration counter on a resumed dispatch: an operator pause or
+    /// interrupt is not a node attempt and must not consume one of the node's
+    /// `DEFAULT_MAX_ITERATIONS_PER_NODE`.
+    pub fn last_spec_node_run_was_operator_paused(
+        &self,
+        spec_id: &str,
+        node_ids: &[String],
+    ) -> Result<bool> {
+        if node_ids.is_empty() {
+            return Ok(false);
+        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let placeholders = vec!["?"; node_ids.len()].join(",");
+        let sql = format!(
+            "SELECT status, paused_through FROM loop_runs
+             WHERE spec_id = ?1 AND node_id IN ({placeholders})
+             ORDER BY started_at DESC, rowid DESC LIMIT 1"
+        );
+        let mut sql_params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(spec_id.to_string())];
+        for id in node_ids {
+            sql_params.push(Box::new(id.clone()));
+        }
+        let refs: Vec<&dyn rusqlite::ToSql> = sql_params.iter().map(|b| b.as_ref()).collect();
+        let row = conn
+            .query_row(&sql, refs.as_slice(), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+            .optional()?;
+        Ok(match row {
+            Some((status, paused_through)) => {
+                LoopRunStatus::from_str(&status) == LoopRunStatus::Interrupted
+                    || paused_through != 0
+            }
+            None => false,
+        })
+    }
+
     /// CT3: append one live-output chunk for a running check node. Called
     /// from the engine's stdout/stderr reader tasks; `stream` must be
     /// `stdout` or `stderr` (enforced by the table CHECK constraint).
@@ -1976,9 +2114,18 @@ impl Database {
         let orphaned: Vec<Loop> = {
             let mut stmt = tx.prepare(
                 "SELECT id, name, description, workdir, status, trigger_config, created_at, started_at, completed_at, autorun_at, active_run_queue_id, on_completed, auto_continue_at, auto_continue_action, archived, paused_by_reconciliation, infra_node_id, hooks
-                 FROM loops WHERE status = ?1",
+                 FROM loops WHERE status IN (?1, ?2)",
             )?;
-            let rows = stmt.query_map(params![LoopStatus::Running.as_str()], map_loop_row)?;
+            // CB31: a loop caught mid-`Pausing` (wait-for-completion pause
+            // requested, running node not yet finished) by a daemon restart is
+            // just as orphaned as a `Running` one — its dispatch is gone and
+            // the pending pause will never complete on its own. Reconcile it
+            // the same way: pause, mark the dangling run interrupted, mark the
+            // spec interrupted, so `loop_continue` alone can resume it.
+            let rows = stmt.query_map(
+                params![LoopStatus::Running.as_str(), LoopStatus::Pausing.as_str()],
+                map_loop_row,
+            )?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
 

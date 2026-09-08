@@ -961,6 +961,7 @@ fn short_id(id: &str) -> String {
 fn status_icon(status: LoopStatus) -> &'static str {
     match status {
         LoopStatus::Running => "\x1b[36m▶\x1b[0m",
+        LoopStatus::Pausing => "\x1b[33m⏸\x1b[0m",
         LoopStatus::Paused => "\x1b[33m⏸\x1b[0m",
         LoopStatus::Completed => "\x1b[32m✓\x1b[0m",
         LoopStatus::Failed => "\x1b[31m✗\x1b[0m",
@@ -991,6 +992,7 @@ fn run_status_icon(status: LoopRunStatus, output: Option<&serde_json::Value>) ->
         LoopRunStatus::Running => "\x1b[36m▶\x1b[0m",
         LoopRunStatus::Pass => "\x1b[32m✓\x1b[0m",
         LoopRunStatus::Fail => "\x1b[31m✗\x1b[0m",
+        LoopRunStatus::Interrupted => "\x1b[33m⚑\x1b[0m",
     }
 }
 

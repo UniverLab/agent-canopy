@@ -242,6 +242,7 @@ fn status_icon_and_label(
     }
     match state.loop_status {
         LoopStatus::Running => ("▶", "running".to_string(), theme.status_running),
+        LoopStatus::Pausing => ("⏸", "pausing".to_string(), Color::Yellow),
         LoopStatus::Paused => ("⏸", "paused".to_string(), Color::Yellow),
         LoopStatus::Completed => ("✓", "completed".to_string(), theme.status_ok),
         LoopStatus::Failed => ("✗", "failed".to_string(), theme.status_fail),
@@ -625,6 +626,7 @@ fn ensemble_member_status_tag(
     match status {
         Some(LoopRunStatus::Pass) => ("[pass]", theme.status_ok),
         Some(LoopRunStatus::Fail) => ("[fail]", theme.status_fail),
+        Some(LoopRunStatus::Interrupted) => ("[interrupted]", theme.status_fail),
         Some(LoopRunStatus::Running) => ("[running]", theme.status_running),
         None => ("[pending]", theme.dim_text),
     }
@@ -974,6 +976,9 @@ fn run_status_span(status: Option<LoopRunStatus>, theme: &Theme) -> Span<'static
         }
         Some(LoopRunStatus::Pass) => Span::styled("pass", Style::default().fg(theme.status_ok)),
         Some(LoopRunStatus::Fail) => Span::styled("fail", Style::default().fg(theme.status_fail)),
+        Some(LoopRunStatus::Interrupted) => {
+            Span::styled("interrupted", Style::default().fg(theme.status_fail))
+        }
         None => Span::styled("(no runs yet)", Style::default().fg(theme.dim_text)),
     }
 }

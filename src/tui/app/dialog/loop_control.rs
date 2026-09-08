@@ -76,7 +76,7 @@ impl LoopControlAction {
 /// reset and run; a draft (never launched) loop offers only run.
 pub(crate) fn available_loop_actions(status: LoopStatus) -> Vec<LoopControlAction> {
     match status {
-        LoopStatus::Running => vec![LoopControlAction::Pause],
+        LoopStatus::Running | LoopStatus::Pausing => vec![LoopControlAction::Pause],
         LoopStatus::Paused => vec![
             LoopControlAction::ContinueRetry,
             LoopControlAction::ContinueSkip,

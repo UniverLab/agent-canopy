@@ -237,32 +237,83 @@ impl LoopEngine {
         });
     }
 
-    pub fn request_pause(&self, loop_id: &str) -> Result<bool> {
+    /// Request a pause for a running loop.
+    ///
+    /// If `interrupt` is false (default), sets the loop to `Pausing` state and
+    /// waits for the running node to complete naturally. The engine checks this
+    /// state between node executions and transitions to `Paused` after the
+    /// current node finishes.
+    ///
+    /// If `interrupt` is true, immediately terminates the running node and
+    /// marks it as `Interrupted` (not `Fail`). Use this when the operator
+    /// explicitly wants to stop the current node.
+    ///
+    /// Returns true if the pause was accepted (loop was running or pausing),
+    /// false if the loop is not running or does not exist.
+    pub fn request_pause(&self, loop_id: &str, interrupt: bool) -> Result<bool> {
         let Some(lp) = self.db.get_loop(loop_id)? else {
             return Ok(false);
         };
 
         match lp.status {
             LoopStatus::Running => {
-                let result = self
+                if interrupt {
+                    // Immediate termination mode: mark paused and interrupt running nodes
+                    let result =
+                        self.db
+                            .update_loop_status(loop_id, LoopStatus::Paused, None, None);
+                    for run in self.db.list_running_loop_runs(loop_id).unwrap_or_default() {
+                        self.interrupt_run(&run, "operator requested interrupt");
+                    }
+                    result
+                } else if self
                     .db
-                    .update_loop_status(loop_id, LoopStatus::Paused, None, None);
-                // B12: don't wait for the sequential run_spec loop to notice
-                // the pause between node executions — that could be up to a
-                // full node timeout away. Kill whatever's actually running
-                // for this loop right now, so the in-flight `wait()` inside
-                // `run_agent_process`/`execute_check_node` unblocks promptly
-                // and `run_spec`'s existing post-execution pause check (which
-                // already tolerates a run whose status was changed out from
-                // under it) takes it from there.
-                for run in self.db.list_running_loop_runs(loop_id).unwrap_or_default() {
-                    self.terminate_run(&run, "loop paused");
+                    .list_running_loop_runs(loop_id)
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    // Req 6: nothing is in flight, so there is nothing to wait
+                    // for — pause immediately, exactly as before this change.
+                    self.db
+                        .update_loop_status(loop_id, LoopStatus::Paused, None, None)
+                } else {
+                    // Wait-for-completion mode: a node is running. Record the
+                    // pending pause; the engine transitions the loop to
+                    // `Paused` once that node finishes on its own.
+                    self.db.request_pause_pending(loop_id)
                 }
-                result
             }
-            LoopStatus::Paused => Ok(true),
-            _ => Ok(false),
+            LoopStatus::Pausing => {
+                if interrupt {
+                    // Already pausing, but interrupt requested: terminate now
+                    for run in self.db.list_running_loop_runs(loop_id).unwrap_or_default() {
+                        self.interrupt_run(&run, "operator requested interrupt");
+                    }
+                    self.db
+                        .update_loop_status(loop_id, LoopStatus::Paused, None, None)
+                } else {
+                    Ok(true) // Already pausing, nothing to do
+                }
+            }
+            LoopStatus::Paused => Ok(true), // Already paused
+            _ => Ok(false),                 // Not running
         }
+    }
+
+    /// Interrupt a running node, marking it as `Interrupted` (not `Fail`).
+    fn interrupt_run(&self, run: &LoopNodeRun, reason: &str) {
+        tracing::info!(
+            run_id = %run.id,
+            node_id = %run.node_id,
+            reason,
+            "node run interrupted by operator"
+        );
+        // Kill the process
+        if let Some(pid) = run.pid {
+            crate::daemon::process::terminate_process_group_async(pid, KILL_GRACE);
+        }
+        // Mark as interrupted (not fail)
+        let _ = self.db.interrupt_loop_run(&run.id, reason);
     }
 
     /// Run `loop_id`'s specs through its graph (R2).
@@ -1710,7 +1761,22 @@ impl LoopEngine {
             }
 
             let iteration = iterations.entry(budget_key).or_insert(0);
-            *iteration += 1;
+
+            // CB31: an operator pause or interrupt is not a node attempt. If
+            // the previous run at this cursor was ended by the operator —
+            // recorded `Interrupted` (explicit `loop_pause(interrupt: true)`),
+            // or finalized with its own verdict while a wait-for-completion
+            // pause was pending (`paused_through`) — the re-execution on
+            // `loop_continue` reuses the same iteration number instead of
+            // consuming a fresh one. Only genuine node outcomes count against
+            // DEFAULT_MAX_ITERATIONS_PER_NODE.
+            let previous_was_operator_paused = self.db.last_spec_node_run_was_operator_paused(
+                &spec.id,
+                &cursor_node_ids(&cursor, &ensembles),
+            )?;
+            if !previous_was_operator_paused {
+                *iteration += 1;
+            }
             if *iteration > DEFAULT_MAX_ITERATIONS_PER_NODE {
                 // B12: the process from the last execution at this node
                 // (or any other node still running) must not survive the
@@ -2067,6 +2133,22 @@ impl LoopEngine {
                         }
                     }
 
+                    // CB31: a wait-for-completion pause was requested while this
+                    // node was running. It ran to its own completion and its
+                    // verdict is now recorded normally; flag that run so
+                    // `loop_continue` re-executing this node does not spend one
+                    // of its iterations (the pause is not an attempt), then
+                    // transition to paused and stop before the next node.
+                    if self.is_pausing(&lp.id)? {
+                        self.db.mark_spec_node_runs_paused_through(
+                            &spec.id,
+                            &cursor_node_ids(&cursor, &ensembles),
+                            iteration_value as i64,
+                        )?;
+                        self.db.complete_pause(&lp.id)?;
+                        return Ok(SpecExecutionOutcome::Paused);
+                    }
+
                     if self.is_paused(&lp.id)? {
                         return Ok(SpecExecutionOutcome::Paused);
                     }
@@ -2110,6 +2192,20 @@ impl LoopEngine {
                             &all_node_names,
                         )
                         .await?;
+
+                    // CB31: as in the single-node arm — a wait-for-completion
+                    // pause landed on this ensemble step. Its members ran to
+                    // completion; flag every run of this iteration so a
+                    // `loop_continue` re-run of the step costs no iteration.
+                    if self.is_pausing(&lp.id)? {
+                        self.db.mark_spec_node_runs_paused_through(
+                            &spec.id,
+                            &cursor_node_ids(&cursor, &ensembles),
+                            iteration_value as i64,
+                        )?;
+                        self.db.complete_pause(&lp.id)?;
+                        return Ok(SpecExecutionOutcome::Paused);
+                    }
 
                     if self.is_paused(&lp.id)? {
                         return Ok(SpecExecutionOutcome::Paused);
@@ -3409,6 +3505,13 @@ impl LoopEngine {
             .db
             .get_loop(loop_id)?
             .is_some_and(|lp| lp.status == LoopStatus::Paused))
+    }
+
+    fn is_pausing(&self, loop_id: &str) -> Result<bool> {
+        Ok(self
+            .db
+            .get_loop(loop_id)?
+            .is_some_and(|lp| lp.status == LoopStatus::Pausing))
     }
 
     /// Fail `loop_id`, sweeping every run still `running` under it — but
@@ -5521,7 +5624,7 @@ fn select_next_step(
                 edge.condition == LoopEdgeCondition::Pass
                     || edge.condition == LoopEdgeCondition::Always
             }
-            LoopRunStatus::Fail => {
+            LoopRunStatus::Fail | LoopRunStatus::Interrupted => {
                 edge.condition == LoopEdgeCondition::Fail
                     || edge.condition == LoopEdgeCondition::Always
             }
@@ -5790,7 +5893,7 @@ fn member_output_text(output: &Value) -> String {
 fn should_advance_to_next_spec(node: &LoopNode, status: LoopRunStatus) -> bool {
     let route_key = match status {
         LoopRunStatus::Pass => "pass_route",
-        LoopRunStatus::Fail => "fail_route",
+        LoopRunStatus::Fail | LoopRunStatus::Interrupted => "fail_route",
         LoopRunStatus::Running => return false,
     };
 
@@ -19475,7 +19578,7 @@ echo done
         );
 
         // Pause graph B.
-        assert!(engine.request_pause(&loop_b.id).unwrap());
+        assert!(engine.request_pause(&loop_b.id, false).unwrap());
         dispatch.await.unwrap().unwrap();
         assert_eq!(
             db.get_loop(&loop_b.id).unwrap().unwrap().status,
@@ -19678,22 +19781,314 @@ echo done
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
-        assert!(engine.request_pause(&loop_b.id).unwrap());
+        assert!(engine.request_pause(&loop_b.id, false).unwrap());
         dispatch.await.unwrap().unwrap();
 
         let b_runs = db.list_loop_runs_for_spec(&spec_b.id).unwrap();
         assert_eq!(
             b_runs.len(),
             1,
-            "graph B's node must have been signalled and finalized"
+            "graph B's node must have completed naturally and been finalized"
         );
-        assert_eq!(b_runs[0].status, LoopRunStatus::Fail);
+        // With the new pause behavior, the node runs to completion — the
+        // command `sleep 0.3 && true` exits 0, so the run is Pass, not Fail.
+        assert_eq!(b_runs[0].status, LoopRunStatus::Pass);
 
         let run_a_after =
             serde_json::to_value(db.get_loop_run(&run_a.id).unwrap().unwrap()).unwrap();
         assert_eq!(
             run_a_after, run_a_before,
             "graph A's node run must never be signalled or mutated by graph B's pause"
+        );
+    }
+
+    // ── CB31: loop_pause waits for the running node and spends no iteration ──
+
+    /// A one-check-node loop whose command is `cmd` (node passes iff it exits
+    /// 0). Returns an Arc'd engine ready to dispatch in the background.
+    fn cb31_fixture(cmd: &str) -> (TempDir, Arc<Database>, Arc<LoopEngine>, String, String) {
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "cb31-node".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "work".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({ "command": cmd, "success_condition": "exit_code_0" }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        (dir, db, Arc::new(engine), loop_id, spec_id)
+    }
+
+    async fn cb31_wait_for_running_run(db: &Database, loop_id: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while db
+            .list_running_loop_runs(loop_id)
+            .unwrap_or_default()
+            .is_empty()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node run never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Req 1 + 2: a default pause waits for the running node, is visible as a
+    /// distinct `pausing` status while it waits, and the node's run is recorded
+    /// with its own outcome — the loop only reaches `paused` once it finished.
+    #[tokio::test]
+    async fn pause_waits_for_node_and_reports_pausing_until_it_finishes() {
+        let (_dir, db, engine, loop_id, spec_id) = cb31_fixture("sleep 2 && true");
+        let disp = {
+            let (e, id) = (Arc::clone(&engine), loop_id.clone());
+            tokio::spawn(async move { e.run_loop(id, None, None, None, None).await })
+        };
+
+        cb31_wait_for_running_run(&db, &loop_id).await;
+        assert!(engine.request_pause(&loop_id, false).unwrap());
+
+        assert_eq!(
+            db.get_loop(&loop_id).unwrap().unwrap().status,
+            LoopStatus::Pausing,
+            "an accepted wait-for-completion pause is visible as `pausing`, distinct from running/paused"
+        );
+        assert!(
+            !db.list_running_loop_runs(&loop_id).unwrap().is_empty(),
+            "the running node must not be terminated by a default pause"
+        );
+
+        disp.await.unwrap().unwrap();
+
+        assert_eq!(
+            db.get_loop(&loop_id).unwrap().unwrap().status,
+            LoopStatus::Paused,
+            "the loop reaches `paused` only after the node finished"
+        );
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            runs[0].status,
+            LoopRunStatus::Pass,
+            "the node ran to its own completion and is recorded Pass — not Fail, not Interrupted"
+        );
+    }
+
+    /// Req 3 + 4 + guideline 7: `interrupt: true` stops the node now and
+    /// records it as operator-interrupted, distinguishable in run history from
+    /// a node that failed on its own — and never carrying the engine's
+    /// out-of-band `terminated` marker.
+    #[tokio::test]
+    async fn explicit_interrupt_records_operator_interrupted_not_failure() {
+        let (_dir, db, engine, loop_id, spec_id) = cb31_fixture("sleep 30 && true");
+        let disp = {
+            let (e, id) = (Arc::clone(&engine), loop_id.clone());
+            tokio::spawn(async move { e.run_loop(id, None, None, None, None).await })
+        };
+
+        cb31_wait_for_running_run(&db, &loop_id).await;
+        assert!(engine.request_pause(&loop_id, true).unwrap());
+
+        disp.await.unwrap().unwrap();
+
+        assert_eq!(
+            db.get_loop(&loop_id).unwrap().unwrap().status,
+            LoopStatus::Paused
+        );
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, LoopRunStatus::Interrupted);
+        assert_ne!(
+            runs[0].status,
+            LoopRunStatus::Fail,
+            "an operator's decision to stop the node must not read as the node failing"
+        );
+        let output = runs[0].output.clone().unwrap();
+        assert_eq!(
+            output.get("interrupted").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert!(
+            output.get("terminated").is_none(),
+            "an operator interrupt is not the engine's out-of-band termination"
+        );
+    }
+
+    /// Req 5 + guideline 4 (waiting pause): a pause-and-continue cycle does not
+    /// advance the node's iteration counter — the node re-runs on continue at
+    /// the same iteration number it paused on.
+    #[tokio::test]
+    async fn waiting_pause_and_continue_consumes_no_iteration() {
+        let (_dir, db, engine, loop_id, spec_id) = cb31_fixture("sleep 2 && true");
+        let disp = {
+            let (e, id) = (Arc::clone(&engine), loop_id.clone());
+            tokio::spawn(async move { e.run_loop(id, None, None, None, None).await })
+        };
+
+        cb31_wait_for_running_run(&db, &loop_id).await;
+        assert!(engine.request_pause(&loop_id, false).unwrap());
+        disp.await.unwrap().unwrap();
+
+        let before = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].iteration, 1);
+
+        // Continue (the resume path behind loop_continue).
+        engine
+            .run_loop_dispatch(loop_id.clone(), None, None, true, None, None)
+            .await
+            .unwrap();
+
+        let after = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        assert_eq!(after.len(), 2, "the node re-ran once on continue");
+        assert!(
+            after.iter().all(|r| r.iteration == 1),
+            "pause-and-continue must not consume an iteration; saw {:?}",
+            after.iter().map(|r| r.iteration).collect::<Vec<_>>()
+        );
+    }
+
+    /// Req 5 + guideline 4 (explicit interrupt): an interrupt-and-continue
+    /// cycle likewise leaves the iteration counter untouched.
+    #[tokio::test]
+    async fn interrupt_and_continue_consumes_no_iteration() {
+        // First run blocks on `sleep` (no marker yet) so it can be interrupted;
+        // once the marker exists the continue re-run returns immediately.
+        let (dir, db, engine, loop_id, spec_id) = {
+            let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+            let marker = dir.path().join("go.marker");
+            db.insert_loop_node(&LoopNode {
+                id: "cb31-node".to_string(),
+                spec_id: Some(spec_id.clone()),
+                loop_id: None,
+                name: "work".to_string(),
+                kind: LoopNodeKind::Check,
+                config: serde_json::json!({
+                    "command": format!("test -f {} || sleep 30", marker.display()),
+                    "success_condition": "exit_code_0"
+                }),
+                position: 1,
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+            (dir, Arc::clone(&db), Arc::new(engine), loop_id, spec_id)
+        };
+        let disp = {
+            let (e, id) = (Arc::clone(&engine), loop_id.clone());
+            tokio::spawn(async move { e.run_loop(id, None, None, None, None).await })
+        };
+
+        cb31_wait_for_running_run(&db, &loop_id).await;
+        assert!(engine.request_pause(&loop_id, true).unwrap());
+        disp.await.unwrap().unwrap();
+
+        std::fs::write(dir.path().join("go.marker"), b"").unwrap();
+
+        engine
+            .run_loop_dispatch(loop_id.clone(), None, None, true, None, None)
+            .await
+            .unwrap();
+
+        let after = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        assert!(
+            after.iter().all(|r| r.iteration == 1),
+            "interrupt-and-continue must not consume an iteration; saw {:?}",
+            after.iter().map(|r| r.iteration).collect::<Vec<_>>()
+        );
+    }
+
+    /// Guideline 5: a node already on its last allowed iteration survives a
+    /// pause and continue and still gets that attempt — it is not pushed over
+    /// `DEFAULT_MAX_ITERATIONS_PER_NODE` by the operator's pause.
+    #[tokio::test]
+    async fn node_at_last_iteration_survives_pause_and_continue() {
+        let (_dir, db, engine, loop_id, spec_id) = cb31_fixture("sleep 2 && true");
+        db.update_loop_spec_status(
+            &spec_id,
+            LoopSpecStatus::Running,
+            Some(chrono::Utc::now()),
+            None,
+        )
+        .unwrap();
+        // Four genuine prior attempts: the node's next attempt is iteration 5,
+        // the last one DEFAULT_MAX_ITERATIONS_PER_NODE allows.
+        for i in 1..=4 {
+            db.insert_loop_run(&LoopNodeRun {
+                id: format!("cb31-seed-{i}"),
+                loop_id: loop_id.clone(),
+                spec_id: spec_id.clone(),
+                node_id: "cb31-node".to_string(),
+                status: LoopRunStatus::Fail,
+                input: None,
+                output: Some(serde_json::json!({ "seed": i })),
+                started_at: chrono::Utc::now() - chrono::Duration::seconds(20 - i as i64),
+                completed_at: Some(chrono::Utc::now() - chrono::Duration::seconds(19 - i as i64)),
+                iteration: i as i64,
+                pid: None,
+                boot_id: None,
+                session_id: None,
+            })
+            .unwrap();
+        }
+
+        let disp = {
+            let (e, id) = (Arc::clone(&engine), loop_id.clone());
+            tokio::spawn(async move { e.run_loop_dispatch(id, None, None, true, None, None).await })
+        };
+        cb31_wait_for_running_run(&db, &loop_id).await;
+        assert!(engine.request_pause(&loop_id, false).unwrap());
+        disp.await.unwrap().unwrap();
+
+        let paused_run = db
+            .list_loop_runs_for_spec(&spec_id)
+            .unwrap()
+            .into_iter()
+            .max_by_key(|r| r.started_at)
+            .unwrap();
+        assert_eq!(
+            paused_run.iteration, 5,
+            "the paused attempt was iteration 5"
+        );
+
+        // Continue: the node must get to run iteration 5 again, not be blocked
+        // by a spurious iteration 6.
+        engine
+            .run_loop_dispatch(loop_id.clone(), None, None, true, None, None)
+            .await
+            .unwrap();
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        assert!(
+            runs.iter().all(|r| r.iteration <= 5),
+            "continue must not push the node to iteration 6; saw {:?}",
+            runs.iter().map(|r| r.iteration).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            db.get_loop_spec(&spec_id).unwrap().unwrap().status,
+            LoopSpecStatus::Completed,
+            "the spec completes on the surviving last attempt, not blocked on an unearned ceiling"
+        );
+    }
+
+    /// Req 6: pausing a loop with nothing in flight is immediate.
+    #[tokio::test]
+    async fn pause_with_no_node_in_flight_is_immediate() {
+        let (_dir, db, engine, loop_id, _spec_id) = cb31_fixture("true");
+        db.claim_loop_for_run(&loop_id, chrono::Utc::now()).unwrap();
+        assert_eq!(
+            db.get_loop(&loop_id).unwrap().unwrap().status,
+            LoopStatus::Running
+        );
+
+        assert!(engine.request_pause(&loop_id, false).unwrap());
+
+        assert_eq!(
+            db.get_loop(&loop_id).unwrap().unwrap().status,
+            LoopStatus::Paused,
+            "with no node running there is nothing to wait for — the pause is immediate"
         );
     }
 

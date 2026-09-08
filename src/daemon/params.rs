@@ -1120,6 +1120,11 @@ pub struct LoopRunParams {
 pub struct LoopPauseParams {
     /// Loop ID.
     pub loop_id: String,
+    /// If true, immediately terminate the running node and mark it as
+    /// interrupted. If false (default), wait for the running node to
+    /// complete naturally before pausing.
+    #[serde(default)]
+    pub interrupt: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

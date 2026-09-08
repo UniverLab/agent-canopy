@@ -1544,7 +1544,9 @@ fn build_loop_update_response(loop_id: &str) -> CallToolResult {
 /// the sanctioned way out, mirroring [`Database::reset_loop`].
 fn loop_run_status_guard(loop_id: &str, status: LoopStatus) -> Result<(), String> {
     match status {
-        LoopStatus::Running => Err(format!("Loop '{loop_id}' is already running.")),
+        LoopStatus::Running | LoopStatus::Pausing => {
+            Err(format!("Loop '{loop_id}' is already running."))
+        }
         LoopStatus::Completed | LoopStatus::Failed => Err(
             "Completed or failed loops cannot be resumed directly; call loop_reset first, \
              then loop_run — or, for a failed loop, loop_schedule_autorun to have it \
@@ -7847,7 +7849,7 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "loop_pause",
-        description = "Pause a running loop after the current node finishes."
+        description = "Pause a running loop. By default, waits for the current node to finish before pausing. Set `interrupt: true` to immediately stop the running node (marked as interrupted, not failed)."
     )]
     async fn loop_pause(
         &self,
@@ -7862,15 +7864,23 @@ impl TaskTriggerHandler {
             Ok(id) => id,
             Err(e) => return Ok(e),
         };
+        let interrupt = params.interrupt.unwrap_or(false);
         let paused = self
             .loop_engine
-            .request_pause(&loop_id)
+            .request_pause(&loop_id, interrupt)
             .map_err(internal_error)?;
         if paused {
-            Ok(success_result(&format!(
-                "Loop '{}' marked to pause.",
-                loop_id
-            )))
+            if interrupt {
+                Ok(success_result(&format!(
+                    "Loop '{}' paused (running node interrupted).",
+                    loop_id
+                )))
+            } else {
+                Ok(success_result(&format!(
+                    "Loop '{}' will pause after the current node finishes.",
+                    loop_id
+                )))
+            }
         } else {
             Ok(error_result(&format!(
                 "Loop '{}' is not running or does not exist.",
@@ -21343,6 +21353,7 @@ mod endpoint_tests {
         let result = handler
             .loop_pause(Parameters(LoopPauseParams {
                 loop_id: lp.id.clone(),
+                interrupt: None,
             }))
             .await
             .unwrap();

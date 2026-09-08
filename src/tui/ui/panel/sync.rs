@@ -307,6 +307,7 @@ fn loop_status_color(status: crate::domain::loops::LoopStatus) -> Color {
     match status {
         crate::domain::loops::LoopStatus::Running => STATUS_OK,
         crate::domain::loops::LoopStatus::Failed => ERROR_COLOR,
+        crate::domain::loops::LoopStatus::Pausing => Color::Yellow,
         crate::domain::loops::LoopStatus::Paused => Color::Yellow,
         _ => Color::White,
     }

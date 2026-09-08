@@ -14,6 +14,8 @@ pub use crate::domain::specs::validate_spec_description_template;
 pub enum LoopStatus {
     Draft,
     Running,
+    /// Pause requested, waiting for the current node to finish naturally.
+    Pausing,
     Paused,
     Completed,
     Failed,
@@ -24,6 +26,7 @@ impl LoopStatus {
         match self {
             Self::Draft => "draft",
             Self::Running => "running",
+            Self::Pausing => "pausing",
             Self::Paused => "paused",
             Self::Completed => "completed",
             Self::Failed => "failed",
@@ -33,6 +36,7 @@ impl LoopStatus {
     pub fn from_str(value: &str) -> Self {
         match value {
             "running" => Self::Running,
+            "pausing" => Self::Pausing,
             "paused" => Self::Paused,
             "completed" => Self::Completed,
             "failed" => Self::Failed,
@@ -393,6 +397,9 @@ pub enum LoopRunStatus {
     Running,
     Pass,
     Fail,
+    /// Operator-interrupted: the node was explicitly stopped by an operator
+    /// via `loop_pause(interrupt: true)`, not a failure of the node's work.
+    Interrupted,
 }
 
 impl LoopRunStatus {
@@ -401,6 +408,7 @@ impl LoopRunStatus {
             Self::Running => "running",
             Self::Pass => "pass",
             Self::Fail => "fail",
+            Self::Interrupted => "interrupted",
         }
     }
 
@@ -408,6 +416,7 @@ impl LoopRunStatus {
         match value {
             "pass" => Self::Pass,
             "fail" => Self::Fail,
+            "interrupted" => Self::Interrupted,
             _ => Self::Running,
         }
     }
@@ -644,7 +653,10 @@ impl Loop {
     /// graph. Draft/Completed/Failed loops are fireable (a scheduled loop
     /// re-runs its graph on each cron slot / watch event).
     pub fn is_fireable(&self) -> bool {
-        !matches!(self.status, LoopStatus::Running | LoopStatus::Paused)
+        !matches!(
+            self.status,
+            LoopStatus::Running | LoopStatus::Pausing | LoopStatus::Paused
+        )
     }
 
     /// Whether this loop's one-shot `autorun_at` schedule is due at `now`.
@@ -1038,6 +1050,7 @@ mod tests {
     fn loop_status_as_str_roundtrip() {
         assert_eq!(LoopStatus::Draft.as_str(), "draft");
         assert_eq!(LoopStatus::Running.as_str(), "running");
+        assert_eq!(LoopStatus::Pausing.as_str(), "pausing");
         assert_eq!(LoopStatus::Paused.as_str(), "paused");
         assert_eq!(LoopStatus::Completed.as_str(), "completed");
         assert_eq!(LoopStatus::Failed.as_str(), "failed");
@@ -1046,6 +1059,7 @@ mod tests {
     #[test]
     fn loop_status_from_str() {
         assert_eq!(LoopStatus::from_str("running"), LoopStatus::Running);
+        assert_eq!(LoopStatus::from_str("pausing"), LoopStatus::Pausing);
         assert_eq!(LoopStatus::from_str("paused"), LoopStatus::Paused);
         assert_eq!(LoopStatus::from_str("completed"), LoopStatus::Completed);
         assert_eq!(LoopStatus::from_str("failed"), LoopStatus::Failed);
@@ -1162,12 +1176,17 @@ mod tests {
         assert_eq!(LoopRunStatus::Running.as_str(), "running");
         assert_eq!(LoopRunStatus::Pass.as_str(), "pass");
         assert_eq!(LoopRunStatus::Fail.as_str(), "fail");
+        assert_eq!(LoopRunStatus::Interrupted.as_str(), "interrupted");
     }
 
     #[test]
     fn loop_run_status_from_str() {
         assert_eq!(LoopRunStatus::from_str("pass"), LoopRunStatus::Pass);
         assert_eq!(LoopRunStatus::from_str("fail"), LoopRunStatus::Fail);
+        assert_eq!(
+            LoopRunStatus::from_str("interrupted"),
+            LoopRunStatus::Interrupted
+        );
         assert_eq!(LoopRunStatus::from_str("invalid"), LoopRunStatus::Running);
     }
 
@@ -1854,6 +1873,7 @@ mod tests {
         let expected_fireable = [
             (LoopStatus::Draft, true),
             (LoopStatus::Running, false),
+            (LoopStatus::Pausing, false),
             (LoopStatus::Paused, false),
             (LoopStatus::Completed, true),
             (LoopStatus::Failed, true),

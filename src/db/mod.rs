@@ -473,7 +473,8 @@ impl Database {
                 iteration INTEGER NOT NULL DEFAULT 1,
                 pid INTEGER,
                 boot_id TEXT,
-                session_id TEXT
+                session_id TEXT,
+                paused_through INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE INDEX IF NOT EXISTS idx_loop_runs_spec_started
@@ -1425,6 +1426,27 @@ impl Database {
                 conn.execute(&sql, [])
                     .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
             }
+        }
+
+        // CB31: a node run finalized with its own verdict while a
+        // wait-for-completion `loop_pause` was pending is flagged here so
+        // `loop_continue` re-executing that node does not spend one of its
+        // `DEFAULT_MAX_ITERATIONS_PER_NODE` — an operator pause is not a node
+        // attempt. Additive and idempotent; NOT NULL DEFAULT 0 backfills
+        // every existing row as "not paused through".
+        let has_paused_through: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loop_runs') WHERE name = 'paused_through'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_paused_through {
+            conn.execute(
+                "ALTER TABLE loop_runs ADD COLUMN paused_through INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
         }
 
         // Event-keyed hooks (CH1): the loop's hooks stored as a JSON map
