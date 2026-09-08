@@ -1040,6 +1040,7 @@ mod tests {
             effort: None,
             prompt: Some("done".to_string()),
             command: None,
+            target_session_id: None,
             timeout_minutes: None,
         };
         let details = LoopDetails {
@@ -1069,6 +1070,7 @@ mod tests {
                 effort: None,
                 prompt: Some("done".to_string()),
                 command: None,
+                target_session_id: None,
                 timeout_minutes: None,
             }],
         );
@@ -1080,6 +1082,7 @@ mod tests {
                 effort: None,
                 prompt: Some("failed {{blocker}}".to_string()),
                 command: None,
+                target_session_id: None,
                 timeout_minutes: None,
             }],
         );
@@ -1091,6 +1094,7 @@ mod tests {
                 effort: None,
                 prompt: Some("spec {{spec_name}}".to_string()),
                 command: None,
+                target_session_id: None,
                 timeout_minutes: None,
             }],
         );

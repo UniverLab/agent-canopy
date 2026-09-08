@@ -470,8 +470,11 @@ pub struct Loop {
     pub active_run_queue_id: Option<String>,
     /// Event-keyed hooks: an ordered map from event name to the list of
     /// hooks registered for that event. Each hook is an agent-node-style
-    /// config (platform/model/effort/prompt/timeout_minutes). An empty map
-    /// preserves pre-N2 behavior exactly (no hooks fire). See
+    /// config (platform/model/effort/prompt/timeout_minutes), a shell
+    /// command, or an interactive message (prompt/target_session_id) that is
+    /// delivered asynchronously — due immediately, never waiting for a
+    /// reply. An empty map preserves pre-N2 behavior exactly (no hooks
+    /// fire). See
     /// [`crate::loop_engine::LoopEngine`]'s `run_loop_dispatch` for where
     /// events fire and `render_hook_prompt` for placeholders.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -502,19 +505,26 @@ pub struct Loop {
     pub infra_node_id: Option<String>,
 }
 
-/// Config for a loop completion hook — either an agent payload
-/// (`platform`/`model`/`prompt`) or a direct shell command (`command`).
+/// Config for a loop completion hook — an agent payload
+/// (`platform`/`model`/`prompt`), a direct shell command (`command`), or an
+/// interactive message into a live session (`prompt` + `target_session_id`).
 /// Exactly one mode must be configured; the engine validates this at
 /// creation time.
+///
+/// An interactive hook is fire-and-forget: firing it enqueues one due-now
+/// row in `scheduled_sends` for the exact configured session id, delivered
+/// asynchronously by the TUI (which stays queued, not lost, while no TUI is
+/// running). It never reads or waits for a reply.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopCompletionHook {
     /// CLI platform for agent hooks (e.g. "mimo", "claude"). `None` for
-    /// command hooks.
+    /// command and interactive hooks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
-    /// Hook prompt template (agent hooks only). `None` for command hooks.
+    /// Hook prompt template (agent and interactive hooks). `None` for
+    /// command hooks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
     /// Shell command to run directly (command hooks only). Supports the same
@@ -524,6 +534,13 @@ pub struct LoopCompletionHook {
     /// loop runs including the run that spawned the hook.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    /// Exact interactive session id an interactive hook delivers to
+    /// (interactive hooks only). `None` for agent and command hooks. A
+    /// session id is not stable over time: it will eventually point at a
+    /// session that no longer exists, and firing then fails loudly naming
+    /// the id rather than redirecting anywhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_session_id: Option<String>,
     pub timeout_minutes: Option<u64>,
 }
 
@@ -537,6 +554,18 @@ impl LoopCompletionHook {
     #[allow(dead_code)]
     pub fn is_agent(&self) -> bool {
         self.platform.is_some()
+    }
+
+    /// Whether this is an interactive hook (enqueues a scheduled send to a
+    /// live session). Selected when `target_session_id` and `prompt` are
+    /// present while `platform` and `command` are absent.
+    pub fn is_interactive(&self) -> bool {
+        self.target_session_id
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+            && self.prompt.as_deref().is_some_and(|s| !s.trim().is_empty())
+            && self.platform.as_deref().is_none_or(|s| s.trim().is_empty())
+            && self.command.as_deref().is_none_or(|s| s.trim().is_empty())
     }
 }
 

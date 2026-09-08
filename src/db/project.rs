@@ -1314,6 +1314,7 @@ mod tests {
             Some(workdir),
             chrono::Utc::now(),
             None,
+            None,
         )
         .unwrap();
         db.insert_failed_scheduled_send(
@@ -1322,6 +1323,7 @@ mod tests {
             "sess-1",
             Some(workdir),
             chrono::Utc::now(),
+            None,
         )
         .unwrap();
         db.upsert_agent(&crate::domain::models::Agent {

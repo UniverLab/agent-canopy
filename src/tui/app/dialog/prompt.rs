@@ -2374,6 +2374,25 @@ mod tests {
     }
 
     #[test]
+    fn for_instruction_prompt_restores_into_a_normal_tab_dialog() {
+        let prompt = "Loop nightly failed: build broke";
+        let state = PersistedBuilderState::for_instruction_prompt(prompt);
+        let json = serde_json::to_string(&state).expect("serialize");
+        let restored: PersistedBuilderState = serde_json::from_str(&json).expect("deserialize");
+
+        let mut target = SimplePromptDialog::new();
+        restored.restore_into(&mut target);
+
+        assert_eq!(target.get_section_content("instruction_1"), prompt);
+        assert_eq!(target.enabled_sections, vec!["instruction_1".to_string()]);
+        // Normal-tab structure: no schedule re-armed, empty collapse/lock maps.
+        assert!(target.send_at.is_none());
+        assert!(target.collapsed_pastes.is_empty());
+        assert!(target.locked_sections.is_empty());
+        assert_eq!(target.active_tab, PromptTab::Normal);
+    }
+
+    #[test]
     fn add_section_focuses_the_new_section_with_cursor_at_start() {
         let mut dialog = SimplePromptDialog::new();
         dialog.add_section("goal");
@@ -4511,6 +4530,35 @@ pub struct PersistedBuilderState {
 }
 
 impl PersistedBuilderState {
+    /// Canonical minimal structured state for a single instruction prompt —
+    /// the same shape [`SimplePromptDialog::new`] produces, with
+    /// `instruction_1` holding `prompt`. Used by loop interactive hooks so a
+    /// hook-enqueued scheduled send carries the structured representation an
+    /// equivalent promptbuilder message would have, rather than an ad-hoc
+    /// JSON blob the builder cannot restore. The raw prompt itself is
+    /// unchanged; this is only the reopen/edit representation.
+    pub fn for_instruction_prompt(prompt: &str) -> Self {
+        let mut sections = HashMap::new();
+        sections.insert("instruction_1".to_string(), prompt.to_string());
+        let mut section_counters = HashMap::new();
+        section_counters.insert("instruction".to_string(), 2usize);
+        section_counters.insert("context".to_string(), 2usize);
+        let mut section_cursors = HashMap::new();
+        section_cursors.insert("instruction_1".to_string(), 0usize);
+        let mut section_scrolls = HashMap::new();
+        section_scrolls.insert("instruction_1".to_string(), 0usize);
+        Self {
+            sections,
+            enabled_sections: vec!["instruction_1".to_string()],
+            focused_section: 1,
+            section_counters,
+            section_cursors,
+            section_scrolls,
+            collapsed_pastes: HashMap::new(),
+            locked_sections: HashSet::new(),
+        }
+    }
+
     pub fn from_dialog(dialog: &SimplePromptDialog) -> Self {
         Self {
             sections: dialog.sections.clone(),

@@ -246,9 +246,18 @@ they run independently with no coordination required from you.
 A loop carries hooks keyed by event, over four events: `on_completed`,
 `on_failed`, `on_blocked`, `on_spec_completed`. More than one hook may be
 registered for a single event, via `loop_update`'s `hooks` map (each key is
-an event name, each value is an ordered array of agent-shaped configs with
-`platform`, `model`, `prompt`, `timeout_minutes`). Hooks registered for one
-event run in declaration order.
+an event name, each value is an ordered array of hook configs). Hooks
+registered for one event run in declaration order. There are three hook
+modes — exactly one per hook:
+
+- **Agent** (`platform` + `prompt`, optional `model`/`effort`/
+  `timeout_minutes`): launches a CLI process with the rendered prompt.
+- **Command** (`command`): runs a shell command directly with the same
+  `{{...}}` placeholders substituted before execution.
+- **Interactive** (`prompt` + `target_session_id`): enqueues a message into
+  a live interactive session, exactly as if sent from the promptbuilder,
+  marked as hook-originated. Fire-and-forget: the hook never reads or waits
+  for a reply.
 
 - `on_completed` fires exactly once when a run transitions to `completed`
   (only when the dispatch completed at least one spec). A completed →
@@ -285,6 +294,18 @@ call passing today's `on_completed` shape still registers that hook.
 The first intended use is a documentation-maintenance agent: on
 completion, review the specs this run closed, the resulting code, and
 `docs/`/`README`, then update the docs to match what actually shipped.
+
+An interactive hook targets the exact session id in its own config, and
+supports the same event placeholders as the other modes, rendered before
+enqueueing. The message carries its provenance — loop id and event — as
+structure alongside the prompt, so the recipient can tell it came from a
+hook without that origin being buried in the prompt text. A session id is
+not stable over time: a hook configured with one will eventually point at
+a session that no longer exists, and firing then fails loudly naming the
+id rather than redirecting the message anywhere else.
+
+A message enqueued while no TUI is running is queued, not lost: it stays
+pending and is delivered when a TUI later starts.
 
 ## Standalone spec backlog
 

@@ -205,8 +205,9 @@ pub(crate) fn build_loop_trigger(
 }
 
 /// Build a validated [`crate::domain::loops::LoopCompletionHook`] from MCP
-/// params — either an agent payload (platform + prompt) or a command.
-/// Exactly one mode must be configured; both or neither is rejected.
+/// params — an agent payload (platform + prompt), a command, or an
+/// interactive message (prompt + target_session_id). Exactly one mode must
+/// be configured; any other combination is rejected.
 fn build_loop_completion_hook(
     params: &LoopCompletionHookParams,
 ) -> Result<crate::domain::loops::LoopCompletionHook, String> {
@@ -218,6 +219,51 @@ fn build_loop_completion_hook(
         .command
         .as_deref()
         .is_some_and(|s| !s.trim().is_empty());
+    let has_target = params
+        .target_session_id
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty());
+    let has_model = params
+        .model
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty());
+    let has_effort = params
+        .effort
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty());
+    let has_prompt = params
+        .prompt
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty());
+
+    if has_target {
+        if has_platform || has_command || has_model || has_effort {
+            return Err(
+                "Interactive hook ('target_session_id' + 'prompt') must not \
+                 set 'platform', 'model', 'effort', or 'command'. Configure exactly one hook mode."
+                    .to_string(),
+            );
+        }
+        if !has_prompt {
+            return Err("Interactive hook 'prompt' must not be empty.".to_string());
+        }
+        let target_session_id = params
+            .target_session_id
+            .as_deref()
+            .unwrap()
+            .trim()
+            .to_string();
+        let prompt = params.prompt.as_deref().unwrap().trim().to_string();
+        return Ok(crate::domain::loops::LoopCompletionHook {
+            platform: None,
+            model: None,
+            effort: None,
+            prompt: Some(prompt),
+            command: None,
+            target_session_id: Some(target_session_id),
+            timeout_minutes: params.timeout_minutes,
+        });
+    }
 
     if has_platform && has_command {
         return Err("Hook cannot have both a 'command' and an agent payload \
@@ -225,8 +271,9 @@ fn build_loop_completion_hook(
             .to_string());
     }
     if !has_platform && !has_command {
-        return Err("Hook must have either a 'command' or an agent payload \
-             ('platform' + 'prompt'). Configure exactly one."
+        return Err("Hook must have either a 'command', an agent payload \
+             ('platform' + 'prompt'), or an interactive payload \
+             ('target_session_id' + 'prompt'). Configure exactly one."
             .to_string());
     }
 
@@ -258,6 +305,7 @@ fn build_loop_completion_hook(
             effort,
             prompt: Some(prompt),
             command: None,
+            target_session_id: None,
             timeout_minutes: params.timeout_minutes,
         });
     }
@@ -270,6 +318,7 @@ fn build_loop_completion_hook(
         effort: None,
         prompt: None,
         command: Some(command),
+        target_session_id: None,
         timeout_minutes: params.timeout_minutes,
     })
 }
@@ -8926,6 +8975,7 @@ fn loop_completion_hook_json(hook: &crate::domain::loops::LoopCompletionHook) ->
         "effort": hook.effort,
         "prompt": hook.prompt,
         "command": hook.command,
+        "target_session_id": hook.target_session_id,
         "timeout_minutes": hook.timeout_minutes,
     })
 }
@@ -12500,6 +12550,7 @@ mod tests {
             effort: None,
             prompt: Some("run tests".to_string()),
             command: None,
+            target_session_id: None,
             timeout_minutes: None,
         };
         let err = build_loop_completion_hook(&params).unwrap_err();
@@ -12514,6 +12565,7 @@ mod tests {
             effort: None,
             prompt: Some("run tests".to_string()),
             command: None,
+            target_session_id: None,
             timeout_minutes: None,
         };
         let err = build_loop_completion_hook(&params).unwrap_err();
@@ -12528,6 +12580,7 @@ mod tests {
             effort: None,
             prompt: Some("".to_string()),
             command: None,
+            target_session_id: None,
             timeout_minutes: None,
         };
         let err = build_loop_completion_hook(&params).unwrap_err();
@@ -12542,6 +12595,7 @@ mod tests {
             effort: None,
             prompt: Some("  \t  ".to_string()),
             command: None,
+            target_session_id: None,
             timeout_minutes: None,
         };
         let err = build_loop_completion_hook(&params).unwrap_err();
@@ -12556,6 +12610,7 @@ mod tests {
             effort: None,
             prompt: Some("{{loop_name}} completed".to_string()),
             command: None,
+            target_session_id: None,
             timeout_minutes: Some(10),
         };
         let hook = build_loop_completion_hook(&params).unwrap();
@@ -12573,6 +12628,7 @@ mod tests {
             effort: None,
             prompt: Some("  test  ".to_string()),
             command: None,
+            target_session_id: None,
             timeout_minutes: None,
         };
         let hook = build_loop_completion_hook(&params).unwrap();
@@ -12589,6 +12645,7 @@ mod tests {
             effort: None,
             prompt: Some("test".to_string()),
             command: None,
+            target_session_id: None,
             timeout_minutes: None,
         };
         let hook = build_loop_completion_hook(&params).unwrap();
@@ -12605,6 +12662,7 @@ mod tests {
             effort: None,
             prompt: Some("test".to_string()),
             command: Some("echo hi".to_string()),
+            target_session_id: None,
             timeout_minutes: None,
         };
         let err = build_loop_completion_hook(&params).unwrap_err();
@@ -12620,6 +12678,7 @@ mod tests {
             effort: None,
             prompt: None,
             command: None,
+            target_session_id: None,
             timeout_minutes: None,
         };
         let err = build_loop_completion_hook(&params).unwrap_err();
@@ -12634,6 +12693,7 @@ mod tests {
             effort: None,
             prompt: None,
             command: Some("echo hello".to_string()),
+            target_session_id: None,
             timeout_minutes: Some(5),
         };
         let hook = build_loop_completion_hook(&params).unwrap();
@@ -12651,10 +12711,94 @@ mod tests {
             effort: None,
             prompt: None,
             command: Some("  echo hello  ".to_string()),
+            target_session_id: None,
             timeout_minutes: None,
         };
         let hook = build_loop_completion_hook(&params).unwrap();
         assert_eq!(hook.command.as_deref(), Some("echo hello"));
+    }
+
+    #[test]
+    fn build_loop_completion_hook_accepts_interactive_config() {
+        let params = LoopCompletionHookParams {
+            platform: None,
+            model: None,
+            effort: None,
+            prompt: Some("  Loop {{loop_name}} failed  ".to_string()),
+            command: None,
+            target_session_id: Some("  session-7  ".to_string()),
+            timeout_minutes: None,
+        };
+        let hook = build_loop_completion_hook(&params).unwrap();
+        assert!(hook.is_interactive());
+        assert!(!hook.is_command());
+        assert!(!hook.is_agent());
+        assert_eq!(hook.target_session_id.as_deref(), Some("session-7"));
+        assert_eq!(hook.prompt.as_deref(), Some("Loop {{loop_name}} failed"));
+    }
+
+    #[test]
+    fn build_loop_completion_hook_rejects_mixed_interactive_modes() {
+        // target plus platform is rejected.
+        let params = LoopCompletionHookParams {
+            platform: Some("claude".to_string()),
+            model: None,
+            effort: None,
+            prompt: Some("hi".to_string()),
+            command: None,
+            target_session_id: Some("session-1".to_string()),
+            timeout_minutes: None,
+        };
+        assert!(build_loop_completion_hook(&params).is_err());
+
+        // target plus command is rejected.
+        let params = LoopCompletionHookParams {
+            platform: None,
+            model: None,
+            effort: None,
+            prompt: Some("hi".to_string()),
+            command: Some("echo hi".to_string()),
+            target_session_id: Some("session-1".to_string()),
+            timeout_minutes: None,
+        };
+        assert!(build_loop_completion_hook(&params).is_err());
+
+        // target plus model is rejected.
+        let params = LoopCompletionHookParams {
+            platform: None,
+            model: Some("opus".to_string()),
+            effort: None,
+            prompt: Some("hi".to_string()),
+            command: None,
+            target_session_id: Some("session-1".to_string()),
+            timeout_minutes: None,
+        };
+        assert!(build_loop_completion_hook(&params).is_err());
+
+        // target plus effort is rejected.
+        let params = LoopCompletionHookParams {
+            platform: None,
+            model: None,
+            effort: Some("high".to_string()),
+            prompt: Some("hi".to_string()),
+            command: None,
+            target_session_id: Some("session-1".to_string()),
+            timeout_minutes: None,
+        };
+        assert!(build_loop_completion_hook(&params).is_err());
+
+        // target without a prompt is rejected.
+        let params = LoopCompletionHookParams {
+            platform: None,
+            model: None,
+            effort: None,
+            prompt: None,
+            command: None,
+            target_session_id: Some("session-1".to_string()),
+            timeout_minutes: None,
+        };
+        let err = build_loop_completion_hook(&params).unwrap_err();
+        assert!(err.contains("prompt"), "{err}");
     }
 
     #[test]
@@ -13994,6 +14138,7 @@ mod additional_tests {
             effort: None,
             prompt: Some("test".to_string()),
             command: None,
+            target_session_id: None,
             timeout_minutes: None,
         };
         let hook = build_loop_completion_hook(&params).unwrap();
@@ -14008,6 +14153,7 @@ mod additional_tests {
             effort: None,
             prompt: Some("do stuff".to_string()),
             command: None,
+            target_session_id: None,
             timeout_minutes: Some(45),
         };
         let hook = build_loop_completion_hook(&params).unwrap();
@@ -15473,6 +15619,7 @@ mod coverage_tests {
             effort: None,
             prompt: Some("{{loop_name}} done".into()),
             command: None,
+            target_session_id: None,
             timeout_minutes: Some(10),
         };
         let json = super::loop_completion_hook_json(&hook);
@@ -15489,6 +15636,7 @@ mod coverage_tests {
             effort: None,
             prompt: Some("t".into()),
             command: None,
+            target_session_id: None,
             timeout_minutes: None,
         };
         let json = super::loop_completion_hook_json(&hook);

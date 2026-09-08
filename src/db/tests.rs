@@ -295,7 +295,7 @@ fn scheduled_sends_for_closed_session_are_dropped_on_missing_target_restore() {
         None,
     )
     .unwrap();
-    db.insert_scheduled_send("ss-x", "ping", "sess-x", None, Utc::now(), None)
+    db.insert_scheduled_send("ss-x", "ping", "sess-x", None, Utc::now(), None, None)
         .unwrap();
     assert_eq!(
         db.list_pending_scheduled_sends_for_session("sess-x")
@@ -6350,6 +6350,7 @@ mod hooks_tests {
             effort: None,
             prompt: Some(prompt.to_string()),
             command: None,
+            target_session_id: None,
             timeout_minutes: Some(5),
         }
     }

@@ -1410,6 +1410,7 @@ fn schedule_send_prompt(app: &mut App, prompt: &str, when: chrono::NaiveDateTime
         workdir_opt,
         fire_time,
         builder_state_json.as_deref(),
+        None,
     ) {
         tracing::error!("Failed to persist scheduled send: {e}");
         crate::domain::notification::send_notification(

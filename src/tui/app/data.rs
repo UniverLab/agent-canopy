@@ -247,6 +247,22 @@ impl App {
                         send.id,
                         send.target_session_id
                     );
+                    // A hook-originated message stays identifiable as such:
+                    // the delivered prompt is exactly the promptbuilder text,
+                    // and the loop/event that sent it is surfaced here rather
+                    // than being buried in that text.
+                    if let Some(provenance) = send.provenance.as_ref() {
+                        if provenance.kind == "hook" {
+                            crate::domain::notification::send_notification(
+                                "Hook message delivered",
+                                &format!(
+                                    "Loop '{}' sent a message to this session (event '{}').",
+                                    provenance.loop_id, provenance.event
+                                ),
+                                crate::domain::notification::NotificationLevel::Info,
+                            );
+                        }
+                    }
                 }
             } else {
                 // Target session doesn't exist — notify and preserve the prompt
@@ -263,6 +279,7 @@ impl App {
                     &send.target_session_id,
                     send.workdir.as_deref(),
                     now,
+                    send.provenance.as_ref(),
                 ) {
                     tracing::warn!(
                         "Failed to preserve failed scheduled send '{}': {e}",
@@ -343,6 +360,7 @@ mod tests {
                 Some(workdir),
                 fire_at,
                 None,
+                None,
             )
             .expect("insert scheduled send");
 
@@ -387,7 +405,15 @@ mod tests {
         assert!(!app.scheduled_sends_restored);
         let fire_at = chrono::Utc::now() - chrono::Duration::minutes(5);
         app.db
-            .insert_scheduled_send("ss-held", "later", "resuming-session", None, fire_at, None)
+            .insert_scheduled_send(
+                "ss-held",
+                "later",
+                "resuming-session",
+                None,
+                fire_at,
+                None,
+                None,
+            )
             .expect("insert scheduled send");
 
         app.deliver_due_scheduled_sends();
@@ -407,6 +433,39 @@ mod tests {
             .is_empty());
     }
 
+    /// A due hook send is held like any other send before the startup
+    /// restore runs: with no TUI agent present it stays pending (not
+    /// delivered, not failed), keeping its provenance for the delivery that
+    /// happens once a TUI comes up.
+    #[test]
+    fn hook_send_is_held_pending_without_tui() {
+        let (mut app, _dir) = test_app();
+        assert!(!app.scheduled_sends_restored);
+        let fire_at = chrono::Utc::now() - chrono::Duration::minutes(5);
+        let provenance =
+            crate::db::scheduled_sends::ScheduledSendProvenance::hook("loop-hook", "on_failed");
+        app.db
+            .insert_scheduled_send(
+                "ss-hook-held",
+                "Loop Loop failed",
+                "operator-session",
+                None,
+                fire_at,
+                None,
+                Some(&provenance),
+            )
+            .expect("insert scheduled send");
+
+        app.deliver_due_scheduled_sends();
+
+        let due = app
+            .db
+            .list_due_scheduled_sends(chrono::Utc::now())
+            .expect("list due");
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].provenance, Some(provenance));
+    }
+
     /// On startup, a pending schedule whose target session was not resumed
     /// (it no longer exists) is dropped silently — no failed record, no
     /// last-prompt recall — and the delivery gate opens.
@@ -422,6 +481,7 @@ mod tests {
                 "gone-session",
                 Some(workdir),
                 fire_at,
+                None,
                 None,
             )
             .expect("insert scheduled send");

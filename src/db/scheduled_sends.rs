@@ -1,8 +1,47 @@
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::params;
+use serde::{Deserialize, Serialize};
 
 use crate::db::Database;
+
+/// Structured origin of a scheduled send, stored as JSON in the nullable
+/// `provenance` column. Only hook provenance (`kind = "hook"`) is produced
+/// today — prompt-builder sends store `None`. Kept out of `prompt` so the
+/// delivered text stays exactly what the promptbuilder would submit while
+/// the recipient can still tell which loop and event sent it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduledSendProvenance {
+    /// Provenance kind. Only `"hook"` is produced by this feature.
+    pub kind: String,
+    /// Id of the loop whose hook enqueued the send.
+    pub loop_id: String,
+    /// Hook event that produced it (e.g. `"on_failed"`).
+    pub event: String,
+}
+
+impl ScheduledSendProvenance {
+    /// Provenance for a message enqueued by a loop hook.
+    pub fn hook(loop_id: &str, event: &str) -> Self {
+        Self {
+            kind: "hook".to_string(),
+            loop_id: loop_id.to_string(),
+            event: event.to_string(),
+        }
+    }
+
+    fn from_json(raw: Option<String>) -> Result<Option<Self>> {
+        raw.map(|json| serde_json::from_str(&json).map_err(|e| anyhow!("{e}")))
+            .transpose()
+    }
+
+    fn to_json(value: Option<&Self>) -> Result<Option<String>> {
+        value
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| anyhow!("{e}"))
+    }
+}
 
 /// A one-shot scheduled prompt delivery.
 #[derive(Debug, Clone)]
@@ -18,6 +57,9 @@ pub struct ScheduledSend {
     pub fire_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub builder_state: Option<String>,
+    /// Structured hook origin, if enqueued by a loop hook. `None` for
+    /// prompt-builder sends and rows written before the column existed.
+    pub provenance: Option<ScheduledSendProvenance>,
 }
 
 /// A prompt whose scheduled delivery failed because its target session was
@@ -31,6 +73,9 @@ pub struct FailedScheduledSend {
     pub target_session_id: String,
     pub workdir: Option<String>,
     pub failed_at: DateTime<Utc>,
+    /// Hook origin retained through the dead-target path so a failed
+    /// hook send still names its loop and event.
+    pub provenance: Option<ScheduledSendProvenance>,
 }
 
 /// Whether `target_session_id` is among the currently live session ids.
@@ -42,6 +87,7 @@ pub fn is_target_alive(target_session_id: &str, live_session_ids: &[String]) -> 
 
 impl Database {
     /// Insert a new scheduled send.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_scheduled_send(
         &self,
         id: &str,
@@ -50,16 +96,18 @@ impl Database {
         workdir: Option<&str>,
         fire_at: DateTime<Utc>,
         builder_state: Option<&str>,
+        provenance: Option<&ScheduledSendProvenance>,
     ) -> Result<()> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let now = Utc::now().timestamp();
+        let provenance_json = ScheduledSendProvenance::to_json(provenance)?;
         conn.execute(
-            "INSERT INTO scheduled_sends (id, prompt, target_session_id, workdir, fire_at, created_at, builder_state)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![id, prompt, target_session_id, workdir, fire_at.timestamp(), now, builder_state],
+            "INSERT INTO scheduled_sends (id, prompt, target_session_id, workdir, fire_at, created_at, builder_state, provenance)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![id, prompt, target_session_id, workdir, fire_at.timestamp(), now, builder_state, provenance_json],
         )?;
         Ok(())
     }
@@ -71,7 +119,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, prompt, target_session_id, workdir, fire_at, created_at, builder_state
+            "SELECT id, prompt, target_session_id, workdir, fire_at, created_at, builder_state, provenance
              FROM scheduled_sends
              WHERE fire_at <= ?1
              ORDER BY fire_at ASC",
@@ -102,7 +150,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, prompt, target_session_id, workdir, fire_at, created_at, builder_state
+            "SELECT id, prompt, target_session_id, workdir, fire_at, created_at, builder_state, provenance
              FROM scheduled_sends
              WHERE target_session_id = ?1
              ORDER BY fire_at ASC",
@@ -152,6 +200,17 @@ impl Database {
     }
 
     fn row_to_scheduled_send(row: &rusqlite::Row) -> rusqlite::Result<ScheduledSend> {
+        let provenance_json: Option<String> = row.get(7)?;
+        let provenance = ScheduledSendProvenance::from_json(provenance_json).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                7,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e.to_string(),
+                )),
+            )
+        })?;
         Ok(ScheduledSend {
             id: row.get(0)?,
             prompt: row.get(1)?,
@@ -162,6 +221,7 @@ impl Database {
             created_at: DateTime::from_timestamp(row.get(5)?, 0)
                 .ok_or_else(|| rusqlite::Error::InvalidParameterName("created_at".into()))?,
             builder_state: row.get(6)?,
+            provenance,
         })
     }
 
@@ -175,20 +235,23 @@ impl Database {
         target_session_id: &str,
         workdir: Option<&str>,
         failed_at: DateTime<Utc>,
+        provenance: Option<&ScheduledSendProvenance>,
     ) -> Result<()> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let provenance_json = ScheduledSendProvenance::to_json(provenance)?;
         conn.execute(
-            "INSERT INTO failed_scheduled_sends (id, prompt, target_session_id, workdir, failed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO failed_scheduled_sends (id, prompt, target_session_id, workdir, failed_at, provenance)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 id,
                 prompt,
                 target_session_id,
                 workdir,
-                failed_at.timestamp()
+                failed_at.timestamp(),
+                provenance_json,
             ],
         )?;
         Ok(())
@@ -209,12 +272,23 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, prompt, target_session_id, workdir, failed_at
+            "SELECT id, prompt, target_session_id, workdir, failed_at, provenance
              FROM failed_scheduled_sends
              WHERE workdir = ?1
              ORDER BY failed_at DESC",
         )?;
         let rows = stmt.query_map(params![workdir], |row| {
+            let provenance_json: Option<String> = row.get(5)?;
+            let provenance = ScheduledSendProvenance::from_json(provenance_json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        e.to_string(),
+                    )),
+                )
+            })?;
             Ok(FailedScheduledSend {
                 id: row.get(0)?,
                 prompt: row.get(1)?,
@@ -222,6 +296,7 @@ impl Database {
                 workdir: row.get(3)?,
                 failed_at: DateTime::from_timestamp(row.get(4)?, 0)
                     .ok_or_else(|| rusqlite::Error::InvalidParameterName("failed_at".into()))?,
+                provenance,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -251,6 +326,7 @@ mod tests {
             Some("/proj"),
             fire,
             None,
+            None,
         )
         .unwrap();
 
@@ -266,7 +342,7 @@ mod tests {
     fn list_due_excludes_future_sends() {
         let db = test_db();
         let future = Utc::now() + chrono::Duration::hours(1);
-        db.insert_scheduled_send("ss-2", "later", "session-xyz", None, future, None)
+        db.insert_scheduled_send("ss-2", "later", "session-xyz", None, future, None, None)
             .unwrap();
 
         let due = db.list_due_scheduled_sends(Utc::now()).unwrap();
@@ -277,7 +353,7 @@ mod tests {
     fn delete_scheduled_send() {
         let db = test_db();
         let fire = Utc::now() - chrono::Duration::hours(1);
-        db.insert_scheduled_send("ss-3", "to delete", "session-del", None, fire, None)
+        db.insert_scheduled_send("ss-3", "to delete", "session-del", None, fire, None, None)
             .unwrap();
 
         assert!(db.delete_scheduled_send("ss-3").unwrap());
@@ -289,10 +365,18 @@ mod tests {
     fn list_pending_for_session() {
         let db = test_db();
         let fire = Utc::now() + chrono::Duration::hours(2);
-        db.insert_scheduled_send("ss-4", "for session", "session-42", None, fire, None)
+        db.insert_scheduled_send("ss-4", "for session", "session-42", None, fire, None, None)
             .unwrap();
-        db.insert_scheduled_send("ss-5", "other session", "session-99", None, fire, None)
-            .unwrap();
+        db.insert_scheduled_send(
+            "ss-5",
+            "other session",
+            "session-99",
+            None,
+            fire,
+            None,
+            None,
+        )
+        .unwrap();
 
         let pending = db
             .list_pending_scheduled_sends_for_session("session-42")
@@ -315,6 +399,7 @@ mod tests {
             Some("/proj"),
             fire,
             None,
+            None,
         )
         .unwrap();
 
@@ -326,6 +411,7 @@ mod tests {
             "session-1",
             Some("/proj"),
             fire,
+            None,
             None,
         )
         .unwrap();
@@ -345,7 +431,7 @@ mod tests {
     fn cancel_selected_removes_only_that_entry() {
         let db = test_db();
         let base = Utc::now() + chrono::Duration::hours(1);
-        db.insert_scheduled_send("ss-a", "first", "session-x", None, base, None)
+        db.insert_scheduled_send("ss-a", "first", "session-x", None, base, None, None)
             .unwrap();
         db.insert_scheduled_send(
             "ss-b",
@@ -353,6 +439,7 @@ mod tests {
             "session-x",
             None,
             base + chrono::Duration::hours(1),
+            None,
             None,
         )
         .unwrap();
@@ -362,6 +449,7 @@ mod tests {
             "session-x",
             None,
             base + chrono::Duration::hours(2),
+            None,
             None,
         )
         .unwrap();
@@ -383,9 +471,17 @@ mod tests {
     fn reassign_moves_pending_sends_to_the_resumed_session_id() {
         let db = test_db();
         let fire = Utc::now() + chrono::Duration::hours(2);
-        db.insert_scheduled_send("ss-r1", "keep me", "old-id", Some("/proj"), fire, None)
-            .unwrap();
-        db.insert_scheduled_send("ss-r2", "unrelated", "other-id", None, fire, None)
+        db.insert_scheduled_send(
+            "ss-r1",
+            "keep me",
+            "old-id",
+            Some("/proj"),
+            fire,
+            None,
+            None,
+        )
+        .unwrap();
+        db.insert_scheduled_send("ss-r2", "unrelated", "other-id", None, fire, None, None)
             .unwrap();
 
         let moved = db.reassign_scheduled_sends("old-id", "new-id").unwrap();
@@ -413,9 +509,9 @@ mod tests {
     fn drop_missing_targets_removes_only_gone_sessions() {
         let db = test_db();
         let fire = Utc::now() + chrono::Duration::hours(1);
-        db.insert_scheduled_send("ss-live", "deliver", "session-live", None, fire, None)
+        db.insert_scheduled_send("ss-live", "deliver", "session-live", None, fire, None, None)
             .unwrap();
-        db.insert_scheduled_send("ss-gone", "orphan", "session-gone", None, fire, None)
+        db.insert_scheduled_send("ss-gone", "orphan", "session-gone", None, fire, None, None)
             .unwrap();
 
         let live = vec!["session-live".to_string()];
@@ -437,9 +533,9 @@ mod tests {
     fn drop_missing_targets_with_no_live_sessions_clears_all() {
         let db = test_db();
         let fire = Utc::now() + chrono::Duration::hours(1);
-        db.insert_scheduled_send("ss-x", "x", "s1", None, fire, None)
+        db.insert_scheduled_send("ss-x", "x", "s1", None, fire, None, None)
             .unwrap();
-        db.insert_scheduled_send("ss-y", "y", "s2", None, fire, None)
+        db.insert_scheduled_send("ss-y", "y", "s2", None, fire, None, None)
             .unwrap();
         let dropped = db.drop_scheduled_sends_missing_targets(&[]).unwrap();
         assert_eq!(dropped, 2);
@@ -502,6 +598,7 @@ mod tests {
             None,
             now + chrono::Duration::hours(3),
             None,
+            None,
         )
         .unwrap();
         db.insert_scheduled_send(
@@ -511,6 +608,7 @@ mod tests {
             None,
             now + chrono::Duration::hours(1),
             None,
+            None,
         )
         .unwrap();
         db.insert_scheduled_send(
@@ -519,6 +617,7 @@ mod tests {
             "s",
             None,
             now + chrono::Duration::hours(2),
+            None,
             None,
         )
         .unwrap();
@@ -540,7 +639,7 @@ mod tests {
     fn reassign_no_matching_sends_returns_zero() {
         let db = test_db();
         let fire = Utc::now() + chrono::Duration::hours(1);
-        db.insert_scheduled_send("ss-1", "prompt", "session-a", None, fire, None)
+        db.insert_scheduled_send("ss-1", "prompt", "session-a", None, fire, None, None)
             .unwrap();
 
         let moved = db
@@ -558,11 +657,11 @@ mod tests {
     fn reassign_moves_all_matching_sends() {
         let db = test_db();
         let fire = Utc::now() + chrono::Duration::hours(1);
-        db.insert_scheduled_send("ss-1", "p1", "old", None, fire, None)
+        db.insert_scheduled_send("ss-1", "p1", "old", None, fire, None, None)
             .unwrap();
-        db.insert_scheduled_send("ss-2", "p2", "old", None, fire, None)
+        db.insert_scheduled_send("ss-2", "p2", "old", None, fire, None, None)
             .unwrap();
-        db.insert_scheduled_send("ss-3", "p3", "other", None, fire, None)
+        db.insert_scheduled_send("ss-3", "p3", "other", None, fire, None, None)
             .unwrap();
 
         let moved = db.reassign_scheduled_sends("old", "new").unwrap();
@@ -580,9 +679,9 @@ mod tests {
     fn drop_missing_targets_with_all_live_keeps_everything() {
         let db = test_db();
         let fire = Utc::now() + chrono::Duration::hours(1);
-        db.insert_scheduled_send("ss-1", "p1", "s1", None, fire, None)
+        db.insert_scheduled_send("ss-1", "p1", "s1", None, fire, None, None)
             .unwrap();
-        db.insert_scheduled_send("ss-2", "p2", "s2", None, fire, None)
+        db.insert_scheduled_send("ss-2", "p2", "s2", None, fire, None, None)
             .unwrap();
 
         let dropped = db
@@ -601,7 +700,7 @@ mod tests {
     fn scheduled_send_with_none_workdir_round_trips() {
         let db = test_db();
         let fire = Utc::now();
-        db.insert_scheduled_send("ss-nw", "prompt", "session", None, fire, None)
+        db.insert_scheduled_send("ss-nw", "prompt", "session", None, fire, None, None)
             .unwrap();
 
         let due = db.list_due_scheduled_sends(Utc::now()).unwrap();
@@ -617,7 +716,7 @@ mod tests {
         let db = test_db();
         let fake_now = Utc::now();
         let fire = fake_now - chrono::Duration::minutes(1);
-        db.insert_scheduled_send("ss-once", "fire me", "session-live", None, fire, None)
+        db.insert_scheduled_send("ss-once", "fire me", "session-live", None, fire, None, None)
             .unwrap();
 
         let due = db.list_due_scheduled_sends(fake_now).unwrap();
@@ -645,6 +744,7 @@ mod tests {
             Some("/home/user/project"),
             fire,
             None,
+            None,
         )
         .unwrap();
 
@@ -661,6 +761,7 @@ mod tests {
             &send.target_session_id,
             send.workdir.as_deref(),
             fake_now,
+            None,
         )
         .unwrap();
         db.delete_scheduled_send(&send.id).unwrap();
@@ -681,8 +782,16 @@ mod tests {
         let db = test_db();
         let fire = Utc::now();
         let state_json = r#"{"sections":{"__raw__":"hello"},"enabled_sections":[],"focused_section":0,"section_counters":{},"section_cursors":{},"section_scrolls":{},"collapsed_pastes":{},"locked_sections":[]}"#;
-        db.insert_scheduled_send("ss-bs", "hello", "session-1", None, fire, Some(state_json))
-            .unwrap();
+        db.insert_scheduled_send(
+            "ss-bs",
+            "hello",
+            "session-1",
+            None,
+            fire,
+            Some(state_json),
+            None,
+        )
+        .unwrap();
 
         let due = db.list_due_scheduled_sends(Utc::now()).unwrap();
         assert_eq!(due.len(), 1);
@@ -699,7 +808,7 @@ mod tests {
     fn insert_with_none_builder_state() {
         let db = test_db();
         let fire = Utc::now();
-        db.insert_scheduled_send("ss-nobs", "prompt", "session-1", None, fire, None)
+        db.insert_scheduled_send("ss-nobs", "prompt", "session-1", None, fire, None, None)
             .unwrap();
 
         let due = db.list_due_scheduled_sends(Utc::now()).unwrap();
@@ -737,5 +846,81 @@ mod tests {
         let due = db.list_due_scheduled_sends(Utc::now()).unwrap();
         assert_eq!(due.len(), 1);
         assert!(due[0].builder_state.is_none());
+        assert!(due[0].provenance.is_none());
+    }
+
+    #[test]
+    fn scheduled_send_provenance_and_builder_state_round_trip() {
+        let db = test_db();
+        let fire = Utc::now();
+        let state_json =
+            r#"{"sections":{"instruction_1":"hook says hi"},"enabled_sections":["instruction_1"]}"#;
+        let provenance = ScheduledSendProvenance::hook("loop-9", "on_failed");
+        db.insert_scheduled_send(
+            "ss-prov",
+            "hook says hi",
+            "session-1",
+            Some("/proj"),
+            fire,
+            Some(state_json),
+            Some(&provenance),
+        )
+        .unwrap();
+
+        let due = db.list_due_scheduled_sends(Utc::now()).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].builder_state.as_deref(), Some(state_json));
+        assert_eq!(due[0].provenance, Some(provenance.clone()));
+        assert_eq!(due[0].provenance.as_ref().unwrap().kind, "hook");
+        assert_eq!(due[0].provenance.as_ref().unwrap().loop_id, "loop-9");
+        assert_eq!(due[0].provenance.as_ref().unwrap().event, "on_failed");
+
+        let pending = db
+            .list_pending_scheduled_sends_for_session("session-1")
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].provenance, Some(provenance));
+    }
+
+    /// A dead-target hook send must retain its origin metadata in the failed
+    /// table — the operator recalling it can still tell which loop/event sent it.
+    #[test]
+    fn dead_target_preserves_hook_provenance() {
+        let db = test_db();
+        let fake_now = Utc::now();
+        let fire = fake_now - chrono::Duration::minutes(1);
+        let provenance = ScheduledSendProvenance::hook("loop-3", "on_completed");
+        db.insert_scheduled_send(
+            "ss-hook-dead",
+            "loop finished",
+            "session-gone",
+            Some("/home/user/project"),
+            fire,
+            None,
+            Some(&provenance),
+        )
+        .unwrap();
+
+        let due = db.list_due_scheduled_sends(fake_now).unwrap();
+        assert_eq!(due.len(), 1);
+        let send = &due[0];
+        assert!(!is_target_alive(&send.target_session_id, &[]));
+
+        db.insert_failed_scheduled_send(
+            &send.id,
+            &send.prompt,
+            &send.target_session_id,
+            send.workdir.as_deref(),
+            fake_now,
+            send.provenance.as_ref(),
+        )
+        .unwrap();
+        db.delete_scheduled_send(&send.id).unwrap();
+
+        let preserved = db
+            .list_failed_scheduled_sends_for_workdir("/home/user/project")
+            .unwrap();
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(preserved[0].provenance, Some(provenance));
     }
 }

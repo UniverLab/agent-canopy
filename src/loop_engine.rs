@@ -8,11 +8,12 @@ use tokio::sync::Semaphore;
 
 use crate::application::notification_service::{LoopFinishOutcome, NotificationService};
 use crate::daemon::process::KILL_GRACE;
+use crate::db::scheduled_sends::ScheduledSendProvenance;
 use crate::db::Database;
 use crate::domain::loops::{
-    EnsembleDetails, EnsembleKind, EnsembleMember, Loop, LoopCompletionHookRun, LoopEdge,
-    LoopEdgeCondition, LoopHookEvent, LoopNode, LoopNodeKind, LoopNodeRun, LoopRunStatus, LoopSpec,
-    LoopSpecStatus, LoopStatus, RouterRoute,
+    EnsembleDetails, EnsembleKind, EnsembleMember, Loop, LoopCompletionHook, LoopCompletionHookRun,
+    LoopEdge, LoopEdgeCondition, LoopHookEvent, LoopNode, LoopNodeKind, LoopNodeRun, LoopRunStatus,
+    LoopSpec, LoopSpecStatus, LoopStatus, RouterRoute,
 };
 use crate::domain::models::Cli;
 use crate::domain::sandbox::Sandbox;
@@ -766,7 +767,11 @@ impl LoopEngine {
                 continue;
             }
 
-            let execution = if hook.is_command() {
+            let execution = if hook.is_interactive() {
+                // Interactive hook: enqueue a due-now scheduled send for the
+                // configured live session — never a CLI spawn.
+                self.execute_interactive_hook(lp, hook, &event, ctx).await
+            } else if hook.is_command() {
                 // Command hook: substitute placeholders, run via shared path
                 let raw_command = hook.command.as_deref().unwrap();
                 match render_hook_command(&event, ctx, raw_command) {
@@ -880,6 +885,138 @@ impl LoopEngine {
                 self.notification_service
                     .notify_loop_completion_hook_failed(&lp.name, &execution.summary);
             }
+        }
+    }
+
+    /// Fire one interactive hook (CH3): render its prompt through the same
+    /// event-placeholder path as agent hooks, verify the configured target
+    /// session is live in the database, and enqueue one due-now scheduled
+    /// send carrying the rendered prompt, a canonical promptbuilder-equivalent
+    /// builder state, and structured hook provenance (loop id + event).
+    ///
+    /// Delivery itself stays where it already is — the TUI's
+    /// `deliver_due_scheduled_sends` — so a send enqueued while no TUI is
+    /// running stays queued (pending, never failed) until one comes up. A
+    /// missing or non-live target fails the hook run naming the exact session
+    /// id, without inserting anything and without touching the loop's status
+    /// (the caller records the failure and continues to later hooks).
+    async fn execute_interactive_hook(
+        &self,
+        lp: &Loop,
+        hook: &LoopCompletionHook,
+        event: &LoopHookEvent,
+        ctx: &HookContext<'_>,
+    ) -> HookExecution {
+        let target = hook
+            .target_session_id
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("");
+        if target.is_empty() {
+            return HookExecution {
+                status: LoopRunStatus::Fail,
+                output: serde_json::json!({
+                    "error": "interactive hook has no target session id",
+                }),
+                summary: format!(
+                    "{} hook has no target session id; message not enqueued.",
+                    event.as_str()
+                ),
+            };
+        }
+        let rendered = match render_hook_prompt(event, ctx, hook.prompt.as_deref().unwrap_or("")) {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                return HookExecution {
+                    status: LoopRunStatus::Fail,
+                    output: serde_json::json!({
+                        "target_session_id": target,
+                        "error": error.to_string(),
+                    }),
+                    summary: format!("{} hook prompt is invalid: {error}", event.as_str()),
+                };
+            }
+        };
+        let live = match self.db.get_active_sessions() {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                return HookExecution {
+                    status: LoopRunStatus::Fail,
+                    output: serde_json::json!({
+                        "target_session_id": target,
+                        "error": error.to_string(),
+                    }),
+                    summary: format!(
+                        "{} hook could not verify target session '{target}': {error}",
+                        event.as_str()
+                    ),
+                };
+            }
+        };
+        if !live.iter().any(|session| session.id == target) {
+            return HookExecution {
+                status: LoopRunStatus::Fail,
+                output: serde_json::json!({
+                    "target_session_id": target,
+                    "error": "session does not exist or is no longer live",
+                }),
+                summary: format!(
+                    "{} hook target session '{target}' does not exist or is no longer live; message not enqueued.",
+                    event.as_str()
+                ),
+            };
+        }
+        let builder_state = crate::tui::PersistedBuilderState::for_instruction_prompt(&rendered);
+        let builder_json = match serde_json::to_string(&builder_state) {
+            Ok(json) => json,
+            Err(error) => {
+                return HookExecution {
+                    status: LoopRunStatus::Fail,
+                    output: serde_json::json!({
+                        "target_session_id": target,
+                        "error": error.to_string(),
+                    }),
+                    summary: format!(
+                        "{} hook could not encode builder state for session '{target}': {error}",
+                        event.as_str()
+                    ),
+                };
+            }
+        };
+        let provenance = ScheduledSendProvenance::hook(&lp.id, event.as_str());
+        let send_id = uuid::Uuid::new_v4().to_string();
+        match self.db.insert_scheduled_send(
+            &send_id,
+            &rendered,
+            target,
+            Some(ctx.workdir),
+            chrono::Utc::now(),
+            Some(&builder_json),
+            Some(&provenance),
+        ) {
+            Ok(()) => HookExecution {
+                status: LoopRunStatus::Pass,
+                output: serde_json::json!({
+                    "scheduled_send_id": send_id,
+                    "target_session_id": target,
+                    "provenance": provenance,
+                }),
+                summary: format!(
+                    "{} hook enqueued a message for live session '{target}'; it will be delivered when a TUI is running.",
+                    event.as_str()
+                ),
+            },
+            Err(error) => HookExecution {
+                status: LoopRunStatus::Fail,
+                output: serde_json::json!({
+                    "target_session_id": target,
+                    "error": error.to_string(),
+                }),
+                summary: format!(
+                    "{} hook could not enqueue a message for session '{target}': {error}",
+                    event.as_str()
+                ),
+            },
         }
     }
 
@@ -13445,6 +13582,7 @@ echo done
             effort: None,
             prompt: Some(format!("touch \"{}\"", marker_path)),
             command: None,
+            target_session_id: None,
             timeout_minutes: Some(1),
         };
         db.update_loop_completion_hook(&loop_id, Some(&hook))
@@ -13497,6 +13635,7 @@ echo done
             effort: None,
             prompt: Some(format!("touch \"{}\"", marker_path)),
             command: None,
+            target_session_id: None,
             timeout_minutes: Some(1),
         };
         db.update_loop_completion_hook(&loop_id, Some(&hook))
@@ -13548,6 +13687,7 @@ echo done
             effort: None,
             prompt: Some(format!("echo fire >> \"{}\"", marker_path)),
             command: None,
+            target_session_id: None,
             timeout_minutes: Some(1),
         };
         db.update_loop_completion_hook(&loop_id, Some(&hook))
@@ -14425,6 +14565,7 @@ echo done
             effort: None,
             prompt: Some(format!("touch \"{}\"", marker_path)),
             command: None,
+            target_session_id: None,
             timeout_minutes: Some(1),
         };
         db.update_loop_completion_hook(&loop_id, Some(&hook))
@@ -14478,6 +14619,7 @@ echo done
             effort: None,
             prompt: Some(format!("touch \"{}\"", marker_path)),
             command: None,
+            target_session_id: None,
             timeout_minutes: Some(1),
         };
         db.update_loop_completion_hook(&loop_id, Some(&hook))
@@ -14721,6 +14863,7 @@ echo done
             effort: None,
             prompt: Some("exit 1".to_string()),
             command: None,
+            target_session_id: None,
             timeout_minutes: Some(1),
         };
         db.update_loop_completion_hook(&loop_id, Some(&hook))
@@ -14775,6 +14918,7 @@ echo done
             effort: None,
             prompt: Some(format!("touch \"{}\"", marker.display())),
             command: None,
+            target_session_id: None,
             timeout_minutes: Some(1),
         };
         let mut hooks = std::collections::BTreeMap::new();
@@ -14835,6 +14979,7 @@ echo done
             effort: None,
             prompt: Some(format!("touch \"{}\"", marker.display())),
             command: None,
+            target_session_id: None,
             timeout_minutes: Some(1),
         };
         let mut hooks = std::collections::BTreeMap::new();
@@ -14901,6 +15046,7 @@ echo done
             effort: None,
             prompt: Some("echo \"{{blocker}} {{node}}\" > /dev/null".to_string()),
             command: None,
+            target_session_id: None,
             timeout_minutes: Some(1),
         };
         let mut hooks = std::collections::BTreeMap::new();
@@ -14967,6 +15113,7 @@ echo done
             effort: None,
             prompt: Some("echo \"{{blocker}} {{node}}\" > /dev/null".to_string()),
             command: None,
+            target_session_id: None,
             timeout_minutes: Some(1),
         };
         let mut hooks = std::collections::BTreeMap::new();
@@ -15021,6 +15168,7 @@ echo done
             effort: None,
             prompt: Some("exit 1".to_string()),
             command: None,
+            target_session_id: None,
             timeout_minutes: Some(1),
         };
         let passing = crate::domain::loops::LoopCompletionHook {
@@ -15029,6 +15177,7 @@ echo done
             effort: None,
             prompt: Some(format!("touch \"{}\"", marker.display())),
             command: None,
+            target_session_id: None,
             timeout_minutes: Some(1),
         };
         let mut hooks = std::collections::BTreeMap::new();
@@ -15098,6 +15247,7 @@ echo done
             effort: None,
             prompt: Some(format!("touch \"{}\"", marker.display())),
             command: None,
+            target_session_id: None,
             timeout_minutes: Some(1),
         };
         let mut hooks = std::collections::BTreeMap::new();
@@ -15114,6 +15264,231 @@ echo done
             .unwrap()
             .is_empty());
         assert!(!marker.exists());
+    }
+
+    // ── CH3: interactive hook tests ────────────────────────────────────
+
+    fn interactive_hook_fixture(
+        target: &str,
+        prompt: &str,
+    ) -> crate::domain::loops::LoopCompletionHook {
+        crate::domain::loops::LoopCompletionHook {
+            platform: None,
+            model: None,
+            effort: None,
+            prompt: Some(prompt.to_string()),
+            command: None,
+            target_session_id: Some(target.to_string()),
+            timeout_minutes: None,
+        }
+    }
+
+    /// CH3: firing an interactive hook inserts one scheduled send addressed
+    /// to the configured session, with the rendered prompt and a populated,
+    /// restorable builder state.
+    #[tokio::test]
+    async fn interactive_hook_enqueues_rendered_scheduled_send() {
+        let (_dir, db, engine, loop_id, _spec_id) = loop_fixture().unwrap();
+        let workdir = db.get_loop(&loop_id).unwrap().unwrap().workdir.clone();
+        db.insert_interactive_session(
+            "session-live",
+            "operator",
+            "claude",
+            &workdir,
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+
+        let hook = interactive_hook_fixture(
+            "session-live",
+            "Loop {{loop_name}} failed: {{blocker}} on {{node}}",
+        );
+        let mut hooks = std::collections::BTreeMap::new();
+        hooks.insert(crate::domain::loops::LoopHookEvent::OnFailed, vec![hook]);
+        db.update_loop_hooks(&loop_id, &hooks).unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        let ctx = HookContext {
+            loop_name: &lp.name,
+            workdir: &lp.workdir,
+            completed_specs: &[],
+            spec_name: None,
+            spec_id: None,
+            blocker: Some("build broke"),
+            node_name: Some("builder"),
+        };
+        engine
+            .fire_hooks(&lp, crate::domain::loops::LoopHookEvent::OnFailed, &ctx)
+            .await;
+
+        let hook_runs = db.list_loop_completion_hook_runs(&loop_id).unwrap();
+        assert_eq!(hook_runs.len(), 1);
+        assert_eq!(hook_runs[0].status, LoopRunStatus::Pass);
+
+        let due = db.list_due_scheduled_sends(chrono::Utc::now()).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].target_session_id, "session-live");
+        assert_eq!(due[0].prompt, "Loop Loop failed: build broke on builder");
+        let state_json = due[0]
+            .builder_state
+            .as_deref()
+            .expect("builder_state populated");
+        assert!(!state_json.is_empty());
+        let state: crate::tui::PersistedBuilderState =
+            serde_json::from_str(state_json).expect("builder state deserializes");
+        let mut dialog = crate::tui::SimplePromptDialog::new();
+        state.restore_into(&mut dialog);
+        assert_eq!(
+            dialog.get_section_content("instruction_1"),
+            "Loop Loop failed: build broke on builder"
+        );
+    }
+
+    /// CH3: the enqueued message carries its provenance — loop and event —
+    /// as structure, not as prose inside the prompt.
+    #[tokio::test]
+    async fn interactive_hook_persists_structured_provenance() {
+        let (_dir, db, engine, loop_id, _spec_id) = loop_fixture().unwrap();
+        let workdir = db.get_loop(&loop_id).unwrap().unwrap().workdir.clone();
+        db.insert_interactive_session(
+            "session-live",
+            "operator",
+            "claude",
+            &workdir,
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+
+        let hook = interactive_hook_fixture("session-live", "Loop {{loop_name}} finished");
+        let mut hooks = std::collections::BTreeMap::new();
+        hooks.insert(crate::domain::loops::LoopHookEvent::OnCompleted, vec![hook]);
+        db.update_loop_hooks(&loop_id, &hooks).unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        let completed = vec![("Spec".to_string(), "ok".to_string())];
+        let ctx = HookContext {
+            loop_name: &lp.name,
+            workdir: &lp.workdir,
+            completed_specs: &completed,
+            spec_name: None,
+            spec_id: None,
+            blocker: None,
+            node_name: None,
+        };
+        engine
+            .fire_hooks(&lp, crate::domain::loops::LoopHookEvent::OnCompleted, &ctx)
+            .await;
+
+        let due = db.list_due_scheduled_sends(chrono::Utc::now()).unwrap();
+        assert_eq!(due.len(), 1);
+        let provenance = due[0].provenance.as_ref().expect("provenance populated");
+        assert_eq!(provenance.kind, "hook");
+        assert_eq!(provenance.loop_id, loop_id);
+        assert_eq!(provenance.event, "on_completed");
+        // Origin stays out of the delivered text.
+        assert!(!due[0].prompt.contains(&loop_id));
+        assert!(!due[0].prompt.contains("on_completed"));
+    }
+
+    /// CH3: a hook targeting an unknown or dead session fails with the id in
+    /// the message, inserts nothing, and leaves the loop's status unchanged.
+    #[tokio::test]
+    async fn interactive_hook_missing_target_fails_without_loop_status_change() {
+        let (_dir, db, engine, loop_id, _spec_id) = loop_fixture().unwrap();
+        let status_before = db.get_loop(&loop_id).unwrap().unwrap().status;
+
+        let hook = interactive_hook_fixture("session-gone", "Loop {{loop_name}} finished");
+        let mut hooks = std::collections::BTreeMap::new();
+        hooks.insert(crate::domain::loops::LoopHookEvent::OnCompleted, vec![hook]);
+        db.update_loop_hooks(&loop_id, &hooks).unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        let completed = vec![("Spec".to_string(), "ok".to_string())];
+        let ctx = HookContext {
+            loop_name: &lp.name,
+            workdir: &lp.workdir,
+            completed_specs: &completed,
+            spec_name: None,
+            spec_id: None,
+            blocker: None,
+            node_name: None,
+        };
+        engine
+            .fire_hooks(&lp, crate::domain::loops::LoopHookEvent::OnCompleted, &ctx)
+            .await;
+
+        let hook_runs = db.list_loop_completion_hook_runs(&loop_id).unwrap();
+        assert_eq!(hook_runs.len(), 1);
+        assert_eq!(hook_runs[0].status, LoopRunStatus::Fail);
+        let summary = hook_runs[0].summary.as_deref().unwrap_or("");
+        assert!(
+            summary.contains("session-gone"),
+            "failure must name the session id, got: {summary}"
+        );
+        assert!(db
+            .list_due_scheduled_sends(chrono::Utc::now())
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.get_loop(&loop_id).unwrap().unwrap().status,
+            status_before
+        );
+    }
+
+    /// CH3: a message enqueued with no TUI running stays pending — the
+    /// engine only enqueues, so the due row must still be there (not failed)
+    /// after firing returns.
+    #[tokio::test]
+    async fn interactive_hook_is_pending_without_tui() {
+        let (_dir, db, engine, loop_id, _spec_id) = loop_fixture().unwrap();
+        let workdir = db.get_loop(&loop_id).unwrap().unwrap().workdir.clone();
+        db.insert_interactive_session(
+            "session-live",
+            "operator",
+            "claude",
+            &workdir,
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+
+        let hook = interactive_hook_fixture("session-live", "Loop {{loop_name}} finished");
+        let mut hooks = std::collections::BTreeMap::new();
+        hooks.insert(crate::domain::loops::LoopHookEvent::OnCompleted, vec![hook]);
+        db.update_loop_hooks(&loop_id, &hooks).unwrap();
+
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        let completed = vec![("Spec".to_string(), "ok".to_string())];
+        let ctx = HookContext {
+            loop_name: &lp.name,
+            workdir: &lp.workdir,
+            completed_specs: &completed,
+            spec_name: None,
+            spec_id: None,
+            blocker: None,
+            node_name: None,
+        };
+        // No TUI delivery object exists anywhere in this test — firing only
+        // enqueues.
+        engine
+            .fire_hooks(&lp, crate::domain::loops::LoopHookEvent::OnCompleted, &ctx)
+            .await;
+
+        let due = db.list_due_scheduled_sends(chrono::Utc::now()).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].target_session_id, "session-live");
+        assert!(db
+            .list_failed_scheduled_sends_for_workdir(&workdir)
+            .unwrap()
+            .is_empty());
     }
 
     // ── CH2: command hook tests ────────────────────────────────────────
@@ -15183,6 +15558,7 @@ echo done
             effort: None,
             prompt: None,
             command: Some("touch \"{{spec_name}}.marker\"".to_string()),
+            target_session_id: None,
             timeout_minutes: Some(1),
         };
         let mut hooks = std::collections::BTreeMap::new();
@@ -15245,6 +15621,7 @@ echo done
             effort: None,
             prompt: None,
             command: Some("echo out; echo err >&2; exit 3".to_string()),
+            target_session_id: None,
             timeout_minutes: Some(1),
         };
         let mut hooks = std::collections::BTreeMap::new();
@@ -15302,6 +15679,7 @@ echo done
             effort: None,
             prompt: None,
             command: Some(format!("echo {{{{spec_name}}}} > \"{}\"", output_path)),
+            target_session_id: None,
             timeout_minutes: Some(1),
         };
         let mut hooks = std::collections::BTreeMap::new();

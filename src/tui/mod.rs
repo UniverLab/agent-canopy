@@ -20,6 +20,12 @@ mod ui;
 mod whimsg;
 
 pub(crate) use ui::truncate_str_keep_tail;
+// CH3: the loop engine enqueues interactive hook messages with a canonical
+// promptbuilder-equivalent state — the builder types live here, so they are
+// re-exported for that one non-TUI consumer rather than making `app` public.
+pub(crate) use app::dialog::PersistedBuilderState;
+#[cfg(test)]
+pub(crate) use app::dialog::SimplePromptDialog;
 
 use anyhow::{Context, Result};
 use ratatui::crossterm::{

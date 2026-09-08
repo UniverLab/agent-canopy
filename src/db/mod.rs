@@ -604,7 +604,8 @@ impl Database {
                 prompt TEXT NOT NULL,
                 target_session_id TEXT NOT NULL,
                 fire_at INTEGER NOT NULL,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                provenance TEXT
             );
 
             CREATE TABLE IF NOT EXISTS failed_scheduled_sends (
@@ -612,7 +613,8 @@ impl Database {
                 prompt TEXT NOT NULL,
                 target_session_id TEXT NOT NULL,
                 workdir TEXT,
-                failed_at INTEGER NOT NULL
+                failed_at INTEGER NOT NULL,
+                provenance TEXT
             );
 
             -- U8: the prompt builder's last-sent prompt per project, recalled
@@ -735,6 +737,29 @@ impl Database {
                 [],
             )
             .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+
+        // `provenance` carries hook origin (`kind`/`loop_id`/`event`) as
+        // structured JSON so the TUI can name the sender without that
+        // metadata being buried in the prompt text. Nullable so legacy
+        // prompt-builder sends keep reading as `None`.
+        for table in ["scheduled_sends", "failed_scheduled_sends"] {
+            let has_column: bool = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = 'provenance'"
+                    ),
+                    [],
+                    |row| Ok(row.get::<_, i32>(0)? > 0),
+                )
+                .unwrap_or(false);
+            if !has_column {
+                conn.execute(
+                    &format!("ALTER TABLE {table} ADD COLUMN provenance TEXT"),
+                    [],
+                )
+                .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+            }
         }
 
         let has_session_type: bool = conn
