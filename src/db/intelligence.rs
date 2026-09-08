@@ -12,6 +12,7 @@ use crate::db::Database;
 pub struct IntelligenceNodeRecord {
     pub id: String,
     pub kind: String,
+    pub status: String,
     pub title: String,
     pub body: String,
     pub metadata: Option<String>,
@@ -38,6 +39,7 @@ impl OperationalSessionRecord {
         IntelligenceNodeRecord {
             id: self.id,
             kind: "session".to_string(),
+            status: "noted".to_string(),
             title: self.title,
             body: self.body,
             metadata: self.metadata,
@@ -80,6 +82,7 @@ pub struct IntelligenceRelationInput {
 pub struct IntelligenceNodeInput {
     pub id: Option<String>,
     pub kind: String,
+    pub status: Option<String>,
     pub title: String,
     pub body: String,
     pub metadata: Option<serde_json::Value>,
@@ -135,6 +138,134 @@ pub struct TraversalScope {
 /// Hard bound on traversal depth: one query never walks further than this.
 pub const MAX_TRAVERSAL_DEPTH: usize = 5;
 
+/// Knowledge-node kinds. `project` is structural (CM9) and exempt from this validation.
+pub const KNOWLEDGE_KINDS: &[&str] = &["fact", "pattern", "idea", "decision", "defect"];
+
+/// Node status — applies to all nodes (knowledge + project).
+pub const NODE_STATUSES: &[&str] = &["noted", "verified", "resolved", "superseded", "deprecated"];
+
+/// Edge relation types for knowledge-node edges.
+/// Project edges use their own vocabulary (`PROJECT_RELATIONS` in `domain/project.rs`).
+pub const KNOWLEDGE_EDGE_RELATIONS: &[&str] = &[
+    "supersedes",
+    "contradicts",
+    "evidence_for",
+    "depends_on",
+    "extends",
+    "part_of",
+];
+
+/// Minimum lexical search score for a same-kind node to count as a
+/// duplicate candidate at write time. A `pub const` so it can be tuned
+/// without touching the query; a config-file setting can come later.
+pub const DUPLICATE_SIMILARITY_THRESHOLD: i64 = 5;
+
+/// Lexical duplicate detection does not catch paraphrase and does not
+/// cross languages — surfaced in the upsert output wherever candidates
+/// are reported.
+pub const LEXICAL_DUPLICATE_LIMITATION: &str = "Lexical duplicate detection does not catch paraphrase and does not cross languages, so a bilingual corpus will pass duplicates through.";
+
+pub fn validate_knowledge_kind(kind: &str) -> Result<()> {
+    if kind == "project" || KNOWLEDGE_KINDS.contains(&kind) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "unknown node kind '{kind}'; allowed: fact, pattern, idea, decision, defect (structural: project)"
+        )
+    }
+}
+
+pub fn validate_node_status(status: &str) -> Result<()> {
+    if NODE_STATUSES.contains(&status) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "unknown node status '{status}'; allowed: noted, verified, resolved, superseded, deprecated"
+        )
+    }
+}
+
+pub fn validate_knowledge_edge_relation(relation: &str) -> Result<()> {
+    if KNOWLEDGE_EDGE_RELATIONS.contains(&relation) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "unknown edge relation '{relation}'; allowed: {}",
+            KNOWLEDGE_EDGE_RELATIONS.join(", ")
+        )
+    }
+}
+
+/// `file:line` citations in a body (`src/foo.rs:42`). Word-ish path chars
+/// plus a colon plus a line number; the trailing boundary keeps `a:b`
+/// prose and clock times (`12:30`) mostly out.
+fn extract_citations(body: &str) -> Vec<String> {
+    let re = regex::Regex::new(r"(?x)\b([A-Za-z0-9_./-]*[A-Za-z0-9_-]:\d+)\b")
+        .expect("citation regex is static and valid");
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for cap in re.captures_iter(body) {
+        let citation = cap[1].to_string();
+        if seen.insert(citation.clone()) {
+            out.push(citation);
+        }
+    }
+    out
+}
+
+/// Mirror of the ranked-search weighting (title hit = 3, body hit = 1)
+/// over the upsert query terms. A candidate at or above
+/// [`DUPLICATE_SIMILARITY_THRESHOLD`] is reported.
+fn lexical_duplicate_score(query_terms: &[String], candidate: &IntelligenceNodeRecord) -> i64 {
+    let title = candidate.title.to_lowercase();
+    let body = candidate.body.to_lowercase();
+    let mut score = 0i64;
+    for term in query_terms {
+        if title.contains(term) {
+            score += 3;
+        }
+        if body.contains(term) {
+            score += 1;
+        }
+    }
+    score
+}
+
+/// Node-id-shaped references in a body: `[[wiki-links]]`, full UUIDs, and
+/// 8+ char hex strings (short citations like `→ f9f487d9`, `Ver 74bdcdd2`).
+fn extract_node_id_references(body: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut push = |candidate: String| {
+        if !candidate.is_empty() && seen.insert(candidate.clone()) {
+            out.push(candidate);
+        }
+    };
+
+    let wiki =
+        regex::Regex::new(r"\[\[([^\[\]]+)\]\]").expect("wiki-link regex is static and valid");
+    for cap in wiki.captures_iter(body) {
+        push(cap[1].trim().to_string());
+    }
+    let uuid = regex::Regex::new(
+        r"\b([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b",
+    )
+    .expect("uuid regex is static and valid");
+    for cap in uuid.captures_iter(body) {
+        push(cap[1].to_string());
+    }
+    let hex = regex::Regex::new(r"\b([0-9a-fA-F]{8,64})\b").expect("hex regex is static and valid");
+    for cap in hex.captures_iter(body) {
+        let token = cap[1].to_string();
+        // A pure decimal run is a number, not a node id.
+        if token.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        push(token);
+    }
+    out
+}
+
 impl Database {
     /// Resolve a node id prefix (e.g. "3a476c63") to exactly one node.
     /// - Ok(Some(full_id)) if exactly one node matches
@@ -187,10 +318,46 @@ impl Database {
     pub fn upsert_intelligence_node(
         &self,
         input: IntelligenceNodeInput,
-    ) -> Result<(IntelligenceNodeRecord, bool)> {
-        let node_id = input.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    ) -> Result<(
+        IntelligenceNodeRecord,
+        bool,
+        Vec<IntelligenceNodeRecord>,
+        Vec<String>,
+    )> {
+        // Destructure by value: every field is consumed below, so the
+        // input stays pass-by-value without tripping needless_pass_by_value.
+        let IntelligenceNodeInput {
+            id,
+            kind,
+            status: input_status,
+            title,
+            body,
+            metadata,
+            project_hash,
+            session_id,
+            relations,
+        } = input;
+        // 1. Kind is validated first: cheapest check, most likely mistake.
+        validate_knowledge_kind(&kind)?;
+
+        // 2. A provided status must be a known value. `None` resolves below
+        // (create → "noted", update → preserve existing).
+        if let Some(ref s) = input_status {
+            validate_node_status(s)?;
+        }
+
+        // 3. New edges must use the knowledge-edge vocabulary. Existing
+        // stored edges are NOT validated retroactively: rejecting them on
+        // read would break every graph walk over the old corpus.
+        if let Some(ref rels) = relations {
+            for rel in rels {
+                validate_knowledge_edge_relation(&rel.relation)?;
+            }
+        }
+
+        let node_id = id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let now = Utc::now().timestamp();
-        let metadata = input.metadata.map(|value| value.to_string());
+        let metadata = metadata.map(|value| value.to_string());
         let conn = self
             .conn
             .lock()
@@ -199,19 +366,45 @@ impl Database {
         // otherwise hide the distinction. For auto-generated ids this is always
         // creation. Done inside the same lock as the INSERT to avoid a race
         // where another thread inserts between the check and the insert.
-        let was_created: bool = {
+        // The existing status is read here too so an update that omits
+        // `status` preserves it without a second lock acquisition.
+        let existing_status: Option<String> = {
             let mut stmt =
-                conn.prepare("SELECT 1 FROM intelligence_nodes WHERE id = ?1 LIMIT 1")?;
+                conn.prepare("SELECT status FROM intelligence_nodes WHERE id = ?1 LIMIT 1")?;
             let mut rows = stmt.query(rusqlite::params![&node_id])?;
-            rows.next()?.is_none()
+            match rows.next()? {
+                Some(row) => Some(row.get(0)?),
+                None => None,
+            }
         };
+        let was_created = existing_status.is_none();
+
+        let status = match input_status {
+            Some(s) => s,
+            None => existing_status.unwrap_or_else(|| "noted".to_string()),
+        };
+
+        // 4. `superseded` is meaningless without the pointer to what holds
+        // instead: it requires a `supersedes` edge in the same write.
+        if status == "superseded" {
+            let has_supersedes = relations
+                .as_ref()
+                .map(|rels| rels.iter().any(|r| r.relation == "supersedes"))
+                .unwrap_or(false);
+            if !has_supersedes {
+                anyhow::bail!(
+                    "status 'superseded' requires a 'supersedes' edge pointing to the replacing node"
+                );
+            }
+        }
 
         conn.execute(
             "INSERT INTO intelligence_nodes (
-                id, kind, title, body, metadata, project_hash, session_id, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                id, kind, status, title, body, metadata, project_hash, session_id, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             ON CONFLICT(id) DO UPDATE SET
                 kind = excluded.kind,
+                status = excluded.status,
                 title = excluded.title,
                 body = excluded.body,
                 metadata = excluded.metadata,
@@ -220,12 +413,13 @@ impl Database {
                 updated_at = excluded.updated_at",
             rusqlite::params![
                 node_id,
-                input.kind,
-                input.title,
-                input.body,
+                kind,
+                status,
+                title,
+                body,
                 metadata,
-                input.project_hash,
-                input.session_id,
+                project_hash,
+                session_id,
                 now,
                 now
             ],
@@ -236,7 +430,7 @@ impl Database {
             rusqlite::params![&node_id],
         )?;
 
-        if let Some(relations) = input.relations {
+        if let Some(relations) = relations {
             for relation in relations {
                 conn.execute(
                     "INSERT INTO intelligence_edges (
@@ -257,7 +451,124 @@ impl Database {
         let record = self
             .get_intelligence_node(&node_id)?
             .ok_or_else(|| anyhow!("Failed to load intelligence node '{}'", node_id))?;
-        Ok((record, was_created))
+        // Write-time signals, computed after the write lands: duplicate
+        // candidates (shared citations, then lexical ranking) and references
+        // to existing nodes that were mentioned but not declared as edges.
+        let duplicates = self.detect_duplicate_candidates(&record);
+        let undeclared_references = self.extract_undeclared_references(&record)?;
+        Ok((record, was_created, duplicates, undeclared_references))
+    }
+
+    /// Write-time duplicate candidates for `node`, strongest signal first.
+    ///
+    /// 1. **Shared citations** — same-kind nodes citing the same `file:line`
+    ///    or the same node ids. Deterministic and precise for this corpus.
+    /// 2. **Lexical ranking** — same-kind nodes scoring at or above
+    ///    [`DUPLICATE_SIMILARITY_THRESHOLD`] against the node's title plus
+    ///    the first ~100 chars of its body.
+    ///
+    /// Candidates are a warning, never a rejection. Best-effort: any
+    /// internal lookup failure yields fewer candidates, not a failed write.
+    fn detect_duplicate_candidates(
+        &self,
+        node: &IntelligenceNodeRecord,
+    ) -> Vec<IntelligenceNodeRecord> {
+        let mut seen: HashSet<String> = HashSet::from([node.id.clone()]);
+        let mut candidates: Vec<IntelligenceNodeRecord> = Vec::new();
+
+        // Signal 1: shared citations. This includes both file:line citations
+        // and references to other knowledge-node ids.
+        let mut shared_references = extract_citations(&node.body);
+        shared_references.extend(extract_node_id_references(&node.body));
+        for citation in shared_references {
+            if let Ok(neighbours) = self.list_nodes_citing(&citation, &node.kind, &node.id) {
+                for neighbour in neighbours {
+                    if seen.insert(neighbour.id.clone()) {
+                        candidates.push(neighbour);
+                    }
+                }
+            }
+        }
+
+        // Signal 2: lexical ranking over title + body head, same kind only.
+        let body_head: String = node.body.chars().take(100).collect();
+        let query = format!("{} {body_head}", node.title);
+        if let Ok(results) = self.search_intelligence_nodes(&query, Some(&node.kind), 10) {
+            let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+            for hit in results.results {
+                if !seen.insert(hit.id.clone()) {
+                    continue;
+                }
+                if lexical_duplicate_score(&terms, &hit) >= DUPLICATE_SIMILARITY_THRESHOLD {
+                    candidates.push(hit);
+                }
+            }
+        }
+
+        candidates
+    }
+
+    /// Same-kind nodes (excluding `exclude_id`) whose body mentions
+    /// `citation`. Backs signal 1 of [`Database::detect_duplicate_candidates`].
+    fn list_nodes_citing(
+        &self,
+        citation: &str,
+        kind: &str,
+        exclude_id: &str,
+    ) -> Result<Vec<IntelligenceNodeRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, kind, status, title, body, metadata, project_hash, session_id, created_at, updated_at
+             FROM intelligence_nodes
+             WHERE kind = ?1 AND id != ?2 AND instr(body, ?3) > 0
+             LIMIT 10",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![kind, exclude_id, citation],
+            Self::read_intelligence_node,
+        )?;
+        Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+
+    /// Ids of existing nodes mentioned in `node`'s body that are not
+    /// declared as outgoing edges. Returns the extracted candidates so
+    /// declaring them costs nothing. Empty when the node has no edges at
+    /// all — a generic orphan warning fires constantly and gets ignored.
+    fn extract_undeclared_references(&self, node: &IntelligenceNodeRecord) -> Result<Vec<String>> {
+        let declared: HashSet<String> = self
+            .list_recent_intelligence_edges(&node.id)?
+            .into_iter()
+            .filter(|edge| edge.from_node_id == node.id)
+            .map(|e| e.to_node_id)
+            .collect();
+        let mut refs: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut reported: HashSet<String> = HashSet::new();
+        for candidate in extract_node_id_references(&node.body) {
+            if candidate == node.id || !seen.insert(candidate.clone()) {
+                continue;
+            }
+            if declared.contains(&candidate) {
+                continue;
+            }
+            // Only warn about references to nodes that actually exist —
+            // anything else is prose, not a missing edge. Prefixes resolve
+            // so short citations (`→ f9f487d9`) still match. Ambiguous or
+            // absent prefixes are skipped: a warning must never fail a write.
+            let Ok(Some(resolved)) = self.resolve_node_id_by_prefix(&candidate) else {
+                continue;
+            };
+            if resolved == node.id || declared.contains(&resolved) {
+                continue;
+            }
+            if reported.insert(resolved.clone()) {
+                refs.push(resolved);
+            }
+        }
+        Ok(refs)
     }
 
     pub fn get_intelligence_node(&self, id: &str) -> Result<Option<IntelligenceNodeRecord>> {
@@ -266,7 +577,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, kind, title, body, metadata, project_hash, session_id, created_at, updated_at
+            "SELECT id, kind, status, title, body, metadata, project_hash, session_id, created_at, updated_at
              FROM intelligence_nodes WHERE id = ?1",
         )?;
         let mut rows = stmt.query(rusqlite::params![id])?;
@@ -372,7 +683,7 @@ impl Database {
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = if kind.is_some() {
             conn.prepare(
-                "SELECT id, kind, title, body, metadata, project_hash, session_id, created_at, updated_at
+                "SELECT id, kind, status, title, body, metadata, project_hash, session_id, created_at, updated_at
                  FROM intelligence_nodes
                  WHERE kind = ?1
                  ORDER BY updated_at DESC
@@ -380,7 +691,7 @@ impl Database {
             )?
         } else {
             conn.prepare(
-                "SELECT id, kind, title, body, metadata, project_hash, session_id, created_at, updated_at
+                "SELECT id, kind, status, title, body, metadata, project_hash, session_id, created_at, updated_at
                  FROM intelligence_nodes
                  ORDER BY updated_at DESC
                  LIMIT ?1",
@@ -468,7 +779,7 @@ impl Database {
         let or_clause = or_clauses.join(" OR ");
         let limit_placeholder = terms.len() + 2;
         let sql = format!(
-            "SELECT id, kind, title, body, metadata, project_hash, session_id, created_at, updated_at, \
+            "SELECT id, kind, status, title, body, metadata, project_hash, session_id, created_at, updated_at, \
              ({match_count_expr}) AS match_count, ({score_expr}) AS score \
              FROM intelligence_nodes \
              WHERE (?1 IS NULL OR kind = ?1) AND ({or_clause}) \
@@ -627,13 +938,14 @@ impl Database {
         Ok(IntelligenceNodeRecord {
             id: row.get(0)?,
             kind: row.get(1)?,
-            title: row.get(2)?,
-            body: row.get(3)?,
-            metadata: row.get(4)?,
-            project_hash: row.get(5)?,
-            session_id: row.get(6)?,
-            created_at: row.get(7)?,
-            updated_at: row.get(8)?,
+            status: row.get(2)?,
+            title: row.get(3)?,
+            body: row.get(4)?,
+            metadata: row.get(5)?,
+            project_hash: row.get(6)?,
+            session_id: row.get(7)?,
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
         })
     }
 
@@ -659,6 +971,7 @@ impl Database {
         self.upsert_intelligence_node(IntelligenceNodeInput {
             id: Some(format!("project:{}", project.hash)),
             kind: "project".to_string(),
+            status: None,
             title: project.name.clone(),
             body: project
                 .description
@@ -672,7 +985,7 @@ impl Database {
             session_id: None,
             relations: None,
         })
-        .map(|(record, _created)| record)
+        .map(|(record, _created, _duplicates, _undeclared)| record)
     }
 
     /// Create missing `kind='project'` root nodes for already-registered
@@ -702,14 +1015,14 @@ impl Database {
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
 
         let sql = if query.is_some() {
-            "SELECT id, kind, title, body, metadata, project_hash, session_id, created_at, updated_at
+            "SELECT id, kind, status, title, body, metadata, project_hash, session_id, created_at, updated_at
              FROM intelligence_nodes
              WHERE kind = 'project'
                AND (instr(lower(title), ?1) > 0 OR instr(lower(body), ?1) > 0 OR instr(lower(coalesce(metadata, '')), ?1) > 0)
              ORDER BY updated_at DESC
              LIMIT ?2"
         } else {
-            "SELECT id, kind, title, body, metadata, project_hash, session_id, created_at, updated_at
+            "SELECT id, kind, status, title, body, metadata, project_hash, session_id, created_at, updated_at
              FROM intelligence_nodes
              WHERE kind = 'project'
              ORDER BY updated_at DESC
@@ -809,7 +1122,7 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
-            "SELECT id, kind, title, body, metadata, project_hash, session_id, created_at, updated_at
+            "SELECT id, kind, status, title, body, metadata, project_hash, session_id, created_at, updated_at
              FROM intelligence_nodes
              WHERE kind = 'project'
                AND (project_hash = ?1 OR id = ?1)
@@ -1124,7 +1437,7 @@ impl Database {
             .collect();
         let hash_clause = hash_placeholders.join(", ");
         let sql = format!(
-            "SELECT id, kind, title, body, metadata, project_hash, session_id, created_at, updated_at, \
+            "SELECT id, kind, status, title, body, metadata, project_hash, session_id, created_at, updated_at, \
              ({match_count_expr}) AS match_count, ({score_expr}) AS score \
              FROM intelligence_nodes \
              WHERE (?1 IS NULL OR kind = ?1) AND project_hash IN ({hash_clause}) AND ({or_clause}) \
@@ -1281,12 +1594,12 @@ impl Database {
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
 
         let sql = match kind {
-            Some(_k) => "SELECT id, kind, title, body, metadata, project_hash, session_id, created_at, updated_at
+            Some(_k) => "SELECT id, kind, status, title, body, metadata, project_hash, session_id, created_at, updated_at
                         FROM intelligence_nodes
                         WHERE project_hash = ?1 AND kind = ?2
                         ORDER BY updated_at DESC
                         LIMIT ?3",
-            None => "SELECT id, kind, title, body, metadata, project_hash, session_id, created_at, updated_at
+            None => "SELECT id, kind, status, title, body, metadata, project_hash, session_id, created_at, updated_at
                      FROM intelligence_nodes
                      WHERE project_hash = ?1 AND kind IN ('fact', 'pattern')
                      ORDER BY updated_at DESC
@@ -1325,7 +1638,7 @@ impl Database {
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
             "SELECT
-                 n.id, n.kind, n.title, n.body, n.metadata, n.project_hash, n.session_id, n.created_at, n.updated_at,
+                 n.id, n.kind, n.status, n.title, n.body, n.metadata, n.project_hash, n.session_id, n.created_at, n.updated_at,
                  e.id, e.from_node_id, e.to_node_id, e.relation, e.weight, e.created_at
              FROM intelligence_edges e
              JOIN intelligence_nodes n ON (
@@ -1341,8 +1654,8 @@ impl Database {
             rusqlite::params![project_node.id, limit as i64],
             move |row| -> rusqlite::Result<_> {
                 let node = Self::read_intelligence_node(row)?;
-                let raw_from: String = row.get(10)?;
-                let raw_to: String = row.get(11)?;
+                let raw_from: String = row.get(11)?;
+                let raw_to: String = row.get(12)?;
                 // Reorient so from_node_id is always the queried project.
                 let (oriented_from, oriented_to) = if raw_from == project_id {
                     (raw_from, raw_to)
@@ -1350,12 +1663,12 @@ impl Database {
                     (raw_to, raw_from)
                 };
                 let edge = IntelligenceEdgeRecord {
-                    id: row.get(9)?,
+                    id: row.get(10)?,
                     from_node_id: oriented_from,
                     to_node_id: oriented_to,
-                    relation: row.get(12)?,
-                    weight: row.get(13)?,
-                    created_at: row.get(14)?,
+                    relation: row.get(13)?,
+                    weight: row.get(14)?,
+                    created_at: row.get(15)?,
                 };
                 Ok((node, edge))
             },
@@ -1583,6 +1896,7 @@ mod tests {
         IntelligenceNodeInput {
             id: Some(id.to_string()),
             kind: "fact".to_string(),
+            status: None,
             title: format!("Node {id}"),
             body: "Test body".to_string(),
             project_hash: Some("proj1".to_string()),
@@ -1672,7 +1986,7 @@ mod tests {
         db.upsert_intelligence_node(IntelligenceNodeInput {
             relations: Some(vec![IntelligenceRelationInput {
                 to_node_id: "a".to_string(),
-                relation: "supports".to_string(),
+                relation: "extends".to_string(),
                 weight: None,
             }]),
             ..sample_node_input("b")
@@ -1681,7 +1995,7 @@ mod tests {
         db.upsert_intelligence_node(IntelligenceNodeInput {
             relations: Some(vec![IntelligenceRelationInput {
                 to_node_id: "b".to_string(),
-                relation: "supports".to_string(),
+                relation: "extends".to_string(),
                 weight: None,
             }]),
             ..sample_node_input("c")
@@ -1705,7 +2019,7 @@ mod tests {
         db.upsert_intelligence_node(IntelligenceNodeInput {
             relations: Some(vec![IntelligenceRelationInput {
                 to_node_id: "a".to_string(),
-                relation: "supports".to_string(),
+                relation: "extends".to_string(),
                 weight: None,
             }]),
             ..sample_node_input("b")
@@ -1714,7 +2028,7 @@ mod tests {
         db.upsert_intelligence_node(IntelligenceNodeInput {
             relations: Some(vec![IntelligenceRelationInput {
                 to_node_id: "b".to_string(),
-                relation: "supports".to_string(),
+                relation: "extends".to_string(),
                 weight: None,
             }]),
             ..sample_node_input("c")
@@ -1745,7 +2059,7 @@ mod tests {
         db.upsert_intelligence_node(IntelligenceNodeInput {
             relations: Some(vec![IntelligenceRelationInput {
                 to_node_id: "a".to_string(),
-                relation: "supports".to_string(),
+                relation: "extends".to_string(),
                 weight: None,
             }]),
             ..sample_node_input("b")
@@ -1802,6 +2116,7 @@ mod tests {
             db.upsert_intelligence_node(IntelligenceNodeInput {
                 id: Some(id.to_string()),
                 kind: "fact".to_string(),
+                status: None,
                 title: "Original".to_string(),
                 body: "body".to_string(),
                 metadata: None,
@@ -1824,6 +2139,7 @@ mod tests {
             db.upsert_intelligence_node(IntelligenceNodeInput {
                 id: Some(id.to_string()),
                 kind: "fact".to_string(),
+                status: None,
                 title: format!("Node {id}"),
                 body: "body".to_string(),
                 metadata: None,
@@ -1849,6 +2165,7 @@ mod tests {
         db.upsert_intelligence_node(IntelligenceNodeInput {
             id: Some("xyz-0000-0000-0000-000000000001".to_string()),
             kind: "fact".to_string(),
+            status: None,
             title: "X".to_string(),
             body: "body".to_string(),
             metadata: None,
@@ -1874,6 +2191,7 @@ mod tests {
             db.upsert_intelligence_node(IntelligenceNodeInput {
                 id: Some(id.to_string()),
                 kind: "fact".to_string(),
+                status: None,
                 title: "N".to_string(),
                 body: "body".to_string(),
                 metadata: None,
@@ -1890,10 +2208,11 @@ mod tests {
     #[test]
     fn upsert_returns_created_true_for_new_node() {
         let db = test_db();
-        let (_record, created) = db
+        let (_record, created, _, _) = db
             .upsert_intelligence_node(IntelligenceNodeInput {
                 id: Some("new-node-1".to_string()),
                 kind: "fact".to_string(),
+                status: None,
                 title: "First".to_string(),
                 body: "body".to_string(),
                 metadata: None,
@@ -1912,6 +2231,7 @@ mod tests {
         db.upsert_intelligence_node(IntelligenceNodeInput {
             id: Some(id.to_string()),
             kind: "fact".to_string(),
+            status: None,
             title: "First".to_string(),
             body: "body".to_string(),
             metadata: None,
@@ -1920,10 +2240,11 @@ mod tests {
             relations: None,
         })
         .unwrap();
-        let (record, created) = db
+        let (record, created, _, _) = db
             .upsert_intelligence_node(IntelligenceNodeInput {
                 id: Some(id.to_string()),
                 kind: "fact".to_string(),
+                status: None,
                 title: "Updated".to_string(),
                 body: "body2".to_string(),
                 metadata: None,
@@ -1943,6 +2264,7 @@ mod tests {
         db.upsert_intelligence_node(IntelligenceNodeInput {
             id: Some(full.to_string()),
             kind: "fact".to_string(),
+            status: None,
             title: "Original".to_string(),
             body: "body".to_string(),
             metadata: None,
@@ -1954,10 +2276,11 @@ mod tests {
         // Simulate handler prefix resolution: 8-char prefix should resolve to full.
         let resolved = db.resolve_node_id_by_prefix("3a476c63").unwrap().unwrap();
         assert_eq!(resolved, full);
-        let (record, created) = db
+        let (record, created, _, _) = db
             .upsert_intelligence_node(IntelligenceNodeInput {
                 id: Some(resolved),
                 kind: "fact".to_string(),
+                status: None,
                 title: "Updated via prefix".to_string(),
                 body: "body2".to_string(),
                 metadata: None,
@@ -1983,6 +2306,7 @@ mod tests {
             db.upsert_intelligence_node(IntelligenceNodeInput {
                 id: Some(id.to_string()),
                 kind: "fact".to_string(),
+                status: None,
                 title: format!("Node {id}"),
                 body: "body".to_string(),
                 metadata: None,
@@ -2006,6 +2330,7 @@ mod tests {
         db.upsert_intelligence_node(IntelligenceNodeInput {
             id: Some(full.to_string()),
             kind: "fact".to_string(),
+            status: None,
             title: "Root".to_string(),
             body: "body".to_string(),
             metadata: None,
@@ -2026,6 +2351,7 @@ mod tests {
         db.upsert_intelligence_node(IntelligenceNodeInput {
             id: Some(full.to_string()),
             kind: "fact".to_string(),
+            status: None,
             title: "To delete".to_string(),
             body: "body".to_string(),
             metadata: None,
@@ -2048,25 +2374,26 @@ mod tests {
         // Seed pre-migration state directly in `intelligence_nodes`: 3
         // operational ids (the id prefixes the three writers use) plus 2
         // knowledge nodes. Before CM8 the writers wrote them this way.
+        // Raw SQL (not upsert): these rows predate the CM10 kind vocabulary,
+        // and the test guards the migration, not the write path.
         {
             let db = Database::new(&path).unwrap();
-            for id in ["run:abc", "sync:/tmp:agent1", "launchpad:uuid-1"] {
-                db.upsert_intelligence_node(IntelligenceNodeInput {
-                    id: Some(id.to_string()),
-                    kind: "session".to_string(),
-                    title: format!("Op {id}"),
-                    body: "op body".to_string(),
-                    metadata: None,
-                    project_hash: None,
-                    session_id: None,
-                    relations: None,
-                })
-                .unwrap();
+            {
+                let conn = db.conn.lock().unwrap();
+                for id in ["run:abc", "sync:/tmp:agent1", "launchpad:uuid-1"] {
+                    conn.execute(
+                        "INSERT INTO intelligence_nodes (id, kind, status, title, body, metadata, project_hash, session_id, created_at, updated_at)
+                         VALUES (?1, 'session', 'noted', ?2, 'op body', NULL, NULL, NULL, strftime('%s','now'), strftime('%s','now'))",
+                        rusqlite::params![id, format!("Op {id}")],
+                    )
+                    .unwrap();
+                }
             }
             for (id, kind) in [("fact1", "fact"), ("pattern1", "pattern")] {
                 db.upsert_intelligence_node(IntelligenceNodeInput {
                     id: Some(id.to_string()),
                     kind: kind.to_string(),
+                    status: None,
                     title: format!("Knowledge {id}"),
                     body: "knowledge body".to_string(),
                     metadata: None,
@@ -2198,6 +2525,7 @@ mod tests {
         db.upsert_intelligence_node(IntelligenceNodeInput {
             id: Some("fact-search".to_string()),
             kind: "fact".to_string(),
+            status: None,
             title: "UniqueSearchTerm Fact Title".to_string(),
             body: "body".to_string(),
             metadata: None,
@@ -2253,5 +2581,238 @@ mod tests {
             meta.get("source").and_then(|v| v.as_str()),
             Some("launchpad")
         );
+    }
+
+    // ── CM10: knowledge-node schema ──────────────────────────────────
+
+    #[test]
+    fn upsert_rejects_unknown_kind() {
+        let db = test_db();
+        let err = db
+            .upsert_intelligence_node(IntelligenceNodeInput {
+                kind: "unknown".to_string(),
+                ..sample_node_input("bad-kind")
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown node kind"),
+            "expected kind rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn upsert_rejects_unknown_status() {
+        let db = test_db();
+        let err = db
+            .upsert_intelligence_node(IntelligenceNodeInput {
+                status: Some("bogus".to_string()),
+                ..sample_node_input("bad-status")
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown node status"),
+            "expected status rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn upsert_defaults_status_to_noted() {
+        let db = test_db();
+        let (record, _, _, _) = db
+            .upsert_intelligence_node(sample_node_input("default-status"))
+            .unwrap();
+        assert_eq!(record.status, "noted");
+    }
+
+    #[test]
+    fn upsert_rejects_superseded_without_supersedes_edge() {
+        let db = test_db();
+        let err = db
+            .upsert_intelligence_node(IntelligenceNodeInput {
+                status: Some("superseded".to_string()),
+                ..sample_node_input("sup-no-edge")
+            })
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("superseded"), "expected superseded in: {msg}");
+        assert!(msg.contains("supersedes"), "expected supersedes in: {msg}");
+    }
+
+    #[test]
+    fn upsert_accepts_superseded_with_supersedes_edge() {
+        let db = test_db();
+        db.upsert_intelligence_node(sample_node_input("sup-a"))
+            .unwrap();
+        let (record, _, _, _) = db
+            .upsert_intelligence_node(IntelligenceNodeInput {
+                status: Some("superseded".to_string()),
+                relations: Some(vec![IntelligenceRelationInput {
+                    to_node_id: "sup-a".to_string(),
+                    relation: "supersedes".to_string(),
+                    weight: None,
+                }]),
+                ..sample_node_input("sup-b")
+            })
+            .unwrap();
+        assert_eq!(record.status, "superseded");
+    }
+
+    #[test]
+    fn upsert_rejects_unknown_edge_relation() {
+        let db = test_db();
+        db.upsert_intelligence_node(sample_node_input("rel-target"))
+            .unwrap();
+        let err = db
+            .upsert_intelligence_node(IntelligenceNodeInput {
+                relations: Some(vec![IntelligenceRelationInput {
+                    to_node_id: "rel-target".to_string(),
+                    relation: "related_to".to_string(),
+                    weight: None,
+                }]),
+                ..sample_node_input("rel-src")
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown edge relation"),
+            "expected edge rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_detection_shared_citations() {
+        let db = test_db();
+        db.upsert_intelligence_node(IntelligenceNodeInput {
+            body: "see src/foo.rs:42 for the implementation".to_string(),
+            ..sample_node_input("cite-a")
+        })
+        .unwrap();
+        let (_, _, duplicates, _) = db
+            .upsert_intelligence_node(IntelligenceNodeInput {
+                body: "also see src/foo.rs:42".to_string(),
+                ..sample_node_input("cite-b")
+            })
+            .unwrap();
+        assert!(
+            duplicates.iter().any(|n| n.id == "cite-a"),
+            "expected cite-a among duplicates, got: {:?}",
+            duplicates.iter().map(|n| &n.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn duplicate_detection_lexical_similarity() {
+        let db = test_db();
+        db.upsert_intelligence_node(IntelligenceNodeInput {
+            title: "Database connection cache".to_string(),
+            ..sample_node_input("lex-a")
+        })
+        .unwrap();
+        let (_, _, duplicates, _) = db
+            .upsert_intelligence_node(IntelligenceNodeInput {
+                title: "Database connection cache strategy".to_string(),
+                ..sample_node_input("lex-b")
+            })
+            .unwrap();
+        assert!(
+            duplicates.iter().any(|n| n.id == "lex-a"),
+            "expected lex-a among duplicates, got: {:?}",
+            duplicates.iter().map(|n| &n.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn undeclared_reference_warning() {
+        let db = test_db();
+        let node_a_id = "aaaaaaaa-1111-2222-3333-444444444444";
+        db.upsert_intelligence_node(IntelligenceNodeInput {
+            id: Some(node_a_id.to_string()),
+            ..sample_node_input("undecl-a")
+        })
+        .unwrap();
+        // `undecl-c` exists so `undecl-b` also exercises a declared edge
+        // alongside its undeclared reference.
+        db.upsert_intelligence_node(sample_node_input("undecl-c"))
+            .unwrap();
+        let (_, _, _, undeclared) = db
+            .upsert_intelligence_node(IntelligenceNodeInput {
+                body: format!("this builds on {node_a_id}"),
+                relations: Some(vec![IntelligenceRelationInput {
+                    to_node_id: "undecl-c".to_string(),
+                    relation: "extends".to_string(),
+                    weight: None,
+                }]),
+                ..sample_node_input("undecl-b")
+            })
+            .unwrap();
+        assert!(
+            undeclared.iter().any(|id| id == node_a_id),
+            "expected undeclared ref to {node_a_id}, got: {undeclared:?}"
+        );
+    }
+
+    #[test]
+    fn no_warning_for_node_without_edges() {
+        let db = test_db();
+        let (_, _, _, undeclared) = db
+            .upsert_intelligence_node(IntelligenceNodeInput {
+                body: "a fresh finding with no links".to_string(),
+                ..sample_node_input("orphan")
+            })
+            .unwrap();
+        assert!(
+            undeclared.is_empty(),
+            "expected no warning, got: {undeclared:?}"
+        );
+    }
+
+    #[test]
+    fn undeclared_reference_warns_even_without_declared_edges() {
+        let db = test_db();
+        let referenced = "bbbbbbbb-1111-2222-3333-444444444444";
+        db.upsert_intelligence_node(IntelligenceNodeInput {
+            id: Some(referenced.to_string()),
+            ..sample_node_input("referenced")
+        })
+        .unwrap();
+
+        let (_, _, _, undeclared) = db
+            .upsert_intelligence_node(IntelligenceNodeInput {
+                body: format!("this builds on {referenced}"),
+                relations: None,
+                ..sample_node_input("unlinked")
+            })
+            .unwrap();
+
+        assert_eq!(undeclared, vec![referenced.to_string()]);
+    }
+
+    #[test]
+    fn project_kind_exempt_from_kind_validation() {
+        let db = test_db();
+        let (record, _, _, _) = db
+            .upsert_intelligence_node(IntelligenceNodeInput {
+                kind: "project".to_string(),
+                ..sample_node_input("proj-exempt")
+            })
+            .unwrap();
+        assert_eq!(record.kind, "project");
+    }
+
+    #[test]
+    fn status_preserved_on_update_when_not_provided() {
+        let db = test_db();
+        db.upsert_intelligence_node(IntelligenceNodeInput {
+            status: Some("verified".to_string()),
+            ..sample_node_input("keep-status")
+        })
+        .unwrap();
+        let (record, created, _, _) = db
+            .upsert_intelligence_node(IntelligenceNodeInput {
+                title: "Updated title".to_string(),
+                ..sample_node_input("keep-status")
+            })
+            .unwrap();
+        assert!(!created);
+        assert_eq!(record.status, "verified");
     }
 }

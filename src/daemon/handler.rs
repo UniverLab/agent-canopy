@@ -3431,6 +3431,7 @@ impl TaskTriggerHandler {
         let node = crate::db::intelligence::IntelligenceNodeInput {
             id: resolved_id,
             kind: params.node_data.kind,
+            status: params.node_data.status,
             title: params.node_data.title,
             body: params.node_data.body,
             metadata: params.node_data.metadata,
@@ -3450,7 +3451,7 @@ impl TaskTriggerHandler {
             }),
         };
 
-        let (record, created) = self
+        let (record, created, duplicate_candidates, undeclared_references) = self
             .db
             .upsert_intelligence_node(node)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -3458,6 +3459,8 @@ impl TaskTriggerHandler {
         let mut out = serde_json::json!({
             "node": intelligence_node_json(&record),
             "created": created,
+            "duplicate_detection_note":
+                crate::db::intelligence::LEXICAL_DUPLICATE_LIMITATION,
         });
         if created {
             if let Some(bad_id) = unresolved_explicit_id {
@@ -3468,6 +3471,18 @@ impl TaskTriggerHandler {
                     bad_id
                 ));
             }
+        }
+        if !duplicate_candidates.is_empty() {
+            out["duplicate_candidates"] = serde_json::json!(duplicate_candidates
+                .iter()
+                .map(intelligence_node_json)
+                .collect::<Vec<_>>());
+            out["duplicate_warning"] = serde_json::json!(
+                "Potential duplicate(s) found; review duplicate_candidates before recording another node."
+            );
+        }
+        if !undeclared_references.is_empty() {
+            out["undeclared_references"] = serde_json::json!(undeclared_references);
         }
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -8231,6 +8246,7 @@ fn intelligence_node_json(
     serde_json::json!({
         "id": node.id,
         "kind": node.kind,
+        "status": node.status,
         "title": node.title,
         "body": node.body,
         "metadata": node.metadata,
@@ -20297,6 +20313,7 @@ mod endpoint_tests {
                     node_data: IntelligenceNodeParams {
                         id: Some("fact-1".to_string()),
                         kind: "fact".to_string(),
+                        status: None,
                         title: "Rust is memory safe".to_string(),
                         body: "Ownership rules prevent data races.".to_string(),
                         metadata: None,
@@ -20317,6 +20334,7 @@ mod endpoint_tests {
                     node_data: IntelligenceNodeParams {
                         id: Some("fact-2".to_string()),
                         kind: "fact".to_string(),
+                        status: None,
                         title: "Ownership rules".to_string(),
                         body: "One owner at a time.".to_string(),
                         metadata: None,
@@ -20324,7 +20342,7 @@ mod endpoint_tests {
                         session_id: None,
                         relations: Some(vec![IntelligenceRelationParams {
                             to_node_id: "fact-1".to_string(),
-                            relation: "supports".to_string(),
+                            relation: "extends".to_string(),
                             weight: Some(1.0),
                         }]),
                     },
@@ -20384,6 +20402,7 @@ mod endpoint_tests {
                     node_data: IntelligenceNodeParams {
                         id: Some(id.to_string()),
                         kind: "fact".to_string(),
+                        status: None,
                         title: title.to_string(),
                         body: "Test body".to_string(),
                         metadata: None,
@@ -20411,7 +20430,7 @@ mod endpoint_tests {
             "Node B",
             Some(vec![IntelligenceRelationParams {
                 to_node_id: "delete-a".to_string(),
-                relation: "supports".to_string(),
+                relation: "extends".to_string(),
                 weight: None,
             }]),
         )
@@ -20422,7 +20441,7 @@ mod endpoint_tests {
             "Node C",
             Some(vec![IntelligenceRelationParams {
                 to_node_id: "delete-b".to_string(),
-                relation: "supports".to_string(),
+                relation: "extends".to_string(),
                 weight: None,
             }]),
         )
@@ -20512,7 +20531,7 @@ mod endpoint_tests {
             "Node B",
             Some(vec![IntelligenceRelationParams {
                 to_node_id: "rel-a".to_string(),
-                relation: "supports".to_string(),
+                relation: "extends".to_string(),
                 weight: None,
             }]),
         )
@@ -20704,6 +20723,7 @@ mod endpoint_tests {
             db.upsert_intelligence_node(crate::db::intelligence::IntelligenceNodeInput {
                 id: Some(id.to_string()),
                 kind: "fact".to_string(),
+                status: None,
                 title: title.to_string(),
                 body: format!("{title} body"),
                 metadata: None,
@@ -21096,6 +21116,7 @@ mod endpoint_tests {
                     node_data: IntelligenceNodeParams {
                         id: Some("brand-new-node-1".to_string()),
                         kind: "fact".to_string(),
+                        status: None,
                         title: "First time".to_string(),
                         body: "body".to_string(),
                         metadata: None,
@@ -21133,6 +21154,7 @@ mod endpoint_tests {
                     node_data: IntelligenceNodeParams {
                         id: Some("update-me-1".to_string()),
                         kind: "fact".to_string(),
+                        status: None,
                         title: "Original".to_string(),
                         body: "v1".to_string(),
                         metadata: None,
@@ -21158,6 +21180,7 @@ mod endpoint_tests {
                     node_data: IntelligenceNodeParams {
                         id: Some("update-me-1".to_string()),
                         kind: "fact".to_string(),
+                        status: None,
                         title: "Updated".to_string(),
                         body: "v2".to_string(),
                         metadata: None,
@@ -21197,6 +21220,7 @@ mod endpoint_tests {
                     node_data: IntelligenceNodeParams {
                         id: Some(full_id.to_string()),
                         kind: "fact".to_string(),
+                        status: None,
                         title: "Original".to_string(),
                         body: "v1".to_string(),
                         metadata: None,
@@ -21217,6 +21241,7 @@ mod endpoint_tests {
                     node_data: IntelligenceNodeParams {
                         id: Some("3a476c63".to_string()),
                         kind: "fact".to_string(),
+                        status: None,
                         title: "Updated via prefix".to_string(),
                         body: "v2".to_string(),
                         metadata: None,
@@ -21282,6 +21307,7 @@ mod endpoint_tests {
                         node_data: IntelligenceNodeParams {
                             id: Some(id.to_string()),
                             kind: "fact".to_string(),
+                            status: None,
                             title: format!("Node {id}"),
                             body: "body".to_string(),
                             metadata: None,
@@ -21303,6 +21329,7 @@ mod endpoint_tests {
                     node_data: IntelligenceNodeParams {
                         id: Some("abc".to_string()),
                         kind: "fact".to_string(),
+                        status: None,
                         title: "Should fail".to_string(),
                         body: "body".to_string(),
                         metadata: None,
@@ -21347,6 +21374,7 @@ mod endpoint_tests {
                     node_data: IntelligenceNodeParams {
                         id: Some(full_id.to_string()),
                         kind: "fact".to_string(),
+                        status: None,
                         title: "Walk me".to_string(),
                         body: "body".to_string(),
                         metadata: None,
@@ -21392,6 +21420,7 @@ mod endpoint_tests {
                     node_data: IntelligenceNodeParams {
                         id: Some(full_id.to_string()),
                         kind: "fact".to_string(),
+                        status: None,
                         title: "Delete me by prefix".to_string(),
                         body: "body".to_string(),
                         metadata: None,

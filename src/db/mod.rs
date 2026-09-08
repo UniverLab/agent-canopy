@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 /// guards can't detect (they'd silently recreate the old names as empty
 /// rather than erroring) — see `check_schema_version`. Version 2 is the
 /// legacy queue-table rename (see `migrate_legacy_queue_schema`).
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Thread-safe `SQLite` database wrapper.
 ///
@@ -337,6 +337,7 @@ impl Database {
             CREATE TABLE IF NOT EXISTS intelligence_nodes (
                 id TEXT PRIMARY KEY,
                 kind TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'noted',
                 title TEXT NOT NULL,
                 body TEXT NOT NULL,
                 metadata TEXT,
@@ -673,8 +674,8 @@ impl Database {
         // to copy.
         // Reversible as long as `operational_sessions` isn't dropped:
         //   INSERT OR REPLACE INTO intelligence_nodes
-        //     (id, kind, title, body, metadata, project_hash, session_id, created_at, updated_at)
-        //   SELECT id, 'session', title, body, metadata, project_hash, session_id, created_at, updated_at
+        //     (id, kind, status, title, body, metadata, project_hash, session_id, created_at, updated_at)
+        //   SELECT id, 'session', 'noted', title, body, metadata, project_hash, session_id, created_at, updated_at
         //   FROM operational_sessions;
         conn.execute_batch(
             "INSERT OR REPLACE INTO operational_sessions (id, title, body, metadata, project_hash, session_id, created_at, updated_at)
@@ -685,6 +686,24 @@ impl Database {
                 WHERE id LIKE 'run:%' OR id LIKE 'sync:%' OR id LIKE 'launchpad:%';",
         )
         .map_err(|e| anyhow::anyhow!("operational_sessions migration failed: {e}"))?;
+
+        // CM10: knowledge-node status. All pre-existing nodes backfill to
+        // 'noted' via the column default. Idempotent pragma guard, same
+        // pattern as the scheduled_sends.workdir migration below.
+        let has_intelligence_status: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('intelligence_nodes') WHERE name = 'status'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_intelligence_status {
+            conn.execute(
+                "ALTER TABLE intelligence_nodes ADD COLUMN status TEXT NOT NULL DEFAULT 'noted'",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
 
         // `workdir` records which project a scheduled send targeted so a
         // dead-target failure can be preserved per-project for U8's recall.

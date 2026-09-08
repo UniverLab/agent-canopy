@@ -736,6 +736,7 @@ mod tests {
         db.upsert_intelligence_node(crate::db::intelligence::IntelligenceNodeInput {
             id: None,
             kind: "fact".to_string(),
+            status: None,
             title: "x".to_string(),
             body: "y".to_string(),
             metadata: None,
@@ -954,6 +955,7 @@ mod tests {
         db.upsert_intelligence_node(crate::db::intelligence::IntelligenceNodeInput {
             id: None,
             kind: "fact".to_string(),
+            status: None,
             title: "c".to_string(),
             body: "d".to_string(),
             metadata: None,

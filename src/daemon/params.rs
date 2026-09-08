@@ -242,8 +242,11 @@ fn arbitrary_json_value_schema(_generator: &mut schemars::SchemaGenerator) -> sc
 pub struct IntelligenceNodeParams {
     /// Optional stable node ID. If omitted, a new UUID is generated.
     pub id: Option<String>,
-    /// Node kind: project, session, fact, or pattern.
+    /// Node kind: fact, pattern, idea, decision, or defect. Structural: project.
     pub kind: String,
+    /// Node status: noted, verified, resolved, superseded, or deprecated.
+    /// Defaults to 'noted' if omitted on create.
+    pub status: Option<String>,
     /// Human-readable title for the node.
     pub title: String,
     /// Main body/content of the node.

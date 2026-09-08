@@ -73,6 +73,7 @@ fn save_knowledge_dialog(app: &mut App) -> anyhow::Result<()> {
     let input = IntelligenceNodeInput {
         id: dialog.edit_id.clone(),
         kind: dialog.kind_str().to_string(),
+        status: Some("noted".to_string()),
         title: dialog.title.clone(),
         body: dialog.body.clone(),
         metadata: None,

@@ -5338,6 +5338,7 @@ mod tests {
             crate::db::intelligence::IntelligenceNodeRecord {
                 id: "n1".into(),
                 kind: "fact".into(),
+                status: "noted".into(),
                 title: "Fact One".into(),
                 body: "body one".into(),
                 metadata: None,
@@ -5349,6 +5350,7 @@ mod tests {
             crate::db::intelligence::IntelligenceNodeRecord {
                 id: "n2".into(),
                 kind: "pattern".into(),
+                status: "noted".into(),
                 title: "Pattern Two".into(),
                 body: "body two".into(),
                 metadata: None,
@@ -5372,6 +5374,7 @@ mod tests {
             crate::db::intelligence::IntelligenceNodeRecord {
                 id: "n1".into(),
                 kind: "fact".into(),
+                status: "noted".into(),
                 title: "Rust Ownership".into(),
                 body: "body".into(),
                 metadata: None,
@@ -5383,6 +5386,7 @@ mod tests {
             crate::db::intelligence::IntelligenceNodeRecord {
                 id: "n2".into(),
                 kind: "fact".into(),
+                status: "noted".into(),
                 title: "Python GIL".into(),
                 body: "body".into(),
                 metadata: None,
@@ -5405,6 +5409,7 @@ mod tests {
         app.project_knowledge = vec![crate::db::intelligence::IntelligenceNodeRecord {
             id: "n1".into(),
             kind: "fact".into(),
+            status: "noted".into(),
             title: "Title".into(),
             body: "contains the word pattern".into(),
             metadata: None,
@@ -5427,6 +5432,7 @@ mod tests {
             crate::db::intelligence::IntelligenceNodeRecord {
                 id: "n1".into(),
                 kind: "fact".into(),
+                status: "noted".into(),
                 title: "Title".into(),
                 body: "body".into(),
                 metadata: None,
@@ -5438,6 +5444,7 @@ mod tests {
             crate::db::intelligence::IntelligenceNodeRecord {
                 id: "n2".into(),
                 kind: "pattern".into(),
+                status: "noted".into(),
                 title: "Title".into(),
                 body: "body".into(),
                 metadata: None,
@@ -5460,6 +5467,7 @@ mod tests {
         app.project_knowledge = vec![crate::db::intelligence::IntelligenceNodeRecord {
             id: "n1".into(),
             kind: "fact".into(),
+            status: "noted".into(),
             title: "Title".into(),
             body: "body".into(),
             metadata: None,
@@ -6188,6 +6196,7 @@ mod tests {
             crate::db::intelligence::IntelligenceNodeRecord {
                 id: "n1".into(),
                 kind: "fact".into(),
+                status: "noted".into(),
                 title: "Alpha".into(),
                 body: "body".into(),
                 metadata: None,
@@ -6199,6 +6208,7 @@ mod tests {
             crate::db::intelligence::IntelligenceNodeRecord {
                 id: "n2".into(),
                 kind: "fact".into(),
+                status: "noted".into(),
                 title: "Beta".into(),
                 body: "body".into(),
                 metadata: None,
