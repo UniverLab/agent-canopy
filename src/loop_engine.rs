@@ -5343,7 +5343,8 @@ fn refuse_unbindable_template(
     Err(anyhow!(
         "Node '{}' prompt template carries {} no binding covers ({}). Refusing to spawn \
          rather than send an agent a template it would read as an instruction — fix the \
-         template or preset so every {{{{...}}}} marker is one the engine substitutes.",
+         template or preset so every {{{{...}}}} marker is one the engine substitutes, \
+         or write a marker meant as text escaped as \\{{{{...}}}}.",
         node_name,
         if unbindable.len() == 1 {
             "a placeholder"
@@ -5354,33 +5355,28 @@ fn refuse_unbindable_template(
     ))
 }
 
+/// Substitute `{{output:Name}}` markers via the shared escape-aware renderer
+/// ([`crate::domain::prompts::render_template`]): escaped markers stay literal,
+/// every other `{{...}}` marker passes through untouched. Kept as the focused
+/// unit for output substitution; the prompt renderers below inline the same
+/// helper with their full binding set so bound values are never rescanned.
+#[allow(dead_code)]
 fn substitute_named_outputs(
     template: &str,
     node_outputs: &HashMap<String, Value>,
     all_node_names: &[String],
 ) -> String {
-    let mut result = template.to_string();
-    let mut search_from = 0;
-    while let Some(rel_start) = result[search_from..].find("{{output:") {
-        let abs_start = search_from + rel_start;
-        let after_prefix = &result[abs_start + 9..];
-        if let Some(end_offset) = after_prefix.find("}}") {
-            let node_name = &after_prefix[..end_offset];
-            let replacement = if let Some(output) = node_outputs.get(node_name) {
+    crate::domain::prompts::render_template(template, |raw| {
+        raw.strip_prefix("output:").map(|node_name| {
+            if let Some(output) = node_outputs.get(node_name) {
                 serde_json::to_string_pretty(output).unwrap_or_else(|_| "(none)".to_string())
             } else if all_node_names.iter().any(|n| n == node_name) {
                 "(not yet executed)".to_string()
             } else {
                 "(unknown node)".to_string()
-            };
-            let abs_end = abs_start + 9 + end_offset + 2;
-            result.replace_range(abs_start..abs_end, &replacement);
-            search_from = abs_start + replacement.len();
-        } else {
-            break;
-        }
-    }
-    result
+            }
+        })
+    })
 }
 
 /// The only `{{...}}` markers [`render_agent_prompt`] can bind. A resolved
@@ -5422,15 +5418,24 @@ fn render_agent_prompt(
         .unwrap_or_else(|| "(none)".to_string());
     let previous_feedback = bound_previous_feedback(previous_feedback);
     let spec_content = spec.description.as_deref().unwrap_or(&spec.name);
-    let prompt = prompt_template
-        .replace("{{loop_name}}", &lp.name)
-        .replace("{{workdir}}", workdir)
-        .replace("{{spec_id}}", &spec.id)
-        .replace("{{spec_name}}", &spec.name)
-        .replace("{{spec_content}}", spec_content)
-        .replace("{{node_id}}", &node.id)
-        .replace("{{previous_feedback}}", &previous_feedback);
-    let prompt = substitute_named_outputs(&prompt, node_outputs, all_node_names);
+    let prompt = crate::domain::prompts::render_template(prompt_template, |raw| match raw {
+        "loop_name" => Some(lp.name.clone()),
+        "workdir" => Some(workdir.to_string()),
+        "spec_id" => Some(spec.id.clone()),
+        "spec_name" => Some(spec.name.clone()),
+        "spec_content" => Some(spec_content.to_string()),
+        "node_id" => Some(node.id.clone()),
+        "previous_feedback" => Some(previous_feedback.clone()),
+        _ => raw.strip_prefix("output:").map(|node_name| {
+            if let Some(output) = node_outputs.get(node_name) {
+                serde_json::to_string_pretty(output).unwrap_or_else(|_| "(none)".to_string())
+            } else if all_node_names.iter().any(|n| n == node_name) {
+                "(not yet executed)".to_string()
+            } else {
+                "(unknown node)".to_string()
+            }
+        }),
+    });
 
     // A spec picked up in `Interrupted` status has a previous attempt's
     // partial work sitting in `workdir` — the engine no longer `git stash`es
@@ -5532,20 +5537,28 @@ fn render_resume_prompt(
         .unwrap_or_else(|| "(none)".to_string());
     let previous_feedback = bound_previous_feedback(previous_feedback);
     let spec_content = spec.description.as_deref().unwrap_or(&spec.name);
-    let prompt = template
-        .replace("{{loop_name}}", &lp.name)
-        .replace("{{workdir}}", workdir)
-        .replace("{{spec_id}}", &spec.id)
-        .replace("{{spec_name}}", &spec.name)
-        .replace("{{spec_content}}", spec_content)
-        .replace("{{node}}", &node.name)
-        .replace("{{node_id}}", &node.id)
-        .replace("{{run_id}}", run_id)
-        .replace("{{previous_feedback}}", &previous_feedback);
-    Ok(substitute_named_outputs(
-        &prompt,
-        node_outputs,
-        all_node_names,
+    Ok(crate::domain::prompts::render_template(
+        template,
+        |raw| match raw {
+            "loop_name" => Some(lp.name.clone()),
+            "workdir" => Some(workdir.to_string()),
+            "spec_id" => Some(spec.id.clone()),
+            "spec_name" => Some(spec.name.clone()),
+            "spec_content" => Some(spec_content.to_string()),
+            "node" => Some(node.name.clone()),
+            "node_id" => Some(node.id.clone()),
+            "run_id" => Some(run_id.to_string()),
+            "previous_feedback" => Some(previous_feedback.clone()),
+            _ => raw.strip_prefix("output:").map(|node_name| {
+                if let Some(output) = node_outputs.get(node_name) {
+                    serde_json::to_string_pretty(output).unwrap_or_else(|_| "(none)".to_string())
+                } else if all_node_names.iter().any(|n| n == node_name) {
+                    "(not yet executed)".to_string()
+                } else {
+                    "(unknown node)".to_string()
+                }
+            }),
+        },
     ))
 }
 
@@ -5600,10 +5613,15 @@ fn render_completion_hook_prompt(
             .join("\n")
     };
 
-    Ok(prompt_template
-        .replace("{{loop_name}}", &lp.name)
-        .replace("{{workdir}}", workdir)
-        .replace("{{completed_specs}}", &completed_specs_text))
+    Ok(crate::domain::prompts::render_template(
+        prompt_template,
+        |raw| match raw {
+            "loop_name" => Some(lp.name.clone()),
+            "workdir" => Some(workdir.to_string()),
+            "completed_specs" => Some(completed_specs_text.clone()),
+            _ => None,
+        },
+    ))
 }
 
 /// The only `{{...}}` markers [`render_completion_hook_prompt`] can bind; a
@@ -18407,6 +18425,240 @@ echo done
         assert!(
             err_msg.contains("custom_var"),
             "error must name the unbindable placeholder: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("\\{{...}}"),
+            "refusal must name the escape form: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn render_agent_prompt_spawns_with_an_escaped_unknown_marker() {
+        let lp = crate::domain::loops::Loop {
+            archived: false,
+            paused_by_reconciliation: false,
+            infra_node_id: None,
+            id: "wf".to_string(),
+            name: "Loop".to_string(),
+            description: None,
+            workdir: "/tmp/project".to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        };
+        let spec = LoopSpec {
+            id: "spec".to_string(),
+            loop_id: Some("wf".to_string()),
+            name: "Spec".to_string(),
+            description: Some("do the thing".to_string()),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        let node = LoopNode {
+            id: "node-1".to_string(),
+            spec_id: Some("spec".to_string()),
+            loop_id: None,
+            name: "Final review (kilo)".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+        let template = "Fail when an unsubstituted template marker like \\{{something}} \
+            appears in a touched file. Spec: {{spec_content}}";
+
+        let prompt = render_agent_prompt(
+            &lp,
+            &spec,
+            &node,
+            template,
+            None,
+            "/tmp/project",
+            "run-1",
+            &HashMap::new(),
+            &[],
+        )
+        .unwrap();
+
+        assert!(
+            prompt.contains("{{something}}"),
+            "rendered prompt must contain the literal marker: {prompt}"
+        );
+        assert!(
+            !prompt.contains("\\{{something}}"),
+            "escaping backslash must be removed: {prompt}"
+        );
+        assert!(
+            prompt.contains("do the thing"),
+            "real bindings must still substitute: {prompt}"
+        );
+    }
+
+    #[test]
+    fn render_agent_prompt_escape_wins_over_a_real_binding() {
+        let lp = crate::domain::loops::Loop {
+            archived: false,
+            paused_by_reconciliation: false,
+            infra_node_id: None,
+            id: "wf".to_string(),
+            name: "Loop".to_string(),
+            description: None,
+            workdir: "/tmp/project".to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        };
+        let spec = LoopSpec {
+            id: "spec".to_string(),
+            loop_id: Some("wf".to_string()),
+            name: "Spec".to_string(),
+            description: Some("SPEC-BODY".to_string()),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        let node = LoopNode {
+            id: "node-1".to_string(),
+            spec_id: Some("spec".to_string()),
+            loop_id: None,
+            name: "Agent".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+
+        let prompt = render_agent_prompt(
+            &lp,
+            &spec,
+            &node,
+            "Literal \\{{spec_content}} here.",
+            None,
+            "/tmp/project",
+            "run-1",
+            &HashMap::new(),
+            &[],
+        )
+        .unwrap();
+
+        assert!(
+            prompt.contains("{{spec_content}}"),
+            "escaped binding must render as literal text: {prompt}"
+        );
+        assert!(
+            !prompt.contains("SPEC-BODY here."),
+            "escaped binding must not substitute the spec: {prompt}"
+        );
+    }
+
+    #[test]
+    fn escaped_output_marker_stays_literal_while_unescaped_still_substitutes() {
+        let mut node_outputs = HashMap::new();
+        node_outputs.insert(
+            "Architect".to_string(),
+            serde_json::json!({"plan": "build-it"}),
+        );
+        let all_nodes = vec!["Architect".to_string(), "Implementer".to_string()];
+
+        let escaped = substitute_named_outputs(
+            "Literal \\{{output:Architect}} here.",
+            &node_outputs,
+            &all_nodes,
+        );
+        assert_eq!(escaped, "Literal {{output:Architect}} here.");
+
+        let lp = crate::domain::loops::Loop {
+            archived: false,
+            paused_by_reconciliation: false,
+            infra_node_id: None,
+            id: "wf-test".to_string(),
+            name: "Loop".to_string(),
+            description: None,
+            workdir: "/tmp/project".to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        };
+        let spec = LoopSpec {
+            id: "spec".to_string(),
+            loop_id: Some(lp.id.clone()),
+            name: "Spec".to_string(),
+            description: Some("task".to_string()),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        let node = LoopNode {
+            id: "node-impl".to_string(),
+            spec_id: Some(spec.id.clone()),
+            loop_id: None,
+            name: "Implementer".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+        let prompt = render_agent_prompt(
+            &lp,
+            &spec,
+            &node,
+            "Follow this design: {{output:Architect}}",
+            None,
+            &lp.workdir,
+            "run-1",
+            &node_outputs,
+            &all_nodes,
+        )
+        .unwrap();
+        assert!(
+            prompt.contains("\"plan\": \"build-it\""),
+            "unescaped output marker must still substitute: {prompt}"
         );
     }
 
