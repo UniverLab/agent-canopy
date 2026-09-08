@@ -21,7 +21,7 @@
 //! endpoint (without daemon-side coordination).
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use reqwest::Client;
@@ -42,6 +42,16 @@ const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 /// was attached but the daemon has no record of it — e.g. after a restart
 /// wiped its in-memory session table.
 const SESSION_NOT_FOUND_MARKER: &str = "Session not found";
+
+/// Bounded reconnect budget for a single forwarded request while the daemon is
+/// unreachable (restart window). Exhausting it returns a distinct "daemon down"
+/// error; the next request starts a fresh budget.
+const RECONNECT_MAX_ATTEMPTS: u32 = 8;
+/// First backoff step; each subsequent step doubles up to `RECONNECT_BACKOFF_MAX`.
+const RECONNECT_BACKOFF_BASE: Duration = Duration::from_millis(250);
+/// Backoff ceiling — a bridge left against a permanently stopped daemon parks
+/// here between attempts instead of spinning.
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 /// A non-2xx response from the daemon's `/mcp` endpoint, carrying the status
 /// and body so callers can distinguish a dead-session 404 from other
@@ -74,6 +84,52 @@ fn is_session_not_found_error(err: &anyhow::Error) -> bool {
 
 fn http_status_of(err: &anyhow::Error) -> Option<reqwest::StatusCode> {
     err.downcast_ref::<DaemonHttpError>().map(|e| e.status)
+}
+
+/// Reconnect budget + backoff shape, injected so tests can run fast and assert
+/// on spacing without waiting real seconds.
+#[derive(Debug, Clone, Copy)]
+struct ReconnectPolicy {
+    max_attempts: u32,
+    backoff_base: Duration,
+    backoff_max: Duration,
+}
+
+impl Default for ReconnectPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: RECONNECT_MAX_ATTEMPTS,
+            backoff_base: RECONNECT_BACKOFF_BASE,
+            backoff_max: RECONNECT_BACKOFF_MAX,
+        }
+    }
+}
+
+fn reconnect_backoff(attempt: u32, policy: &ReconnectPolicy) -> Duration {
+    // `attempt` is 1-based: attempt 1 waits `backoff_base`, then doubling.
+    let shift = attempt.saturating_sub(1).min(10);
+    let scaled = policy.backoff_base.saturating_mul(1u32 << shift);
+    scaled.min(policy.backoff_max)
+}
+
+/// The daemon's `/mcp` endpoint could not be reached at all (connection refused,
+/// reset, or timed out) — as opposed to reachable but returning an HTTP error.
+/// This is the signal the reconnect loop backs off on.
+#[derive(Debug)]
+struct DaemonUnreachable {
+    detail: String,
+}
+
+impl std::fmt::Display for DaemonUnreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "canopy daemon unreachable: {}", self.detail)
+    }
+}
+
+impl std::error::Error for DaemonUnreachable {}
+
+fn is_daemon_unreachable(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<DaemonUnreachable>().is_some()
 }
 
 /// Best-effort JSON-RPC `method` extraction for diagnostics; never fails the
@@ -203,6 +259,32 @@ async fn daemon_reachable(port: u16) -> bool {
     .unwrap_or(false)
 }
 
+/// Everything `run_proxy_loop` must remember across requests so it can re-create
+/// a daemon-side MCP session on its own after a restart — without the client
+/// re-initializing.
+#[derive(Default)]
+struct ProxyState {
+    /// Last `mcp-session-id` handed back by the daemon.
+    session_id: Option<String>,
+    /// The client's own `initialize` request line, captured verbatim so it can
+    /// be replayed against a fresh daemon.
+    init_request: Option<String>,
+    /// The client's `notifications/initialized` line, replayed after a fresh
+    /// `initialize` so the daemon marks the new session ready.
+    initialized_notification: Option<String>,
+}
+
+/// Outcome of serving one client request when it did not produce messages.
+#[derive(Debug)]
+enum ServeError {
+    /// The daemon stayed unreachable for the whole reconnect budget. The string
+    /// is the ready-to-send, human-actionable message (names the endpoint, the
+    /// attempt count and the elapsed time).
+    DaemonUnreachable(String),
+    /// Any other failure (HTTP 5xx, unrecoverable dead session, body read, …).
+    Other(anyhow::Error),
+}
+
 async fn run_proxy_loop(port: u16, agent_id: &str) -> Result<()> {
     let endpoint = format!("http://127.0.0.1:{port}/mcp");
     let client = Client::new();
@@ -211,7 +293,8 @@ async fn run_proxy_loop(port: u16, agent_id: &str) -> Result<()> {
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
     let mut stdout = tokio::io::stdout();
-    let mut session_id: Option<String> = None;
+    let mut state = ProxyState::default();
+    let policy = ReconnectPolicy::default();
 
     #[cfg(unix)]
     let mut sig_hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
@@ -250,60 +333,45 @@ async fn run_proxy_loop(port: u16, agent_id: &str) -> Result<()> {
         }
 
         let method = jsonrpc_method(&line);
-        let mut session_attached = session_id.is_some();
 
-        let mut result = forward_request(
-            &client,
-            &endpoint,
-            agent_id,
-            seed_id.as_deref(),
-            &line,
-            session_id.as_deref(),
-        )
-        .await;
-
-        // A cached session only ever dies this way when the daemon restarted
-        // and lost its in-memory session table. Clear it and retry once
-        // without a session header so the daemon can start a new one; a
-        // second failure (e.g. the retried method isn't `initialize`, which
-        // is the only request rmcp accepts session-less) falls through to
-        // the normal error reporting below instead of looping.
-        if session_attached && matches!(&result, Err(err) if is_session_not_found_error(err)) {
-            eprintln!(
-                "canopy bridge: daemon session not found for method {method} \
-                 (daemon likely restarted); clearing cached session and retrying once"
-            );
-            session_id = None;
-            session_attached = false;
-            result = forward_request(
-                &client,
-                &endpoint,
-                agent_id,
-                seed_id.as_deref(),
-                &line,
-                None,
-            )
-            .await;
+        match method.as_str() {
+            "initialize" => state.init_request = Some(line.clone()),
+            "notifications/initialized" => state.initialized_notification = Some(line.clone()),
+            _ => {}
         }
 
-        match result {
-            Ok(reply) => {
-                if let Some(sid) = reply.session_id {
-                    session_id = Some(sid);
-                }
-                for message in reply.messages {
+        match serve_one_request(
+            &client,
+            &endpoint,
+            port,
+            agent_id,
+            seed_id.as_deref(),
+            &policy,
+            &mut state,
+            &line,
+            &method,
+        )
+        .await
+        {
+            Ok(messages) => {
+                for message in messages {
                     stdout.write_all(message.as_bytes()).await?;
                     stdout.write_all(b"\n").await?;
                 }
                 stdout.flush().await?;
             }
-            Err(err) => {
+            Err(ServeError::DaemonUnreachable(msg)) => {
+                eprintln!("canopy bridge: {msg} (method={method})");
+                let fallback = build_jsonrpc_daemon_error(&line, &msg);
+                stdout.write_all(fallback.as_bytes()).await?;
+                stdout.write_all(b"\n").await?;
+                stdout.flush().await?;
+            }
+            Err(ServeError::Other(err)) => {
                 let status = http_status_of(&err)
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "n/a".to_string());
-                eprintln!(
-                    "canopy bridge: {err} (status={status}, method={method}, session_attached={session_attached})"
-                );
+                eprintln!("canopy bridge: {err} (status={status}, method={method})");
                 let fallback = build_jsonrpc_transport_error(&line, &err.to_string());
                 stdout.write_all(fallback.as_bytes()).await?;
                 stdout.write_all(b"\n").await?;
@@ -312,7 +380,7 @@ async fn run_proxy_loop(port: u16, agent_id: &str) -> Result<()> {
         }
     }
 
-    close_daemon_session(&client, &endpoint, session_id.as_deref()).await;
+    close_daemon_session(&client, &endpoint, state.session_id.as_deref()).await;
     Ok(())
 }
 
@@ -348,10 +416,15 @@ async fn forward_request(
         request = request.header(MCP_SESSION_HEADER, sid);
     }
 
-    let response = request
-        .send()
-        .await
-        .context("failed to reach canopy daemon")?;
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(source) => {
+            return Err(DaemonUnreachable {
+                detail: source.to_string(),
+            }
+            .into());
+        }
+    };
     let status = response.status();
 
     let new_session_id = response
@@ -450,6 +523,168 @@ fn build_jsonrpc_transport_error(raw_request: &str, message: &str) -> String {
     .to_string()
 }
 
+/// FR2 + FR5: the message a client gets while the bridge cannot reach the daemon.
+/// Names the real cause (daemon not reachable at its port), that the bridge
+/// retried, how many times, over how long, and that it will retry again.
+fn build_daemon_unreachable_message(port: u16, attempts: u32, elapsed: Duration) -> String {
+    format!(
+        "canopy daemon not reachable at 127.0.0.1:{port}: the bridge retried \
+         {attempts} attempts over {:.1}s and will retry again on the next request \
+         (the daemon may be restarting — check `canopy doctor`)",
+        elapsed.as_secs_f64()
+    )
+}
+
+/// Like `build_jsonrpc_transport_error`, but puts the caller-supplied message in
+/// `error.message` (not a fixed "transport error" string) so the client sees the
+/// real cause. Distinct code so it is greppable in client logs.
+fn build_jsonrpc_daemon_error(raw_request: &str, message: &str) -> String {
+    let id = serde_json::from_str::<serde_json::Value>(raw_request)
+        .ok()
+        .and_then(|v| v.get("id").cloned())
+        .unwrap_or(serde_json::Value::Null);
+
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32001,
+            "message": message,
+        }
+    })
+    .to_string()
+}
+
+/// Mint a fresh daemon-side MCP session by replaying the client's own
+/// `initialize` (and then `notifications/initialized`). The replayed
+/// `initialize` response is intentionally discarded: the client already
+/// completed its handshake and must not receive a second `initialize` result.
+async fn reestablish_session(
+    client: &Client,
+    endpoint: &str,
+    agent_id: &str,
+    seed_id: Option<&str>,
+    init_request: &str,
+    initialized_notification: Option<&str>,
+) -> Result<String> {
+    let reply = forward_request(client, endpoint, agent_id, seed_id, init_request, None)
+        .await
+        .context("re-initializing the MCP session with the daemon failed")?;
+
+    let session_id = reply
+        .session_id
+        .context("daemon accepted the replayed initialize but returned no mcp-session-id")?;
+
+    if let Some(note) = initialized_notification {
+        // Best-effort: rmcp already marks the session usable on `initialize`.
+        let _ = forward_request(client, endpoint, agent_id, seed_id, note, Some(&session_id)).await;
+    }
+
+    Ok(session_id)
+}
+
+/// Serve exactly one client request line: forward it, recover a dead session by
+/// replaying `initialize`, and back off + retry through a daemon-restart window.
+/// Returns the JSON-RPC message(s) to write to stdout, or a `ServeError`.
+#[allow(clippy::too_many_arguments)]
+async fn serve_one_request(
+    client: &Client,
+    endpoint: &str,
+    port: u16,
+    agent_id: &str,
+    seed_id: Option<&str>,
+    policy: &ReconnectPolicy,
+    state: &mut ProxyState,
+    line: &str,
+    method: &str,
+) -> Result<Vec<String>, ServeError> {
+    let started = Instant::now();
+    let mut attempt: u32 = 0;
+
+    loop {
+        attempt += 1;
+
+        let mut result = forward_request(
+            client,
+            endpoint,
+            agent_id,
+            seed_id,
+            line,
+            state.session_id.as_deref(),
+        )
+        .await;
+
+        // Dead session => the daemon restarted and lost its session table. Replay
+        // the client's captured `initialize` to mint a new one, then retry this
+        // request. Gate on having an `init_request` to replay rather than on
+        // still holding a `session_id`: a connection-refused blip earlier in this
+        // same call (daemon down while the port was unbound) nulls `session_id`,
+        // and the recovery must still fire on the 404 that the restarted daemon
+        // returns for our now-sessionless forward. `initialize` itself is never
+        // recovered this way — it carries no session.
+        if method != "initialize"
+            && state.init_request.is_some()
+            && matches!(&result, Err(err) if is_session_not_found_error(err))
+        {
+            let init_line = state
+                .init_request
+                .clone()
+                .expect("init_request is Some per the guard above");
+            eprintln!(
+                "canopy bridge: daemon has no record of our session for {method} \
+                 (daemon likely restarted); re-initializing the MCP session"
+            );
+            match reestablish_session(
+                client,
+                endpoint,
+                agent_id,
+                seed_id,
+                &init_line,
+                state.initialized_notification.as_deref(),
+            )
+            .await
+            {
+                Ok(new_sid) => {
+                    state.session_id = Some(new_sid.clone());
+                    result =
+                        forward_request(client, endpoint, agent_id, seed_id, line, Some(&new_sid))
+                            .await;
+                }
+                Err(err) => result = Err(err),
+            }
+        }
+
+        match result {
+            Ok(reply) => {
+                if let Some(sid) = reply.session_id {
+                    state.session_id = Some(sid);
+                }
+                return Ok(reply.messages);
+            }
+            Err(err) if is_daemon_unreachable(&err) => {
+                // A full restart means any session we hold is already dead.
+                state.session_id = None;
+
+                if attempt >= policy.max_attempts {
+                    return Err(ServeError::DaemonUnreachable(
+                        build_daemon_unreachable_message(port, attempt, started.elapsed()),
+                    ));
+                }
+
+                let wait = reconnect_backoff(attempt, policy);
+                eprintln!(
+                    "canopy bridge: daemon not reachable at 127.0.0.1:{port} \
+                     (attempt {attempt}/{}); retrying in {:.1}s",
+                    policy.max_attempts,
+                    wait.as_secs_f64()
+                );
+                tokio::time::sleep(wait).await;
+            }
+            Err(err) => return Err(ServeError::Other(err)),
+        }
+    }
+}
+
 // ── Embedded fallback (daemon unavailable) ───────────────────────────────────
 
 async fn run_embedded_stdio(agent_id: &str, workdir: &str) -> Result<()> {
@@ -535,6 +770,144 @@ fn read_port_from_state(data_dir: &Path) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// A port that nothing is listening on: bind then drop, so a connect is refused.
+    async fn free_port() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
+    }
+
+    struct FakeInner {
+        session_id: String,
+        pid: u32,
+        init_count: usize,
+        got_initialized_notification: bool,
+        omit_session_header: bool,
+    }
+
+    #[derive(Clone)]
+    struct FakeDaemon {
+        inner: std::sync::Arc<Mutex<FakeInner>>,
+    }
+
+    fn new_fake_daemon() -> FakeDaemon {
+        FakeDaemon {
+            inner: std::sync::Arc::new(Mutex::new(FakeInner {
+                session_id: "sess-1".to_string(),
+                pid: 1,
+                init_count: 0,
+                got_initialized_notification: false,
+                omit_session_header: false,
+            })),
+        }
+    }
+
+    /// A live stand-in for the daemon's `/mcp` route whose session table can be
+    /// swapped mid-test to simulate a restart. On `initialize` it mints
+    /// `inner.session_id` and returns it in the `mcp-session-id` header (unless
+    /// `omit_session_header`); on any other method it 404s "Session not found"
+    /// unless the request carries exactly `inner.session_id`. Split from the
+    /// spawner so a test can bind it to a specific (just-vacated) port.
+    fn fake_daemon_router(fake: FakeDaemon) -> axum::Router {
+        use axum::extract::{Request, State};
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+
+        async fn handle_mcp(
+            State(fake): State<FakeDaemon>,
+            request: Request,
+        ) -> axum::response::Response {
+            let (parts, body) = request.into_parts();
+            let bytes = axum::body::to_bytes(body, 64 * 1024)
+                .await
+                .unwrap_or_default();
+            let method = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(str::to_string))
+                .unwrap_or_default();
+            let req_session = parts
+                .headers
+                .get(MCP_SESSION_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+
+            let mut inner = fake.inner.lock().unwrap();
+            match method.as_str() {
+                "initialize" => {
+                    inner.init_count += 1;
+                    let sid = inner.session_id.clone();
+                    let body = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+                    if inner.omit_session_header {
+                        (
+                            axum::http::StatusCode::OK,
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            body,
+                        )
+                            .into_response()
+                    } else {
+                        (
+                            axum::http::StatusCode::OK,
+                            [
+                                (axum::http::header::CONTENT_TYPE, "application/json"),
+                                (
+                                    axum::http::header::HeaderName::from_static("mcp-session-id"),
+                                    sid.as_str(),
+                                ),
+                            ],
+                            body,
+                        )
+                            .into_response()
+                    }
+                }
+                "notifications/initialized" => {
+                    inner.got_initialized_notification = true;
+                    axum::http::StatusCode::ACCEPTED.into_response()
+                }
+                _ => {
+                    if req_session.as_deref() == Some(inner.session_id.as_str()) {
+                        (
+                            axum::http::StatusCode::OK,
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            format!(
+                                r#"{{"jsonrpc":"2.0","id":2,"result":{{"served_by_pid":{}}}}}"#,
+                                inner.pid
+                            ),
+                        )
+                            .into_response()
+                    } else {
+                        (
+                            axum::http::StatusCode::NOT_FOUND,
+                            "Not Found: Session not found",
+                        )
+                            .into_response()
+                    }
+                }
+            }
+        }
+
+        axum::Router::new()
+            .route("/mcp", post(handle_mcp))
+            .with_state(fake)
+    }
+
+    async fn spawn_stateful_fake_daemon() -> (u16, FakeDaemon, tokio::task::JoinHandle<()>) {
+        let fake = new_fake_daemon();
+        let router = fake_daemon_router(fake.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        (port, fake, handle)
+    }
+
+    const INIT_LINE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    const INITIALIZED_LINE: &str = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+    const TOOLS_LIST_LINE: &str = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
 
     // ── session-not-found classification ─────────────────────────
 
@@ -1230,5 +1603,396 @@ mod tests {
         let result = resolve_bridge_port(None);
         assert_eq!(result, 7755); // Should fall back to default
         std::env::remove_var("CANOPY_PORT");
+    }
+
+    // ── reconnect tests ─────────────────────────────────────────
+
+    /// Test A: bridge serves next call after daemon restart on same port
+    /// Covers spec guideline tests #1 (serves next call, no client restart)
+    /// and #3 (different PID served normally).
+    #[tokio::test]
+    async fn bridge_serves_next_call_after_daemon_restart_on_same_port() {
+        let (port, fake, _handle) = spawn_stateful_fake_daemon().await;
+        let endpoint = format!("http://127.0.0.1:{port}/mcp");
+        let client = Client::new();
+        let policy = ReconnectPolicy::default();
+        let mut state = ProxyState {
+            init_request: Some(INIT_LINE.into()),
+            ..Default::default()
+        };
+
+        // 1. Initialize
+        let msgs = serve_one_request(
+            &client,
+            &endpoint,
+            port,
+            "agent",
+            None,
+            &policy,
+            &mut state,
+            INIT_LINE,
+            "initialize",
+        )
+        .await
+        .expect("initialize must succeed");
+        assert!(!msgs.is_empty());
+        assert_eq!(state.session_id.as_deref(), Some("sess-1"));
+
+        // 2. Send initialized notification
+        state.initialized_notification = Some(INITIALIZED_LINE.into());
+        serve_one_request(
+            &client,
+            &endpoint,
+            port,
+            "agent",
+            None,
+            &policy,
+            &mut state,
+            INITIALIZED_LINE,
+            "notifications/initialized",
+        )
+        .await
+        .expect("notifications/initialized must succeed");
+
+        // 3. tools/list with session
+        let msgs = serve_one_request(
+            &client,
+            &endpoint,
+            port,
+            "agent",
+            None,
+            &policy,
+            &mut state,
+            TOOLS_LIST_LINE,
+            "tools/list",
+        )
+        .await
+        .expect("tools/list must succeed");
+        assert!(msgs[0].contains("\"served_by_pid\":1"));
+
+        // 4. Simulate daemon restart (new PID, new session table)
+        {
+            let mut i = fake.inner.lock().unwrap();
+            i.pid = 2;
+            i.session_id = "sess-2".into();
+            i.init_count = 0;
+            i.got_initialized_notification = false;
+        }
+
+        // 5. tools/list again — must succeed via re-initialization
+        let msgs2 = serve_one_request(
+            &client,
+            &endpoint,
+            port,
+            "agent",
+            None,
+            &policy,
+            &mut state,
+            TOOLS_LIST_LINE,
+            "tools/list",
+        )
+        .await
+        .expect("tools/list after restart must succeed");
+
+        assert_eq!(
+            fake.inner.lock().unwrap().init_count,
+            1,
+            "bridge must replay initialize exactly once"
+        );
+        assert_eq!(state.session_id.as_deref(), Some("sess-2"));
+        assert!(
+            msgs2[0].contains("\"served_by_pid\":2"),
+            "must be served by new PID"
+        );
+        assert!(
+            fake.inner.lock().unwrap().got_initialized_notification,
+            "bridge must send initialized notification"
+        );
+    }
+
+    /// Reproduces the measured scenario exactly: the daemon is fully stopped so
+    /// connects are refused, then the operator restarts it on the same port with
+    /// a fresh (empty) session table and a new PID. A bridge call that spans the
+    /// outage must still be served — no client restart, no re-registration.
+    ///
+    /// This also guards the regression where dead-session recovery was gated on
+    /// still holding a `session_id`: the connection-refused blip nulls it, so
+    /// without the fix the 404 from the restarted daemon falls through to a bare
+    /// transport error and the bridge never reconnects.
+    #[tokio::test]
+    async fn bridge_recovers_when_daemon_stops_then_restarts_on_same_port() {
+        // Reserve a port, then drop the listener so connects are refused.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let endpoint = format!("http://127.0.0.1:{port}/mcp");
+
+        let policy = ReconnectPolicy {
+            max_attempts: 50,
+            backoff_base: Duration::from_millis(25),
+            backoff_max: Duration::from_millis(50),
+        };
+        // The client already completed its handshake against the *old* daemon.
+        let mut state = ProxyState {
+            session_id: Some("sess-old".into()),
+            init_request: Some(INIT_LINE.into()),
+            initialized_notification: Some(INITIALIZED_LINE.into()),
+        };
+
+        // Bring a fresh daemon (new PID, new session id) up on the same port
+        // after a short outage.
+        let fake = new_fake_daemon();
+        {
+            let mut i = fake.inner.lock().unwrap();
+            i.pid = 2;
+            i.session_id = "sess-new".into();
+        }
+        let fake_for_task = fake.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let router = fake_daemon_router(fake_for_task);
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let msgs = serve_one_request(
+            &Client::new(),
+            &endpoint,
+            port,
+            "agent",
+            None,
+            &policy,
+            &mut state,
+            TOOLS_LIST_LINE,
+            "tools/list",
+        )
+        .await
+        .expect("bridge must recover after the daemon restarts on the same port");
+
+        assert!(
+            msgs[0].contains("\"served_by_pid\":2"),
+            "must be served by the restarted daemon: {msgs:?}"
+        );
+        assert_eq!(
+            state.session_id.as_deref(),
+            Some("sess-new"),
+            "bridge must hold a freshly minted session, not the stale one"
+        );
+        assert_eq!(
+            fake.inner.lock().unwrap().init_count,
+            1,
+            "bridge must replay initialize exactly once, not spin"
+        );
+    }
+
+    /// Test B: error while daemon is down names the daemon and retry
+    /// Covers spec guideline test #2.
+    #[tokio::test]
+    async fn bridge_error_while_daemon_down_names_daemon_and_retry() {
+        let port = free_port().await;
+        let endpoint = format!("http://127.0.0.1:{port}/mcp");
+        let policy = ReconnectPolicy {
+            max_attempts: 3,
+            backoff_base: Duration::from_millis(5),
+            backoff_max: Duration::from_millis(10),
+        };
+        let mut state = ProxyState::default();
+
+        let err = serve_one_request(
+            &Client::new(),
+            &endpoint,
+            port,
+            "agent",
+            None,
+            &policy,
+            &mut state,
+            TOOLS_LIST_LINE,
+            "tools/list",
+        )
+        .await
+        .expect_err("must fail when daemon is unreachable");
+
+        let msg = match err {
+            ServeError::DaemonUnreachable(m) => m,
+            other => panic!("expected DaemonUnreachable, got {other:?}"),
+        };
+        assert!(
+            msg.contains(&format!("127.0.0.1:{port}")),
+            "must name the daemon at its port: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("retr"),
+            "must state it retried: {msg}"
+        );
+        assert_ne!(msg, "canopy bridge transport error");
+
+        // Feed through client-facing builder
+        let v: serde_json::Value =
+            serde_json::from_str(&build_jsonrpc_daemon_error(TOOLS_LIST_LINE, &msg)).unwrap();
+        assert_eq!(v["error"]["message"], msg);
+        assert_eq!(v["id"], 2);
+        assert_ne!(v["error"]["message"], "canopy bridge transport error");
+    }
+
+    /// Test D: bounded failure when daemon never returns
+    /// Covers spec guideline test #4.
+    #[tokio::test]
+    async fn bridge_reports_bounded_failure_when_daemon_never_returns() {
+        let port = free_port().await;
+        let endpoint = format!("http://127.0.0.1:{port}/mcp");
+        let policy = ReconnectPolicy {
+            max_attempts: 3,
+            backoff_base: Duration::from_millis(5),
+            backoff_max: Duration::from_millis(10),
+        };
+
+        // First call
+        let err = tokio::time::timeout(
+            Duration::from_secs(2),
+            serve_one_request(
+                &Client::new(),
+                &endpoint,
+                port,
+                "agent",
+                None,
+                &policy,
+                &mut ProxyState::default(),
+                TOOLS_LIST_LINE,
+                "tools/list",
+            ),
+        )
+        .await
+        .expect("serve_one_request must return, not loop forever")
+        .expect_err("must fail");
+
+        let msg = match err {
+            ServeError::DaemonUnreachable(m) => m,
+            other => panic!("expected DaemonUnreachable, got {other:?}"),
+        };
+        assert!(
+            msg.contains("3 attempts"),
+            "must state bounded count: {msg}"
+        );
+        assert!(msg.contains("over"), "must report elapsed: {msg}");
+        assert!(msg.contains('s'), "must report seconds: {msg}");
+        assert_ne!(msg, "canopy bridge transport error");
+
+        // Second call — fresh state
+        let err2 = tokio::time::timeout(
+            Duration::from_secs(2),
+            serve_one_request(
+                &Client::new(),
+                &endpoint,
+                port,
+                "agent",
+                None,
+                &policy,
+                &mut ProxyState::default(),
+                TOOLS_LIST_LINE,
+                "tools/list",
+            ),
+        )
+        .await
+        .expect("second call must also return")
+        .expect_err("must fail again");
+
+        let msg2 = match err2 {
+            ServeError::DaemonUnreachable(m) => m,
+            other => panic!("expected DaemonUnreachable on second call, got {other:?}"),
+        };
+        assert!(
+            msg2.contains("3 attempts"),
+            "repeated call must give same bounded report: {msg2}"
+        );
+    }
+
+    /// Test E: reconnect attempts are spaced by backoff, not tight loop
+    /// Covers spec guideline test #5.
+    #[tokio::test]
+    async fn bridge_backs_off_between_reconnect_attempts() {
+        let port = free_port().await;
+        let endpoint = format!("http://127.0.0.1:{port}/mcp");
+        let policy = ReconnectPolicy {
+            max_attempts: 4,
+            backoff_base: Duration::from_millis(50),
+            backoff_max: Duration::from_millis(200),
+        };
+
+        let start = Instant::now();
+        let _ = serve_one_request(
+            &Client::new(),
+            &endpoint,
+            port,
+            "agent",
+            None,
+            &policy,
+            &mut ProxyState::default(),
+            TOOLS_LIST_LINE,
+            "tools/list",
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        // Sleeps after attempts 1, 2, 3 (not after 4th): 50ms + 100ms + 200ms = 350ms
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "reconnect must back off: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "backoff must stay bounded: {elapsed:?}"
+        );
+    }
+
+    /// Test F: reconnect_backoff grows and is bounded (pure unit)
+    #[test]
+    fn reconnect_backoff_grows_and_is_bounded() {
+        let p = ReconnectPolicy::default();
+        assert_eq!(reconnect_backoff(1, &p), Duration::from_millis(250));
+        assert_eq!(reconnect_backoff(2, &p), Duration::from_millis(500));
+        assert_eq!(reconnect_backoff(3, &p), Duration::from_millis(1000));
+        assert_eq!(reconnect_backoff(50, &p), RECONNECT_BACKOFF_MAX);
+        let mut prev = Duration::ZERO;
+        for a in 1..12 {
+            let d = reconnect_backoff(a, &p);
+            assert!(d >= prev, "monotonic non-decreasing");
+            assert!(d <= RECONNECT_BACKOFF_MAX, "never exceeds the ceiling");
+            prev = d;
+        }
+    }
+
+    /// Test G: reestablish_session replays initialize and returns new session
+    #[tokio::test]
+    async fn reestablish_session_replays_initialize_and_returns_new_session() {
+        let (port, fake, _handle) = spawn_stateful_fake_daemon().await;
+        let endpoint = format!("http://127.0.0.1:{port}/mcp");
+        let client = Client::new();
+        let sid = reestablish_session(
+            &client,
+            &endpoint,
+            "agent",
+            None,
+            INIT_LINE,
+            Some(INITIALIZED_LINE),
+        )
+        .await
+        .expect("replayed initialize must mint a session");
+        assert_eq!(sid, "sess-1");
+        assert_eq!(fake.inner.lock().unwrap().init_count, 1);
+        assert!(fake.inner.lock().unwrap().got_initialized_notification);
+    }
+
+    /// Test H: reestablish_session errors when daemon returns no session id
+    #[tokio::test]
+    async fn reestablish_session_errors_when_daemon_returns_no_session_id() {
+        let (port, fake, _handle) = spawn_stateful_fake_daemon().await;
+        fake.inner.lock().unwrap().omit_session_header = true;
+        let endpoint = format!("http://127.0.0.1:{port}/mcp");
+        let err = reestablish_session(&Client::new(), &endpoint, "agent", None, INIT_LINE, None)
+            .await
+            .expect_err("no mcp-session-id header must be an error, not a silent empty session");
+        assert!(format!("{err:#}").to_lowercase().contains("session"));
     }
 }
