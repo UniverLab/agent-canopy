@@ -1695,4 +1695,68 @@ mod preview_key_tests {
         assert!(!matches!(app.focus, Focus::ContextTransfer));
         app.interactive_agents[0].kill();
     }
+
+    // ── CT6: preview owns plain Up/Down regardless of child claim ────
+
+    fn app_with_two_claimed_interactive_sessions() -> App {
+        let first = spawn_cat_agent("ct6-first");
+        *first.kitty_keyboard_flags.lock().expect("lock") = Some(7);
+        let second = spawn_cat_agent("ct6-second");
+        second.vt.lock().expect("vt lock").process(b"\x1b[?1049h");
+        assert!(first.kitty_keyboard_negotiated());
+        assert!(second.in_alternate_screen());
+
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.interactive_agents = vec![first, second];
+        app.agents = vec![AgentEntry::Interactive(0), AgentEntry::Interactive(1)];
+        app.selected = 0;
+        app.focus = Focus::Preview;
+        app
+    }
+
+    #[test]
+    fn preview_down_navigates_despite_claimed_selected_child() {
+        // The selected session negotiated Kitty (Codex shape); plain Down
+        // must still move the preview selection, not reach the child.
+        let mut app = app_with_two_claimed_interactive_sessions();
+
+        handle_preview_key(&mut app, KeyCode::Down, KeyModifiers::NONE).unwrap();
+
+        assert_eq!(app.selected, 1);
+        assert!(matches!(app.focus, Focus::Preview));
+        app.interactive_agents[0].kill();
+        app.interactive_agents[1].kill();
+    }
+
+    #[test]
+    fn preview_up_navigates_despite_claimed_selected_child() {
+        // The selected session entered the alternate screen (vim shape);
+        // plain Up must still move the preview selection.
+        let mut app = app_with_two_claimed_interactive_sessions();
+        app.selected = 1;
+
+        handle_preview_key(&mut app, KeyCode::Up, KeyModifiers::NONE).unwrap();
+
+        assert_eq!(app.selected, 0);
+        assert!(matches!(app.focus, Focus::Preview));
+        app.interactive_agents[0].kill();
+        app.interactive_agents[1].kill();
+    }
+
+    #[test]
+    fn preview_enter_on_claimed_child_still_enters_focus() {
+        // Entering focus by keyboard is unchanged: log scroll resets and
+        // focus becomes Agent, exactly as for an unclaimed child.
+        let mut app = app_with_two_claimed_interactive_sessions();
+        app.log_scroll = 9;
+
+        handle_preview_key(&mut app, KeyCode::Enter, KeyModifiers::NONE).unwrap();
+
+        assert!(matches!(app.focus, Focus::Agent));
+        assert_eq!(app.log_scroll, 0);
+        app.interactive_agents[0].kill();
+        app.interactive_agents[1].kill();
+    }
 }

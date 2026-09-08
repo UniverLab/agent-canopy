@@ -266,6 +266,16 @@ fn currently_focused_target(app: &App) -> Option<FocusedAgent> {
 /// Codex (spec C23) negotiates Kitty without ever using the alternate
 /// screen, so either signal alone must be sufficient — neither is dropped.
 pub(crate) fn focused_child_claimed_keyboard(app: &App) -> bool {
+    // Ownership boundary (CT6): only the child in actual `Focus::Agent`
+    // owns the keyboard. A session merely selected/previewed in
+    // `Focus::Preview` never claims arrows — preview navigation owns them.
+    // This is why preview arrows were sometimes swallowed: without the
+    // focus gate, a previewed child in the alternate screen (or with Kitty
+    // keyboard flags negotiated) counted as "focused" and its claim reached
+    // preview-level dispatch.
+    if app.focus != Focus::Agent {
+        return false;
+    }
     let Some(target) = currently_focused_target(app) else {
         return false;
     };
@@ -1459,6 +1469,12 @@ mod focus_shortcuts_keyboard_claim_tests {
             "Ctrl+T is reserved for context transfer regardless of which \
              signal claimed the keyboard"
         );
+        // Opening the modal moved focus to ContextTransfer; re-establish
+        // Agent focus so the F4/F10 probes below still exercise the claimed
+        // focused child (in production the dispatcher re-routes by the new
+        // focus after a handled key, so a single call never evaluates later
+        // shortcuts under a mutated focus).
+        app.focus = Focus::Agent;
         assert!(!handle_focus_shortcuts(
             &mut app,
             KeyCode::F(4),
@@ -1545,5 +1561,98 @@ mod focus_shortcuts_keyboard_claim_tests {
 
         app.interactive_agents[0].kill();
         app.interactive_agents[1].kill();
+    }
+
+    // CT6 ownership matrix: only a *focused* child may claim the keyboard.
+    // A session merely selected in Preview never does — otherwise its
+    // alternate-screen/Kitty state swallows preview-level Up/Down and the
+    // arrows stop navigating between sessions.
+
+    #[test]
+    fn previewed_kitty_claimed_child_does_not_claim_keyboard() {
+        let agent = spawn_cat_agent("previewed-codex-like");
+        *agent.kitty_keyboard_flags.lock().expect("lock") = Some(7);
+        assert!(agent.kitty_keyboard_negotiated());
+        let mut app = app_with_interactive_agent(agent);
+        app.focus = Focus::Preview;
+
+        assert!(
+            !focused_child_claimed_keyboard(&app),
+            "a Kitty-negotiated child that is only previewed must not claim arrows"
+        );
+        app.interactive_agents[0].kill();
+    }
+
+    #[test]
+    fn previewed_alternate_screen_child_does_not_claim_keyboard() {
+        let agent = spawn_cat_agent("previewed-vim-like");
+        agent.vt.lock().expect("vt lock").process(b"\x1b[?1049h");
+        assert!(agent.in_alternate_screen());
+        let mut app = app_with_interactive_agent(agent);
+        app.focus = Focus::Preview;
+
+        assert!(
+            !focused_child_claimed_keyboard(&app),
+            "an alternate-screen child that is only previewed must not claim arrows"
+        );
+        app.interactive_agents[0].kill();
+    }
+
+    #[test]
+    fn focused_claimed_child_still_claims_keyboard() {
+        // The focus gate narrows the claim; it must not remove it. A claimed
+        // child in actual Agent focus still owns ordinary keys.
+        let agent = spawn_cat_agent("focused-codex-like");
+        *agent.kitty_keyboard_flags.lock().expect("lock") = Some(7);
+        let mut app = app_with_interactive_agent(agent);
+        assert!(matches!(app.focus, Focus::Agent));
+
+        assert!(focused_child_claimed_keyboard(&app));
+        app.interactive_agents[0].kill();
+    }
+
+    #[test]
+    fn previewed_claimed_child_does_not_block_unreserved_shortcuts() {
+        // Same ownership rule through `handle_focus_shortcuts`: with Preview
+        // focus, an unreserved key (Ctrl+S) reaches canopy even though the
+        // selected child negotiated Kitty — the claim cannot reach
+        // preview-level dispatch. Two sessions so the split picker can open.
+        let agent = spawn_cat_agent("previewed-ctrl-s");
+        *agent.kitty_keyboard_flags.lock().expect("lock") = Some(7);
+        let second = spawn_cat_agent("previewed-ctrl-s-2");
+        let mut app = app_with_interactive_agent(agent);
+        app.interactive_agents.push(second);
+        app.focus = Focus::Preview;
+
+        assert!(handle_focus_shortcuts(
+            &mut app,
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL
+        ));
+        assert!(app.split_picker_open);
+        app.interactive_agents[0].kill();
+        app.interactive_agents[1].kill();
+    }
+
+    #[test]
+    fn focused_claimed_child_still_yields_reserved_shift_arrows() {
+        // Shift+Up/Down stays canopy-owned inside a claimed focused session;
+        // the focus gate changes who may claim, not the reserved set.
+        let agent = spawn_cat_agent("focused-shift-arrows");
+        *agent.kitty_keyboard_flags.lock().expect("lock") = Some(7);
+        let mut app = app_with_interactive_agent(agent);
+        assert!(matches!(app.focus, Focus::Agent));
+
+        assert!(handle_focus_shortcuts(
+            &mut app,
+            KeyCode::Up,
+            KeyModifiers::SHIFT
+        ));
+        assert!(handle_focus_shortcuts(
+            &mut app,
+            KeyCode::Down,
+            KeyModifiers::SHIFT
+        ));
+        app.interactive_agents[0].kill();
     }
 }
