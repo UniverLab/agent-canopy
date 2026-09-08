@@ -101,13 +101,14 @@ stdio. Connect any MCP-capable AI CLI with `canopy mcp`.
 | `blueprint_create` | Create a reusable node config template |
 | `blueprint_delete` | Delete a custom blueprint (builtins protected) |
 
-## Project (3)
+## Project (4)
 
 | Tool | Description |
 |---|---|
-| `project_search` | Search the automatic project registry |
+| `project_search` | Search the project registry |
 | `project_update` | Update a project's registry entry |
 | `project_remap` | Remap a moved/renamed workdir instead of orphaning history |
+| `project_register` | Explicitly register a project directory (no marker file needed) |
 
 ## RAG (1)
 

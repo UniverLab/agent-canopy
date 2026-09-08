@@ -122,6 +122,11 @@ impl Database {
         // must exist as a kind='project' node or link_projects and the TUI
         // relation picker have nothing to operate on.
         self.ensure_project_node(p)?;
+        // Recompute derived containment (best-effort: never fail a register
+        // on a graph nicety).
+        if let Err(e) = self.rebuild_containment_edges() {
+            tracing::debug!("rebuild_containment_edges after upsert failed: {e}");
+        }
         Ok(())
     }
 
@@ -140,15 +145,31 @@ impl Database {
         Ok(project)
     }
 
+    /// Explicit registration entry point (the spec's "explicit call"):
+    /// canonicalizes `path` and registers it, marker file or not.
+    pub fn register_project_explicit(&self, path: &Path) -> Result<Project> {
+        self.register_project_path(path)
+    }
+
     pub fn delete_project(&self, hash: &str) -> Result<()> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        conn.execute(
-            "DELETE FROM projects WHERE hash=?1",
-            rusqlite::params![hash],
-        )?;
+        {
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+            conn.execute(
+                "DELETE FROM projects WHERE hash=?1",
+                rusqlite::params![hash],
+            )?;
+            // Remove the graph root node; incident edges CASCADE via FKs.
+            conn.execute(
+                "DELETE FROM intelligence_nodes WHERE id=?1",
+                rusqlite::params![format!("project:{hash}")],
+            )?;
+        }
+        if let Err(e) = self.rebuild_containment_edges() {
+            tracing::debug!("rebuild_containment_edges after delete failed: {e}");
+        }
         Ok(())
     }
 
@@ -338,101 +359,175 @@ impl Database {
     /// one project: either the whole re-key applied (and committed) or none
     /// of it did.
     pub fn remap_project(&self, old_hash: &str, new_canonical_path: &str) -> Result<RemapOutcome> {
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-        let tx = conn.transaction()?;
+        // Scope the connection guard: the post-commit containment rebuild
+        // re-locks the connection, so the guard must be dropped first
+        // (a held std Mutex guard here would deadlock).
+        let outcome = {
+            let mut conn = self
+                .conn
+                .lock()
+                .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+            let tx = conn.transaction()?;
 
-        let old_path: String = tx
-            .query_row(
-                "SELECT path FROM projects WHERE hash = ?1",
-                params![old_hash],
-                |row| row.get(0),
-            )
-            .map_err(|_| anyhow::anyhow!("No project registered with hash '{old_hash}'"))?;
+            let old_path: String = tx
+                .query_row(
+                    "SELECT path FROM projects WHERE hash = ?1",
+                    params![old_hash],
+                    |row| row.get(0),
+                )
+                .map_err(|_| anyhow::anyhow!("No project registered with hash '{old_hash}'"))?;
 
-        let new_hash = workdir_hash(new_canonical_path);
-        if new_hash == old_hash {
-            anyhow::bail!(
-                "New path resolves to the same project (hash unchanged) — nothing to remap"
-            );
+            let new_hash = workdir_hash(new_canonical_path);
+            if new_hash == old_hash {
+                anyhow::bail!(
+                    "New path resolves to the same project (hash unchanged) — nothing to remap"
+                );
+            }
+
+            let target_exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM projects WHERE hash = ?1)",
+                params![new_hash],
+                |row| row.get::<_, i64>(0),
+            )? != 0;
+            let kind = RemapKind::decide(target_exists);
+            let counts = count_remap_targets(&tx, &old_path, old_hash)?;
+
+            tx.execute(
+                "UPDATE interactive_sessions SET working_dir = ?2 WHERE working_dir = ?1",
+                params![old_path, new_canonical_path],
+            )?;
+            tx.execute(
+                "UPDATE terminal_sessions SET working_dir = ?2 WHERE working_dir = ?1",
+                params![old_path, new_canonical_path],
+            )?;
+            tx.execute(
+                "UPDATE loops SET workdir = ?2 WHERE workdir = ?1",
+                params![old_path, new_canonical_path],
+            )?;
+            tx.execute(
+                "UPDATE loop_specs SET workdir = ?2 WHERE workdir = ?1",
+                params![old_path, new_canonical_path],
+            )?;
+            tx.execute(
+                "UPDATE sync_messages SET workdir = ?2 WHERE workdir = ?1",
+                params![old_path, new_canonical_path],
+            )?;
+            tx.execute(
+                "UPDATE sync_locks SET workdir = ?2 WHERE workdir = ?1",
+                params![old_path, new_canonical_path],
+            )?;
+            tx.execute(
+                "UPDATE last_prompts SET workdir = ?2 WHERE workdir = ?1",
+                params![old_path, new_canonical_path],
+            )?;
+            tx.execute(
+                "UPDATE scheduled_sends SET workdir = ?2 WHERE workdir = ?1",
+                params![old_path, new_canonical_path],
+            )?;
+            tx.execute(
+                "UPDATE failed_scheduled_sends SET workdir = ?2 WHERE workdir = ?1",
+                params![old_path, new_canonical_path],
+            )?;
+            tx.execute(
+                "UPDATE agents SET working_dir = ?2 WHERE working_dir = ?1",
+                params![old_path, new_canonical_path],
+            )?;
+            tx.execute(
+                "UPDATE intelligence_nodes SET project_hash = ?2 WHERE project_hash = ?1",
+                params![old_hash, new_hash],
+            )?;
+
+            // Keep the `project:{hash}` graph root in sync with the hash re-key:
+            // CASCADE won't fire here (no row delete in MOVE), so rename
+            // explicitly. MERGE drops the stale root (edges CASCADE).
+            let old_node_id = format!("project:{old_hash}");
+            let new_node_id = format!("project:{new_hash}");
+            let old_node: Option<(String, String, Option<String>)> = match tx.query_row(
+                "SELECT title, body, metadata FROM intelligence_nodes WHERE id = ?1",
+                params![old_node_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ) {
+                Ok(v) => Some(v),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(e) => return Err(e.into()),
+            };
+            match kind {
+                RemapKind::Move => {
+                    if let Some((title, body, metadata)) = old_node {
+                        let new_metadata = match metadata
+                            .as_deref()
+                            .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+                        {
+                            Some(mut value) => {
+                                if let Some(obj) = value.as_object_mut() {
+                                    obj.insert(
+                                        "path".to_string(),
+                                        serde_json::Value::String(new_canonical_path.to_string()),
+                                    );
+                                }
+                                value.to_string()
+                            }
+                            None => serde_json::json!({
+                                "source": "registry",
+                                "path": new_canonical_path,
+                            })
+                            .to_string(),
+                        };
+                        tx.execute(
+                            "DELETE FROM intelligence_nodes WHERE id = ?1",
+                            params![old_node_id],
+                        )?;
+                        tx.execute(
+                        "INSERT INTO intelligence_nodes (id, kind, title, body, metadata, project_hash, session_id, created_at, updated_at)
+                         VALUES (?1, 'project', ?2, ?3, ?4, ?5, NULL, strftime('%s','now'), strftime('%s','now'))",
+                        params![new_node_id, title, body, new_metadata, new_hash],
+                    )?;
+                        tx.execute(
+                        "UPDATE intelligence_edges SET from_node_id = ?2 WHERE from_node_id = ?1",
+                        params![old_node_id, new_node_id],
+                    )?;
+                        tx.execute(
+                            "UPDATE intelligence_edges SET to_node_id = ?2 WHERE to_node_id = ?1",
+                            params![old_node_id, new_node_id],
+                        )?;
+                    }
+                }
+                RemapKind::Merge => {
+                    tx.execute(
+                        "DELETE FROM intelligence_nodes WHERE id = ?1",
+                        params![old_node_id],
+                    )?;
+                }
+            }
+
+            match kind {
+                RemapKind::Move => {
+                    tx.execute(
+                        "UPDATE projects SET hash = ?2, path = ?3 WHERE hash = ?1",
+                        params![old_hash, new_hash, new_canonical_path],
+                    )?;
+                }
+                RemapKind::Merge => {
+                    tx.execute("DELETE FROM projects WHERE hash = ?1", params![old_hash])?;
+                }
+            }
+
+            tx.commit()?;
+
+            Ok::<RemapOutcome, anyhow::Error>(RemapOutcome {
+                kind,
+                old_hash: old_hash.to_string(),
+                new_hash,
+                new_path: new_canonical_path.to_string(),
+                counts,
+            })
+        }?;
+
+        if let Err(e) = self.rebuild_containment_edges() {
+            tracing::debug!("rebuild_containment_edges after remap failed: {e}");
         }
 
-        let target_exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM projects WHERE hash = ?1)",
-            params![new_hash],
-            |row| row.get::<_, i64>(0),
-        )? != 0;
-        let kind = RemapKind::decide(target_exists);
-        let counts = count_remap_targets(&tx, &old_path, old_hash)?;
-
-        tx.execute(
-            "UPDATE interactive_sessions SET working_dir = ?2 WHERE working_dir = ?1",
-            params![old_path, new_canonical_path],
-        )?;
-        tx.execute(
-            "UPDATE terminal_sessions SET working_dir = ?2 WHERE working_dir = ?1",
-            params![old_path, new_canonical_path],
-        )?;
-        tx.execute(
-            "UPDATE loops SET workdir = ?2 WHERE workdir = ?1",
-            params![old_path, new_canonical_path],
-        )?;
-        tx.execute(
-            "UPDATE loop_specs SET workdir = ?2 WHERE workdir = ?1",
-            params![old_path, new_canonical_path],
-        )?;
-        tx.execute(
-            "UPDATE sync_messages SET workdir = ?2 WHERE workdir = ?1",
-            params![old_path, new_canonical_path],
-        )?;
-        tx.execute(
-            "UPDATE sync_locks SET workdir = ?2 WHERE workdir = ?1",
-            params![old_path, new_canonical_path],
-        )?;
-        tx.execute(
-            "UPDATE last_prompts SET workdir = ?2 WHERE workdir = ?1",
-            params![old_path, new_canonical_path],
-        )?;
-        tx.execute(
-            "UPDATE scheduled_sends SET workdir = ?2 WHERE workdir = ?1",
-            params![old_path, new_canonical_path],
-        )?;
-        tx.execute(
-            "UPDATE failed_scheduled_sends SET workdir = ?2 WHERE workdir = ?1",
-            params![old_path, new_canonical_path],
-        )?;
-        tx.execute(
-            "UPDATE agents SET working_dir = ?2 WHERE working_dir = ?1",
-            params![old_path, new_canonical_path],
-        )?;
-        tx.execute(
-            "UPDATE intelligence_nodes SET project_hash = ?2 WHERE project_hash = ?1",
-            params![old_hash, new_hash],
-        )?;
-
-        match kind {
-            RemapKind::Move => {
-                tx.execute(
-                    "UPDATE projects SET hash = ?2, path = ?3 WHERE hash = ?1",
-                    params![old_hash, new_hash, new_canonical_path],
-                )?;
-            }
-            RemapKind::Merge => {
-                tx.execute("DELETE FROM projects WHERE hash = ?1", params![old_hash])?;
-            }
-        }
-
-        tx.commit()?;
-
-        Ok(RemapOutcome {
-            kind,
-            old_hash: old_hash.to_string(),
-            new_hash,
-            new_path: new_canonical_path.to_string(),
-            counts,
-        })
+        Ok(outcome)
     }
 
     // ── RAG queue (SQLite) ──────────────────────────────────────────────

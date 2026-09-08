@@ -134,7 +134,7 @@ pipeline, all 83 MCP tools, and the complete CLI reference.
 - **Project-Scoped Knowledge** — Store facts, patterns, and session summaries scoped to individual projects via `project_hash` (SHA-256 of canonical workdir path, truncated to 8 hex). Auto-detected from the session workdir — agents never need to set it manually.
 - **Full-Text Search** — Search intelligence nodes by query and optional kind filter across all projects.
 - **Graph Walk** — Traverse the knowledge graph from any node up to a configurable depth, returning connected facts, patterns, and cross-references.
-- **Project Relationships** — Link projects with typed relations (`depends_on`, `complements`, `relates_to`, `independent`) and query related projects for context enrichment.
+- **Project Relationships** — Link projects with typed relations (`depends_on`, `complements`, `extends`, `publishes`; `relates_to` accepted as legacy, `contains` derived) and query related projects for context enrichment.
 - **Context Retrieval** — `intelligence_get_context` auto-detects the project, returns a curated mix of session knowledge, project facts, and related-project summaries.
 
 ### 🔄 Multi-Agent Sync
@@ -195,7 +195,7 @@ pipeline, all 83 MCP tools, and the complete CLI reference.
 
 ---
 
-## MCP Tools (83)
+## MCP Tools (84)
 
 | Category | Tools |
 |----------|-------|
@@ -207,7 +207,7 @@ pipeline, all 83 MCP tools, and the complete CLI reference.
 | **Spec Backlog** (5) | `spec_create`, `spec_list`, `spec_update`, `spec_delete`, `spec_set_status` |
 | **Spec Queues** (5) | `queue_create`, `queue_add_spec`, `queue_list`, `queue_remove_spec`, `queue_reorder` |
 | **Node Blueprints** (3) | `blueprint_list`, `blueprint_create`, `blueprint_delete` |
-| **Project** (3) | `project_search`, `project_update`, `project_remap` |
+| **Project** (4) | `project_search`, `project_update`, `project_remap`, `project_register` |
 | **RAG** (1) | `rag_search` |
 | **Protocol** (1) | `get_tools` |
 

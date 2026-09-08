@@ -31,6 +31,19 @@ impl Database {
         if let Err(e) = db.backfill_project_nodes() {
             tracing::warn!("Could not backfill project intelligence nodes: {e}");
         }
+        // CM9 typed project graph: retype backlog notes, derive containment,
+        // seed known cross-project dependencies. All best-effort: open must
+        // never fail because a seed path isn't registered.
+        if let Err(e) = db.retype_backlog_project_nodes() {
+            tracing::warn!("Could not retype backlog project nodes: {e}");
+        }
+        match db.rebuild_containment_edges() {
+            Ok(count) => tracing::debug!("Rebuilt {count} derived containment edge(s)"),
+            Err(e) => tracing::warn!("Could not rebuild containment edges: {e}"),
+        }
+        if let Err(e) = db.seed_cm9_project_dependencies() {
+            tracing::warn!("Could not seed CM9 project dependencies: {e}");
+        }
         if let Err(e) = db.seed_builtin_blueprints() {
             tracing::warn!("Could not seed builtin blueprints: {e}");
         }

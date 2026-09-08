@@ -7,6 +7,26 @@ use anyhow::Result;
 
 use crate::tui::app::types::{App, Focus, ProjectRelationDialog};
 
+/// Picker relation vocabulary: the declarable types plus the legacy label and
+/// the skip sentinel. `contains` is derived from registry paths and is never
+/// offered here.
+pub const PICKER_RELATIONS: &[&str] = &[
+    "depends_on",
+    "complements",
+    "extends",
+    "publishes",
+    "relates_to (legacy)",
+    "independent",
+];
+
+/// Map a picker selection to the stored relation (`None` = skip, no edge).
+pub fn picker_relation_for_selection(selection: &str) -> Option<&str> {
+    match selection {
+        "independent" => None,
+        "relates_to (legacy)" => Some("relates_to"),
+        other => Some(other),
+    }
+}
 impl App {
     pub fn open_project_relation_dialog(&mut self) -> Result<()> {
         let Some(project) = self.selected_project() else {
@@ -25,12 +45,7 @@ impl App {
             filtered: Vec::new(),
             selected_idx: 0,
             relation_idx: 0,
-            relation_types: vec![
-                "depends_on".to_string(),
-                "complements".to_string(),
-                "relates_to".to_string(),
-                "independent".to_string(),
-            ],
+            relation_types: PICKER_RELATIONS.iter().map(|s| s.to_string()).collect(),
             filter_buffer: String::new(),
             error: None,
         };
@@ -57,10 +72,11 @@ impl App {
         let rel_type = &dialog.relation_types[dialog.relation_idx];
 
         // "Independent" — skip
-        if rel_type == "independent" {
+        if picker_relation_for_selection(rel_type).is_none() {
             self.close_project_relation_dialog();
             return Ok(());
         }
+        let rel_type = picker_relation_for_selection(rel_type).unwrap_or("relates_to");
 
         // Need a target project to link to
         let target_entry = dialog.filtered.get(dialog.selected_idx);
@@ -217,5 +233,32 @@ impl ProjectRelationDialog {
             self.relation_types.len(),
             forward,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn picker_offers_new_types_and_never_contains() {
+        assert!(PICKER_RELATIONS.contains(&"extends"));
+        assert!(PICKER_RELATIONS.contains(&"publishes"));
+        assert!(PICKER_RELATIONS.contains(&"depends_on"));
+        assert!(PICKER_RELATIONS.contains(&"complements"));
+        assert!(
+            !PICKER_RELATIONS.contains(&"contains"),
+            "contains is derived and must never be offered"
+        );
+    }
+
+    #[test]
+    fn picker_maps_legacy_and_skip() {
+        assert_eq!(
+            picker_relation_for_selection("relates_to (legacy)"),
+            Some("relates_to")
+        );
+        assert_eq!(picker_relation_for_selection("independent"), None);
+        assert_eq!(picker_relation_for_selection("extends"), Some("extends"));
     }
 }

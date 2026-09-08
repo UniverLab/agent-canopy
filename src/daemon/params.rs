@@ -206,6 +206,8 @@ pub struct IntelligenceGetContextParams {
     pub scope: String,
     /// Optional project hash to scope facts/patterns to a specific project.
     pub project_hash: Option<String>,
+    /// Traversal depth in project-graph hops (default 1, max 5).
+    pub depth: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -272,6 +274,10 @@ pub struct IntelligenceSearchParams {
     pub kind: Option<String>,
     /// Maximum number of results to return.
     pub limit: Option<usize>,
+    /// Optional project hash to scope the search; traverses outbound edges.
+    pub project_hash: Option<String>,
+    /// Traversal depth in project-graph hops (default 1, max 5).
+    pub depth: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -341,6 +347,12 @@ pub struct ProjectRemapParams {
     pub dry_run: Option<bool>,
     /// Remap even if `new_path` doesn't exist on disk yet. Default: false.
     pub force: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectRegisterParams {
+    /// Absolute path of the project directory to register explicitly.
+    pub path: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

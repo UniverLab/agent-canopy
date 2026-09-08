@@ -5891,3 +5891,413 @@ fn fail_subagent_run_sets_status() {
     assert_eq!(record.stderr.as_deref(), Some("oops"));
     assert!(record.exit_code.is_none());
 }
+
+// ── CM9: typed project graph ──────────────────────────────────────────
+
+/// Register a project row at an on-disk path (hash derived like production).
+fn cm9_register_at(db: &Database, path: &std::path::Path) -> String {
+    let s = path.to_string_lossy().to_string();
+    let hash = crate::domain::project::workdir_hash(&s);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| s.clone());
+    db.upsert_project(&crate::domain::project::Project {
+        hash: hash.clone(),
+        path: s,
+        name,
+        description: None,
+        tags: None,
+        indexed_at: None,
+        created_at: chrono::Utc::now().timestamp(),
+    })
+    .unwrap();
+    hash
+}
+
+fn cm9_put_fact(db: &Database, id: &str, hash: &str, title: &str) {
+    db.upsert_intelligence_node(IntelligenceNodeInput {
+        id: Some(id.to_string()),
+        kind: "fact".to_string(),
+        title: title.to_string(),
+        body: format!("{title} body"),
+        metadata: None,
+        project_hash: Some(hash.to_string()),
+        session_id: None,
+        relations: None,
+    })
+    .unwrap();
+}
+
+#[test]
+fn cm9_link_rejects_unknown_relation() {
+    let db = test_db();
+    let dir = tempdir().unwrap();
+    let ha = cm9_register_at(&db, &dir.path().join("a"));
+    // create dirs so register works on real paths below; here direct upsert is enough
+    let _ = std::fs::create_dir_all(dir.path().join("a"));
+    let _ = std::fs::create_dir_all(dir.path().join("b"));
+    let hb = cm9_register_at(&db, &dir.path().join("b"));
+
+    let err = db.link_projects(&ha, &hb, "blocks", None).unwrap_err();
+    assert!(
+        err.to_string().contains("allowed:"),
+        "error must name allowed relations, got: {err}"
+    );
+    for rel in [
+        "depends_on",
+        "complements",
+        "extends",
+        "publishes",
+        "contains",
+        "relates_to",
+    ] {
+        // contains is rejected at the write path, not the validator; the rest succeed
+        if rel == "contains" {
+            continue;
+        }
+        db.link_projects(&ha, &hb, rel, None).unwrap();
+    }
+}
+
+#[test]
+fn cm9_link_rejects_contains() {
+    let db = test_db();
+    let dir = tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("a")).unwrap();
+    std::fs::create_dir_all(dir.path().join("b")).unwrap();
+    let ha = cm9_register_at(&db, &dir.path().join("a"));
+    let hb = cm9_register_at(&db, &dir.path().join("b"));
+    let err = db.link_projects(&ha, &hb, "contains", None).unwrap_err();
+    assert!(
+        err.to_string().contains("derived"),
+        "contains guard must mention derived, got: {err}"
+    );
+}
+
+#[test]
+fn cm9_containment_derived_parent_child() {
+    let db = test_db();
+    let root = tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("parent")).unwrap();
+    std::fs::create_dir_all(root.path().join("parent/child")).unwrap();
+    std::fs::create_dir_all(root.path().join("other")).unwrap();
+    std::fs::create_dir_all(root.path().join("parent2")).unwrap();
+    let hp = cm9_register_at(&db, &root.path().join("parent"));
+    let hc = cm9_register_at(&db, &root.path().join("parent/child"));
+    let ho = cm9_register_at(&db, &root.path().join("other"));
+    let _hp2 = cm9_register_at(&db, &root.path().join("parent2"));
+
+    let n = db.rebuild_containment_edges().unwrap();
+    assert_eq!(n, 1, "exactly one contains edge expected");
+
+    let related = db.list_related_projects(&hp, 10).unwrap();
+    assert_eq!(related.len(), 1);
+    assert_eq!(related[0].0.project_hash.as_deref(), Some(hc.as_str()));
+    assert_eq!(related[0].1.relation, "contains");
+    // Parent → child direction: edge stored from container to contained.
+    assert_eq!(related[0].1.from_node_id, format!("project:{hp}"));
+    assert_eq!(related[0].1.to_node_id, format!("project:{hc}"));
+
+    // Sibling and string-prefix trap get no edges.
+    assert!(db.list_related_projects(&ho, 10).unwrap().is_empty());
+    let trap: Vec<_> = db
+        .list_related_projects(&_hp2, 10)
+        .unwrap()
+        .into_iter()
+        .filter(|(_, e)| e.relation == "contains")
+        .collect();
+    assert!(trap.is_empty(), "/parent must not contain /parent2");
+}
+
+#[test]
+fn cm9_containment_recomputed_on_delete_and_remap() {
+    let db = test_db();
+    let root = tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("parent")).unwrap();
+    std::fs::create_dir_all(root.path().join("parent/child")).unwrap();
+    let hp = cm9_register_at(&db, &root.path().join("parent"));
+    let hc = cm9_register_at(&db, &root.path().join("parent/child"));
+    assert_eq!(db.rebuild_containment_edges().unwrap(), 1);
+
+    // Remap child outside the parent: edge must disappear.
+    std::fs::create_dir_all(root.path().join("elsewhere")).unwrap();
+    let new_path = root
+        .path()
+        .join("elsewhere")
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    db.remap_project(&hc, &new_path).unwrap();
+    let after_remap: Vec<_> = db
+        .list_related_projects(&hp, 10)
+        .unwrap()
+        .into_iter()
+        .filter(|(_, e)| e.relation == "contains")
+        .collect();
+    assert!(
+        after_remap.is_empty(),
+        "contains edge must be gone after remap"
+    );
+
+    // Delete parent: root node gone, no dangling contains edges.
+    db.delete_project(&hp).unwrap();
+    assert!(db.get_project(&hp).unwrap().is_none());
+    let conn = db.conn.lock().unwrap();
+    let dangling: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM intelligence_edges WHERE relation = 'contains'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(dangling, 0);
+}
+
+#[test]
+fn cm9_traversal_outbound_and_upward() {
+    let db = test_db();
+    let dir = tempdir().unwrap();
+    for sub in ["a", "a/b", "c"] {
+        std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+    }
+    let ha = cm9_register_at(&db, &dir.path().join("a"));
+    let hb = cm9_register_at(&db, &dir.path().join("a/b"));
+    let hc = cm9_register_at(&db, &dir.path().join("c"));
+    db.rebuild_containment_edges().unwrap();
+    // A depends_on C.
+    db.link_projects(&ha, &hc, "depends_on", None).unwrap();
+
+    // Depth 1 from B: B direct + A via contains. C is two hops away.
+    let scope1 = db.traverse_project_scope(&hb, 1).unwrap();
+    let mut got: Vec<(&str, Option<&str>)> = scope1
+        .projects
+        .iter()
+        .map(|p| (p.hash.as_str(), p.via_relation.as_deref()))
+        .collect();
+    got.sort_by_key(|(hash, _)| *hash);
+    let mut expected = vec![(ha.as_str(), Some("contains")), (hb.as_str(), None)];
+    expected.sort_by_key(|(hash, _)| *hash);
+    assert_eq!(got, expected);
+
+    // Depth 2 also reaches C via depends_on.
+    let scope2 = db.traverse_project_scope(&hb, 2).unwrap();
+    let c_hop = scope2.projects.iter().find(|p| p.hash == hc).unwrap();
+    assert_eq!(c_hop.via_relation.as_deref(), Some("depends_on"));
+    assert_eq!(c_hop.depth, 2);
+}
+
+#[test]
+fn cm9_inbound_depends_warns_not_pulls() {
+    let db = test_db();
+    let dir = tempdir().unwrap();
+    for sub in ["a", "d"] {
+        std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+    }
+    let ha = cm9_register_at(&db, &dir.path().join("a"));
+    let hd = cm9_register_at(&db, &dir.path().join("d"));
+    db.link_projects(&hd, &ha, "depends_on", None).unwrap();
+
+    // Traversal from A (even deep) never pulls D inbound.
+    let scope = db.traverse_project_scope(&ha, 5).unwrap();
+    assert!(
+        scope.projects.iter().all(|p| p.hash != hd),
+        "inbound dependent must not be traversed"
+    );
+    // But the impact warning source lists D.
+    let dependents = db.list_project_dependents(&ha).unwrap();
+    assert_eq!(dependents.len(), 1);
+    assert_eq!(
+        dependents[0].from_project_hash.as_deref(),
+        Some(hd.as_str())
+    );
+    assert_eq!(dependents[0].relation, "depends_on");
+}
+
+#[test]
+fn cm9_complements_bidirectional() {
+    let db = test_db();
+    let dir = tempdir().unwrap();
+    for sub in ["x", "y"] {
+        std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+    }
+    let hx = cm9_register_at(&db, &dir.path().join("x"));
+    let hy = cm9_register_at(&db, &dir.path().join("y"));
+    db.link_projects(&hx, &hy, "complements", None).unwrap();
+
+    for (from, to) in [(&hx, &hy), (&hy, &hx)] {
+        let scope = db.traverse_project_scope(from, 1).unwrap();
+        let hop = scope.projects.iter().find(|p| &p.hash == to).unwrap();
+        assert_eq!(hop.via_relation.as_deref(), Some("complements"));
+    }
+}
+
+#[test]
+fn cm9_depth_bounded() {
+    let db = test_db();
+    let dir = tempdir().unwrap();
+    for sub in ["a", "b", "c"] {
+        std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+    }
+    let ha = cm9_register_at(&db, &dir.path().join("a"));
+    let hb = cm9_register_at(&db, &dir.path().join("b"));
+    let hc = cm9_register_at(&db, &dir.path().join("c"));
+    db.link_projects(&ha, &hb, "depends_on", None).unwrap();
+    db.link_projects(&hb, &hc, "depends_on", None).unwrap();
+
+    let s1 = db.traverse_project_scope(&ha, 1).unwrap();
+    assert_eq!(s1.projects.len(), 2, "depth 1 reaches only B");
+    let s2 = db.traverse_project_scope(&ha, 2).unwrap();
+    assert_eq!(s2.projects.len(), 3, "depth 2 reaches B and C");
+    // Depth 99 clamps to MAX_TRAVERSAL_DEPTH (no unbounded walk).
+    let s99 = db.traverse_project_scope(&ha, 99).unwrap();
+    assert_eq!(s99.projects.len(), 3);
+    let s0 = db.traverse_project_scope(&ha, 0).unwrap();
+    assert_eq!(s0.projects.len(), 1);
+    assert_eq!(s0.reached, 0);
+}
+
+#[test]
+fn cm9_search_scoped_marks_origin() {
+    let db = test_db();
+    let dir = tempdir().unwrap();
+    for sub in ["a", "b", "c"] {
+        std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+    }
+    let ha = cm9_register_at(&db, &dir.path().join("a"));
+    let hb = cm9_register_at(&db, &dir.path().join("b"));
+    let hc = cm9_register_at(&db, &dir.path().join("c"));
+    db.link_projects(&ha, &hb, "depends_on", None).unwrap();
+    cm9_put_fact(&db, "fact-a", &ha, "alpha convention");
+    cm9_put_fact(&db, "fact-b", &hb, "alpha convention");
+    cm9_put_fact(&db, "fact-c", &hc, "alpha convention");
+
+    let scope = db.traverse_project_scope(&ha, 1).unwrap();
+    let hashes: Vec<String> = scope.projects.iter().map(|p| p.hash.clone()).collect();
+    let result = db
+        .search_intelligence_nodes_scoped("alpha convention", Some("fact"), 10, &hashes)
+        .unwrap();
+    let mut found: Vec<(&str, &str)> = result
+        .results
+        .iter()
+        .map(|r| (r.id.as_str(), r.project_hash.as_deref().unwrap()))
+        .collect();
+    found.sort();
+    assert_eq!(
+        found,
+        vec![("fact-a", ha.as_str()), ("fact-b", hb.as_str())]
+    );
+
+    // Empty hash set yields empty results (never leaks unscoped rows).
+    let empty = db
+        .search_intelligence_nodes_scoped("alpha", None, 10, &[])
+        .unwrap();
+    assert!(empty.results.is_empty());
+}
+
+#[test]
+fn cm9_no_edges_behaves_as_today() {
+    let db = test_db();
+    let dir = tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("lone")).unwrap();
+    let hl = cm9_register_at(&db, &dir.path().join("lone"));
+    cm9_put_fact(&db, "fact-lone", &hl, "lone knowledge");
+
+    let scope = db.traverse_project_scope(&hl, 1).unwrap();
+    assert_eq!(scope.projects.len(), 1);
+    assert_eq!(scope.reached, 0);
+
+    let rows = db.list_project_knowledge(&hl, None, 50).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, "fact-lone");
+}
+
+#[test]
+fn cm9_remap_renames_project_node() {
+    let db = test_db();
+    let root = tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("old")).unwrap();
+    std::fs::create_dir_all(root.path().join("new")).unwrap();
+    let old_hash = cm9_register_at(&db, &root.path().join("old"));
+    cm9_put_fact(&db, "fact-move", &old_hash, "moving knowledge");
+
+    let new_path = root
+        .path()
+        .join("new")
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let outcome = db.remap_project(&old_hash, &new_path).unwrap();
+
+    // Old graph root gone, new root present with updated path metadata.
+    assert!(db
+        .get_intelligence_node(&format!("project:{old_hash}"))
+        .unwrap()
+        .is_none());
+    let node = db
+        .get_intelligence_node(&format!("project:{}", outcome.new_hash))
+        .unwrap()
+        .expect("renamed project node must exist");
+    assert_eq!(node.kind, "project");
+    assert!(node.metadata.as_deref().unwrap().contains(&new_path));
+    // Knowledge re-keyed to the new hash.
+    let rows = db
+        .list_project_knowledge(&outcome.new_hash, None, 10)
+        .unwrap();
+    assert!(rows.iter().any(|r| r.id == "fact-move"));
+}
+
+#[test]
+fn cm9_retype_backlog_nodes() {
+    let db = test_db();
+    // Exercise the UPDATE path with fixed ids carrying the real prefixes.
+    for (id, title) in [
+        ("d8c3230b-note", "backlog grooming notes"),
+        ("508e398c-note", "sprint backlog notes"),
+    ] {
+        db.upsert_intelligence_node(IntelligenceNodeInput {
+            id: Some(id.to_string()),
+            kind: "project".to_string(),
+            title: title.to_string(),
+            body: format!("{title} body text"),
+            metadata: Some(serde_json::json!({"origin": "backlog"})),
+            project_hash: Some("hash-backlog".to_string()),
+            session_id: None,
+            relations: None,
+        })
+        .unwrap();
+    }
+    let n = db.retype_backlog_project_nodes().unwrap();
+    assert_eq!(n, 2);
+    for id in ["d8c3230b-note", "508e398c-note"] {
+        let node = db.get_intelligence_node(id).unwrap().unwrap();
+        assert_eq!(node.kind, "fact", "retype must update, not delete");
+        assert!(node.title.contains("backlog"));
+    }
+
+    // Registry nodes are refused, never retyped.
+    db.upsert_intelligence_node(IntelligenceNodeInput {
+        id: Some("d8c3230b-real".to_string()),
+        kind: "project".to_string(),
+        title: "Real Project".to_string(),
+        body: "real".to_string(),
+        metadata: Some(serde_json::json!({"source": "registry", "path": "/x"})),
+        project_hash: Some("hash-real".to_string()),
+        session_id: None,
+        relations: None,
+    })
+    .unwrap();
+    // Prefix d8c3230b is now ambiguous (two matches) → Err, and the real
+    // node must be untouched.
+    let err = db.retype_backlog_project_nodes().unwrap_err();
+    assert!(err.to_string().contains("Ambiguous"));
+    assert_eq!(
+        db.get_intelligence_node("d8c3230b-real")
+            .unwrap()
+            .unwrap()
+            .kind,
+        "project"
+    );
+}

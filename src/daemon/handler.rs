@@ -2352,41 +2352,75 @@ impl TaskTriggerHandler {
         )))
     }
 
-    /// Fetch knowledge for the context endpoint.
-    /// When project_hash is provided, returns project-scoped facts/patterns
-    /// alongside session nodes; otherwise returns all node kinds.
+    /// Fetch knowledge for the context endpoint, traversing the project graph.
+    /// Returns (generic session nodes, tagged project knowledge, traversal info).
+    /// Each tagged row is (record, via_project_hash, via_relation): root rows
+    /// carry `via_relation: None` (direct); reached rows carry the edge
+    /// relation that reached them. Bounded: per-project cap + total cap of 60.
+    /// The root project keeps the historic single-project limit so a project
+    /// with no edges reads exactly as before (modulo additive via_* fields).
     fn fetch_context_knowledge(
         &self,
         project_hash: Option<&str>,
         scope: &str,
+        depth: usize,
     ) -> Result<
         (
             Vec<crate::db::intelligence::IntelligenceNodeRecord>,
-            Vec<crate::db::intelligence::IntelligenceNodeRecord>,
+            TaggedProjectKnowledge,
+            serde_json::Value,
         ),
         String,
     > {
-        let knowledge_limit = if scope == "full" { 20 } else { 5 };
+        const TOTAL_CAP: usize = 60;
+        let root_limit = if scope == "full" { 50 } else { 20 };
+        let per_project_limit = if scope == "full" { 20 } else { 8 };
         if let Some(ph) = project_hash {
-            let pk_limit = if scope == "full" { 50 } else { 20 };
-            let pk = self
+            let traversal = self
                 .db
-                .list_project_knowledge(ph, None, pk_limit)
+                .traverse_project_scope(ph, depth)
                 .map_err(|e| e.to_string())?;
+            let mut tagged = Vec::new();
+            for tp in &traversal.projects {
+                let limit = if tp.via_relation.is_none() {
+                    root_limit
+                } else {
+                    per_project_limit
+                };
+                let rows = self
+                    .db
+                    .list_project_knowledge(&tp.hash, None, limit)
+                    .map_err(|e| e.to_string())?;
+                for row in rows {
+                    if tagged.len() >= TOTAL_CAP {
+                        break;
+                    }
+                    tagged.push((row, tp.hash.clone(), tp.via_relation.clone()));
+                }
+                if tagged.len() >= TOTAL_CAP {
+                    break;
+                }
+            }
+            let info = serde_json::json!({
+                "depth": depth.min(crate::db::intelligence::MAX_TRAVERSAL_DEPTH),
+                "projects_reached": traversal.projects.len(),
+                "total_cap": TOTAL_CAP,
+            });
             let generic: Vec<crate::db::intelligence::IntelligenceNodeRecord> = self
                 .db
-                .list_operational_sessions(knowledge_limit)
+                .list_operational_sessions(if scope == "full" { 20 } else { 5 })
                 .map_err(|e| e.to_string())?
                 .into_iter()
                 .map(|r| r.into_intelligence_node_record())
                 .collect();
-            Ok((generic, pk))
+            Ok((generic, tagged, info))
         } else {
+            let knowledge_limit = if scope == "full" { 20 } else { 5 };
             let generic = self
                 .db
                 .list_intelligence_nodes(None, knowledge_limit)
                 .map_err(|e| e.to_string())?;
-            Ok((generic, Vec::new()))
+            Ok((generic, Vec::new(), serde_json::json!({})))
         }
     }
 
@@ -2464,8 +2498,10 @@ impl TaskTriggerHandler {
 
         self.db.upsert_agent(&agent).map_err(internal_error)?;
         if let Some(workdir) = agent.working_dir.as_deref() {
-            if let Err(e) = self.db.register_project_path(std::path::Path::new(workdir)) {
-                tracing::debug!("Could not register project at {workdir}: {e}");
+            if crate::domain::project::should_auto_register(std::path::Path::new(workdir)) {
+                if let Err(e) = self.db.register_project_path(std::path::Path::new(workdir)) {
+                    tracing::debug!("Could not register project at {workdir}: {e}");
+                }
             }
         }
         self.scheduler_notify.notify_one();
@@ -3256,6 +3292,10 @@ impl TaskTriggerHandler {
         let effective_project_hash = resolved_agent_id.as_deref().and_then(|agent_id| {
             resolve_effective_project_hash(&self.db, params.project_hash.as_deref(), agent_id)
         });
+        let depth = params
+            .depth
+            .unwrap_or(1)
+            .min(crate::db::intelligence::MAX_TRAVERSAL_DEPTH);
 
         let sessions: Vec<crate::db::intelligence::IntelligenceNodeRecord> = self
             .db
@@ -3265,8 +3305,8 @@ impl TaskTriggerHandler {
             .map(|r| r.into_intelligence_node_record())
             .collect();
 
-        let (knowledge, project_knowledge) = self
-            .fetch_context_knowledge(effective_project_hash.as_deref(), &scope)
+        let (knowledge, project_knowledge, traversal) = self
+            .fetch_context_knowledge(effective_project_hash.as_deref(), &scope, depth)
             .map_err(|e| McpError::internal_error(e, None))?;
 
         let sync_messages = self
@@ -3285,6 +3325,21 @@ impl TaskTriggerHandler {
             if let Some(ref ph) = effective_project_hash {
                 self.db
                     .list_related_projects(ph, 10)
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        // Impact warning (full scope only — keeps light cheap): which projects
+        // declare a dependency on the targeted project. Inbound dependents
+        // never pull context; they only warn.
+        let dependents = if scope == "full" {
+            if let Some(ref ph) = effective_project_hash {
+                self.db
+                    .list_project_dependents(ph)
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?
             } else {
                 Vec::new()
@@ -3319,6 +3374,8 @@ impl TaskTriggerHandler {
             effective_project_hash.as_deref(),
             &project_knowledge,
             &related_projects,
+            &traversal,
+            &dependents,
         );
         inject_seed_identity(
             &mut out,
@@ -3419,7 +3476,11 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "intelligence_search",
-        description = "Search intelligence nodes by free text and optional kind."
+        description = "Search intelligence nodes by free text and optional kind. \
+         Pass project_hash to scope the search to that project plus the projects \
+         it reaches via outbound project-graph edges (depth, default 1, max 5); \
+         otherwise the project is auto-detected from the session workdir. \
+         Scoped hits carry via_relation; unscoped search is unchanged."
     )]
     async fn intelligence_search(
         &self,
@@ -3428,6 +3489,78 @@ impl TaskTriggerHandler {
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_nursery(parts.as_ref())?;
         let limit = params.limit.unwrap_or(10).min(50);
+        let depth = params
+            .depth
+            .unwrap_or(1)
+            .min(crate::db::intelligence::MAX_TRAVERSAL_DEPTH);
+
+        // Scoped when an explicit hash is given, else auto-detect (same
+        // precedence as the other read tools).
+        let resolved_agent_id = self.resolve_sync_agent_id(parts.as_ref()).ok();
+        let scoped_hash = resolved_agent_id.as_deref().and_then(|agent_id| {
+            resolve_effective_project_hash(&self.db, params.project_hash.as_deref(), agent_id)
+        });
+
+        if let Some(ph) = scoped_hash {
+            let traversal = self
+                .db
+                .traverse_project_scope(&ph, depth)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let hashes: Vec<String> = traversal.projects.iter().map(|p| p.hash.clone()).collect();
+            let via_by_hash: std::collections::HashMap<&str, Option<&str>> = traversal
+                .projects
+                .iter()
+                .map(|p| (p.hash.as_str(), p.via_relation.as_deref()))
+                .collect();
+            let search_result = self
+                .db
+                .search_intelligence_nodes_scoped(
+                    &params.query,
+                    params.kind.as_deref(),
+                    limit,
+                    &hashes,
+                )
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+            let results: Vec<serde_json::Value> = search_result
+                .results
+                .iter()
+                .map(|node| {
+                    let mut value = intelligence_node_json(node);
+                    let via_relation = node
+                        .project_hash
+                        .as_deref()
+                        .and_then(|h| via_by_hash.get(h).copied().flatten());
+                    let via_relation = match via_relation {
+                        None => serde_json::Value::Null,
+                        Some("contains") => serde_json::json!("inherited:contains"),
+                        Some(other) => serde_json::json!(other),
+                    };
+                    if let Some(obj) = value.as_object_mut() {
+                        obj.insert("via_relation".to_string(), via_relation);
+                    }
+                    value
+                })
+                .collect();
+            let out = serde_json::json!({
+                "query": params.query,
+                "kind": params.kind,
+                "project_hash": ph,
+                "depth": depth,
+                "projects_reached": traversal.projects.len(),
+                "traversal": {
+                    "depth": depth,
+                    "projects_reached": traversal.projects.len(),
+                },
+                "count": results.len(),
+                "examined_count": search_result.examined_count,
+                "results": results,
+            });
+            return Ok(CallToolResult::success(vec![Content::text(
+                serde_json::to_string_pretty(&out).unwrap_or_default(),
+            )]));
+        }
+
         let search_result = self
             .db
             .search_intelligence_nodes(&params.query, params.kind.as_deref(), limit)
@@ -3438,6 +3571,7 @@ impl TaskTriggerHandler {
             "kind": params.kind,
             "count": search_result.results.len(),
             "examined_count": search_result.examined_count,
+            "projects_reached": 1,
             "results": search_result.results.iter().map(intelligence_node_json).collect::<Vec<_>>(),
         });
 
@@ -3805,9 +3939,11 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "intelligence_link_projects",
-        description = "Create a relationship between two indexed projects. \
-         The relation defaults to 'relates_to' if not specified. \
-         Both projects must exist as kind='project' nodes in the intelligence graph."
+        description = "Create a typed relationship between two indexed projects. \
+         Relation must be one of: depends_on, complements, extends, publishes \
+         (relates_to is accepted as legacy). 'contains' is derived from registry \
+         paths and rejected here. Both projects must exist as kind='project' \
+         nodes in the intelligence graph."
     )]
     async fn intelligence_link_projects(
         &self,
@@ -3823,6 +3959,14 @@ impl TaskTriggerHandler {
         let relation = params.relation.as_deref().unwrap_or("relates_to");
         if let Err(e) = validate_non_empty(relation, "Relation") {
             return Ok(error_result(&e));
+        }
+        if let Err(e) = crate::domain::project::validate_project_relation(relation) {
+            return Ok(error_result(&e.to_string()));
+        }
+        if relation == "contains" {
+            return Ok(error_result(
+                "relation 'contains' is derived from registry paths — it cannot be hand-linked",
+            ));
         }
 
         let edge = self
@@ -3896,8 +4040,10 @@ impl TaskTriggerHandler {
         };
 
         self.db.insert_loop(&lp).map_err(internal_error)?;
-        if let Err(error) = self.db.register_project_path(std::path::Path::new(workdir)) {
-            tracing::debug!("Could not register loop project at {workdir}: {error}");
+        if crate::domain::project::should_auto_register(std::path::Path::new(workdir)) {
+            if let Err(error) = self.db.register_project_path(std::path::Path::new(workdir)) {
+                tracing::debug!("Could not register loop project at {workdir}: {error}");
+            }
         }
         self.activate_loop_trigger(&lp).await;
 
@@ -6189,8 +6335,10 @@ impl TaskTriggerHandler {
         self.db
             .import_loop_graph(&lp, &plan)
             .map_err(internal_error)?;
-        if let Err(error) = self.db.register_project_path(std::path::Path::new(workdir)) {
-            tracing::debug!("Could not register imported loop's project at {workdir}: {error}");
+        if crate::domain::project::should_auto_register(std::path::Path::new(workdir)) {
+            if let Err(error) = self.db.register_project_path(std::path::Path::new(workdir)) {
+                tracing::debug!("Could not register imported loop's project at {workdir}: {error}");
+            }
         }
         self.activate_loop_trigger(&lp).await;
 
@@ -7497,6 +7645,45 @@ impl TaskTriggerHandler {
         }
     }
 
+    /// Explicitly register a project directory (no marker file required).
+    #[tool(
+        name = "project_register",
+        description = "Explicitly register a project directory in the registry. \
+        Unlike automatic registration (which requires a `.canopy-project` marker \
+        file in the directory), this call registers any existing directory."
+    )]
+    async fn project_register(
+        &self,
+        Parameters(params): Parameters<ProjectRegisterParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(e) = validate_non_empty(&params.path, "path") {
+            return Ok(error_result(&e));
+        }
+        let raw = std::path::Path::new(&params.path);
+        let canonical = match std::fs::canonicalize(raw) {
+            Ok(canonical) => canonical,
+            Err(e) => {
+                return Ok(error_result(&format!(
+                    "Path '{}' does not exist ({e})",
+                    params.path
+                )))
+            }
+        };
+        match self.db.register_project_explicit(&canonical) {
+            Ok(project) => {
+                let out = serde_json::json!({
+                    "workdir_hash": project.hash,
+                    "name": project.name,
+                    "path": project.path,
+                });
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&out).unwrap_or_default(),
+                )]))
+            }
+            Err(e) => Ok(error_result(&e.to_string())),
+        }
+    }
+
     /// Full-text search over personal RAG chunks (LanceDB vector search). Rate-limited: 10/min per agent.
     #[tool(
         name = "rag_search",
@@ -8021,6 +8208,14 @@ impl TaskTriggerHandler {
     }
 }
 
+/// Project knowledge rows tagged with traversal origin: (record,
+/// via_project_hash, via_relation). Root rows carry `via_relation: None`.
+type TaggedProjectKnowledge = Vec<(
+    crate::db::intelligence::IntelligenceNodeRecord,
+    String,
+    Option<String>,
+)>;
+
 fn intelligence_node_json(
     node: &crate::db::intelligence::IntelligenceNodeRecord,
 ) -> serde_json::Value {
@@ -8454,11 +8649,13 @@ fn append_temporal_agents_section(status: &mut String, agents: &[Agent]) {
 fn inject_project_context(
     out: &mut serde_json::Value,
     project_hash: Option<&str>,
-    project_knowledge: &[IntelligenceNodeRecord],
+    project_knowledge: &[(IntelligenceNodeRecord, String, Option<String>)],
     related_projects: &[(
         IntelligenceNodeRecord,
         crate::db::intelligence::IntelligenceEdgeRecord,
     )],
+    traversal: &serde_json::Value,
+    dependents: &[crate::db::intelligence::IntelligenceProjectDependencyRecord],
 ) {
     if let Some(ph) = project_hash {
         if let Some(obj) = out.as_object_mut() {
@@ -8469,13 +8666,21 @@ fn inject_project_context(
     if !project_knowledge.is_empty() {
         let pk_json: Vec<serde_json::Value> = project_knowledge
             .iter()
-            .map(|n| {
+            .map(|(n, via_project, via_relation)| {
+                // `contains` hops read as upward inheritance, never a silent merge.
+                let via_relation = match via_relation.as_deref() {
+                    None => serde_json::Value::Null,
+                    Some("contains") => serde_json::json!("inherited:contains"),
+                    Some(other) => serde_json::json!(other),
+                };
                 serde_json::json!({
                     "id": n.id,
                     "kind": n.kind,
                     "title": n.title,
                     "body": n.body,
                     "project_hash": n.project_hash,
+                    "via_project": via_project,
+                    "via_relation": via_relation,
                 })
             })
             .collect();
@@ -8495,6 +8700,39 @@ fn inject_project_context(
                     serde_json::Value::String(new_summary),
                 );
             }
+        }
+    }
+
+    if let Some(obj) = out.as_object_mut() {
+        if project_hash.is_some()
+            && traversal.is_object()
+            && !traversal.as_object().map(|o| o.is_empty()).unwrap_or(true)
+        {
+            obj.insert("traversal".to_string(), traversal.clone());
+        }
+    }
+
+    if !dependents.is_empty() {
+        let target = project_hash.unwrap_or_default();
+        let dep_json: Vec<serde_json::Value> = dependents
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "from_node_id": d.from_node_id,
+                    "from_title": d.from_title,
+                    "from_project_hash": d.from_project_hash,
+                    "relation": d.relation,
+                })
+            })
+            .collect();
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert(
+                "dependency_impact".to_string(),
+                serde_json::json!({
+                    "target": target,
+                    "dependents": dep_json,
+                }),
+            );
         }
     }
 
@@ -19809,6 +20047,8 @@ mod endpoint_tests {
                     query: "memory safe".to_string(),
                     kind: Some("fact".to_string()),
                     limit: Some(5),
+                    project_hash: None,
+                    depth: None,
                 }),
                 OptionalExtension(None),
             )
@@ -19916,6 +20156,8 @@ mod endpoint_tests {
                     query: "Node B".to_string(),
                     kind: None,
                     limit: Some(5),
+                    project_hash: None,
+                    depth: None,
                 }),
                 OptionalExtension(None),
             )
@@ -20026,6 +20268,8 @@ mod endpoint_tests {
                     query: "Node".to_string(),
                     kind: Some("fact".to_string()),
                     limit: Some(10),
+                    project_hash: None,
+                    depth: None,
                 }),
                 OptionalExtension(None),
             )
@@ -20058,6 +20302,7 @@ mod endpoint_tests {
                 Parameters(IntelligenceGetContextParams {
                     scope: "sideways".to_string(),
                     project_hash: None,
+                    depth: None,
                 }),
                 OptionalExtension(None),
             )
@@ -20070,6 +20315,7 @@ mod endpoint_tests {
                 Parameters(IntelligenceGetContextParams {
                     scope: "light".to_string(),
                     project_hash: None,
+                    depth: None,
                 }),
                 OptionalExtension(None),
             )
@@ -20083,6 +20329,7 @@ mod endpoint_tests {
                 Parameters(IntelligenceGetContextParams {
                     scope: "full".to_string(),
                     project_hash: None,
+                    depth: None,
                 }),
                 OptionalExtension(None),
             )
@@ -20135,6 +20382,212 @@ mod endpoint_tests {
             .unwrap();
         assert!(!is_err(&linked), "{}", text(&linked));
         assert!(raw_text(&linked).contains("depends_on"));
+    }
+
+    // ── CM9: typed project graph traversal ──────────────────────
+
+    /// Register parent + child dirs (child nested under parent) with one fact
+    /// each. Returns (base_tempdir, parent_hash, child_hash).
+    fn cm9_seed_parent_child(db: &Database) -> (tempfile::TempDir, String, String) {
+        let base = tempdir().unwrap();
+        let parent = base.path().join("ws-parent");
+        let child = parent.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let p = db.register_project_path(&parent).unwrap();
+        let c = db.register_project_path(&child).unwrap();
+        for (id, hash, title) in [
+            (
+                "cm9-fact-parent",
+                p.hash.clone(),
+                "workspace billing rulebook",
+            ),
+            (
+                "cm9-fact-child",
+                c.hash.clone(),
+                "workspace billing rulebook",
+            ),
+        ] {
+            db.upsert_intelligence_node(crate::db::intelligence::IntelligenceNodeInput {
+                id: Some(id.to_string()),
+                kind: "fact".to_string(),
+                title: title.to_string(),
+                body: format!("{title} body"),
+                metadata: None,
+                project_hash: Some(hash),
+                session_id: None,
+                relations: None,
+            })
+            .unwrap();
+        }
+        (base, p.hash, c.hash)
+    }
+
+    #[tokio::test]
+    async fn intelligence_link_rejects_unknown_relation_via_mcp() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        db.register_project_path(dir_a.path()).unwrap();
+        db.register_project_path(dir_b.path()).unwrap();
+        let hash_a = crate::domain::project::workdir_hash(
+            &std::fs::canonicalize(dir_a.path())
+                .unwrap()
+                .to_string_lossy(),
+        );
+        let hash_b = crate::domain::project::workdir_hash(
+            &std::fs::canonicalize(dir_b.path())
+                .unwrap()
+                .to_string_lossy(),
+        );
+
+        let bad = handler
+            .intelligence_link_projects(Parameters(IntelligenceLinkProjectsParams {
+                from_project_hash: hash_a.clone(),
+                to_project_hash: hash_b.clone(),
+                relation: Some("blocks".to_string()),
+                weight: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&bad), "unknown relation must be an error_result");
+        assert!(raw_text(&bad).contains("allowed:"));
+
+        let derived = handler
+            .intelligence_link_projects(Parameters(IntelligenceLinkProjectsParams {
+                from_project_hash: hash_a,
+                to_project_hash: hash_b,
+                relation: Some("contains".to_string()),
+                weight: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&derived));
+        assert!(raw_text(&derived).contains("derived"));
+    }
+
+    #[tokio::test]
+    async fn intelligence_get_context_traverses_and_warns() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        let _agent_guard = AgentIdVar::set("agent-cm9-ctx-1");
+        let (_base, parent_hash, child_hash) = cm9_seed_parent_child(&db);
+        // A third project depending on the parent (impact warning source).
+        let dep_dir = tempdir().unwrap();
+        let depender = db.register_project_path(dep_dir.path()).unwrap();
+        db.link_projects(&depender.hash, &parent_hash, "depends_on", None)
+            .unwrap();
+
+        let full = handler
+            .intelligence_get_context(
+                Parameters(IntelligenceGetContextParams {
+                    scope: "full".to_string(),
+                    project_hash: Some(parent_hash.clone()),
+                    depth: None,
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!is_err(&full), "{}", text(&full));
+        let body = raw_text(&full);
+        // Parent fact direct + child fact inherited via outbound contains.
+        assert!(body.contains("cm9-fact-parent"));
+        assert!(body.contains("cm9-fact-child"));
+        assert!(body.contains("inherited:contains"));
+        assert!(body.contains("\"via_project\""));
+        assert!(body.contains("\"projects_reached\""));
+        // Impact warning names the depender.
+        assert!(body.contains("\"dependency_impact\""));
+        assert!(body.contains(&depender.hash));
+
+        let light = handler
+            .intelligence_get_context(
+                Parameters(IntelligenceGetContextParams {
+                    scope: "light".to_string(),
+                    project_hash: Some(child_hash),
+                    depth: None,
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!is_err(&light), "{}", text(&light));
+        let light_body = raw_text(&light);
+        assert!(light_body.contains("cm9-fact-child"));
+        assert!(
+            !light_body.contains("\"dependency_impact\""),
+            "light scope must not warn"
+        );
+    }
+
+    #[tokio::test]
+    async fn intelligence_search_scoped() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        let _agent_guard = AgentIdVar::set("agent-cm9-search-1");
+        let (_base, parent_hash, child_hash) = cm9_seed_parent_child(&db);
+
+        let scoped = handler
+            .intelligence_search(
+                Parameters(IntelligenceSearchParams {
+                    query: "billing rulebook".to_string(),
+                    kind: Some("fact".to_string()),
+                    limit: Some(10),
+                    project_hash: Some(child_hash.clone()),
+                    depth: None,
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!is_err(&scoped), "{}", text(&scoped));
+        let body = raw_text(&scoped);
+        assert!(body.contains("cm9-fact-child"));
+        assert!(body.contains("cm9-fact-parent"));
+        assert!(body.contains("\"via_relation\""));
+        assert!(body.contains("\"projects_reached\""));
+
+        // Depth 0 sees only the child project itself.
+        let narrow = handler
+            .intelligence_search(
+                Parameters(IntelligenceSearchParams {
+                    query: "billing rulebook".to_string(),
+                    kind: Some("fact".to_string()),
+                    limit: Some(10),
+                    project_hash: Some(child_hash),
+                    depth: Some(0),
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        let narrow_body = raw_text(&narrow);
+        assert!(narrow_body.contains("cm9-fact-child"));
+        assert!(!narrow_body.contains("cm9-fact-parent"));
+        let _ = parent_hash;
+    }
+
+    #[tokio::test]
+    async fn project_register_tool_registers_without_marker() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        let base = tempdir().unwrap();
+        let target = base.path().join("explicit-proj");
+        std::fs::create_dir_all(&target).unwrap();
+        assert!(!target.join(".canopy-project").exists());
+
+        let registered = handler
+            .project_register(Parameters(ProjectRegisterParams {
+                path: target.to_string_lossy().to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&registered), "{}", text(&registered));
+        assert!(raw_text(&registered).contains("\"workdir_hash\""));
+
+        let canonical = std::fs::canonicalize(&target)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let expected = crate::domain::project::workdir_hash(&canonical);
+        assert!(db.get_project(&expected).unwrap().is_some());
     }
 
     // ── get_tools ────────────────────────────────────────────────
@@ -20503,6 +20956,8 @@ mod endpoint_tests {
                     query: "Updated via prefix".to_string(),
                     kind: Some("fact".to_string()),
                     limit: Some(10),
+                    project_hash: None,
+                    depth: None,
                 }),
                 OptionalExtension(None),
             )

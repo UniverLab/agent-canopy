@@ -663,7 +663,7 @@ impl App {
             crate::system::boot_id().as_deref(),
         );
         // Don't register nursery temp dir as a project — it's ephemeral
-        if !is_nursery {
+        if !is_nursery && crate::domain::project::should_auto_register(Path::new(&dir)) {
             let _ = self.db.register_project_path(Path::new(&dir));
         }
         self.interactive_agents.push(agent);
@@ -714,7 +714,9 @@ impl App {
         };
         self.db.upsert_agent(&agent)?;
         if let Some(workdir) = agent.working_dir.as_deref() {
-            let _ = self.db.register_project_path(Path::new(workdir));
+            if crate::domain::project::should_auto_register(Path::new(workdir)) {
+                let _ = self.db.register_project_path(Path::new(workdir));
+            }
         }
         Ok(())
     }
@@ -790,7 +792,9 @@ impl App {
         let _ = self
             .db
             .insert_terminal_session(&agent.id, &agent.name, shell, &dir);
-        let _ = self.db.register_project_path(Path::new(&dir));
+        if crate::domain::project::should_auto_register(Path::new(&dir)) {
+            let _ = self.db.register_project_path(Path::new(&dir));
+        }
         // Load command history into cache
         let hist = crate::tui::terminal_history::load_history(&self.data_dir, &agent.name);
         agent.replay_scrollback_lines(&hist.scrollback);

@@ -80,6 +80,43 @@ impl Project {
     }
 }
 
+/// Allowed typed relations between project nodes.
+///
+/// `contains` is derived from registry paths (never hand-linked);
+/// `relates_to` is legacy-accepted but deprecated.
+pub const PROJECT_RELATIONS: &[&str] = &[
+    "contains",
+    "depends_on",
+    "complements",
+    "extends",
+    "publishes",
+];
+/// Legacy relation still accepted for backwards compatibility.
+pub const LEGACY_PROJECT_RELATIONS: &[&str] = &["relates_to"];
+
+/// Lexical validator for project relation names (case-sensitive).
+/// Accepts the 5-type vocabulary plus legacy `relates_to`.
+pub fn validate_project_relation(relation: &str) -> anyhow::Result<()> {
+    if PROJECT_RELATIONS.contains(&relation) || LEGACY_PROJECT_RELATIONS.contains(&relation) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "unknown project relation '{}'; allowed: contains, depends_on, complements, extends, publishes (legacy: relates_to)",
+            relation
+        )
+    }
+}
+
+/// Bare marker file `.canopy-project` in the directory root.
+pub fn project_marker_present(dir: &std::path::Path) -> bool {
+    dir.join(".canopy-project").exists()
+}
+
+/// Policy: auto-registration happens only when the marker is present.
+pub fn should_auto_register(dir: &std::path::Path) -> bool {
+    project_marker_present(dir)
+}
+
 /// Whether remapping a project onto a new path keeps the project's own
 /// registry row (nothing was there yet) or folds its dependents into a
 /// project that's already registered at that path.
@@ -219,5 +256,55 @@ mod tests {
         let md = "# Title\n\n[![badge](url)](link)\n\nThis is a real description with more than twenty words that should be returned by the extractor function working correctly.\n\n## Section";
         let desc = extract_readme_description(md).unwrap();
         assert!(desc.contains("real description"));
+    }
+
+    #[test]
+    fn validate_project_relation_accepts_vocab_and_legacy() {
+        for rel in [
+            "contains",
+            "depends_on",
+            "complements",
+            "extends",
+            "publishes",
+            "relates_to",
+        ] {
+            assert!(
+                validate_project_relation(rel).is_ok(),
+                "{rel} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_project_relation_rejects_unknown_and_case() {
+        for rel in [
+            "",
+            "blocks",
+            "contained_by",
+            "CONTAINS",
+            "Depends_on",
+            "related",
+        ] {
+            let err = validate_project_relation(rel).unwrap_err();
+            assert!(
+                err.to_string().contains("allowed:"),
+                "error should list allowed set, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn project_marker_present_false_without_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!project_marker_present(dir.path()));
+        assert!(!should_auto_register(dir.path()));
+    }
+
+    #[test]
+    fn project_marker_present_true_with_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".canopy-project"), "").unwrap();
+        assert!(project_marker_present(dir.path()));
+        assert!(should_auto_register(dir.path()));
     }
 }

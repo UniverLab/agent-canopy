@@ -114,6 +114,27 @@ pub struct IntelligenceProjectDependencyRecord {
     pub created_at: i64,
 }
 
+/// One project reached by [`Database::traverse_project_scope`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraversedProject {
+    pub hash: String,
+    /// Relation of the edge that reached this project; `None` for the root.
+    pub via_relation: Option<String>,
+    /// BFS depth from the root (root = 0).
+    pub depth: usize,
+}
+
+/// Bounded project-scope traversal result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraversalScope {
+    pub projects: Vec<TraversedProject>,
+    /// Number of projects reached excluding the root.
+    pub reached: usize,
+}
+
+/// Hard bound on traversal depth: one query never walks further than this.
+pub const MAX_TRAVERSAL_DEPTH: usize = 5;
+
 impl Database {
     /// Resolve a node id prefix (e.g. "3a476c63") to exactly one node.
     /// - Ok(Some(full_id)) if exactly one node matches
@@ -719,6 +740,12 @@ impl Database {
         relation: &str,
         weight: Option<f64>,
     ) -> Result<IntelligenceEdgeRecord> {
+        crate::domain::project::validate_project_relation(relation)?;
+        if relation == "contains" {
+            anyhow::bail!(
+                "relation 'contains' is derived from registry paths — it cannot be hand-linked"
+            );
+        }
         let from_node = self
             .find_project_node(from_project_hash)?
             .ok_or_else(|| anyhow!("Project node not found for hash '{}'", from_project_hash))?;
@@ -794,6 +821,451 @@ impl Database {
         } else {
             Ok(None)
         }
+    }
+
+    /// Recompute derived `contains` (parent → child) edges from registry paths.
+    ///
+    /// Deletes all existing `contains` edges between project nodes, then links
+    /// each project to its deepest container (component-wise path prefix via
+    /// `Path::starts_with` — never a string prefix). Pure recompute: hand
+    /// edits never survive, and only the direct parent is stored (transitivity
+    /// is recovered via the depth parameter at read time). Returns edges inserted.
+    pub fn rebuild_containment_edges(&self) -> Result<usize> {
+        {
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+            conn.execute(
+                "DELETE FROM intelligence_edges WHERE relation = 'contains'
+                 AND from_node_id IN (SELECT id FROM intelligence_nodes WHERE kind = 'project')
+                 AND to_node_id IN (SELECT id FROM intelligence_nodes WHERE kind = 'project')",
+                [],
+            )?;
+        }
+
+        let projects = self.list_projects()?;
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for child in &projects {
+            let child_path = std::path::Path::new(&child.path);
+            let mut best: Option<&crate::domain::project::Project> = None;
+            let mut best_depth = 0usize;
+            for parent in &projects {
+                if parent.hash == child.hash {
+                    continue;
+                }
+                let parent_path = std::path::Path::new(&parent.path);
+                if child_path.starts_with(parent_path) {
+                    let depth = parent_path.components().count();
+                    if depth > best_depth {
+                        best_depth = depth;
+                        best = Some(parent);
+                    }
+                }
+            }
+            if let Some(parent) = best {
+                pairs.push((parent.hash.clone(), child.hash.clone()));
+            }
+        }
+
+        let mut inserted = 0usize;
+        for (parent_hash, child_hash) in pairs {
+            let from_node = self.find_project_node(&parent_hash)?;
+            let to_node = self.find_project_node(&child_hash)?;
+            let (Some(from_node), Some(to_node)) = (from_node, to_node) else {
+                continue;
+            };
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM intelligence_edges WHERE from_node_id = ?1 AND to_node_id = ?2 AND relation = 'contains')",
+                rusqlite::params![from_node.id, to_node.id],
+                |row| row.get::<_, i64>(0),
+            )? != 0;
+            if exists {
+                continue;
+            }
+            let now = Utc::now().timestamp();
+            conn.execute(
+                "INSERT INTO intelligence_edges (from_node_id, to_node_id, relation, weight, created_at)
+                 VALUES (?1, ?2, 'contains', 1.0, ?3)",
+                rusqlite::params![from_node.id, to_node.id, now],
+            )?;
+            inserted += 1;
+        }
+        Ok(inserted)
+    }
+
+    /// BFS project-scope traversal from `root_hash` up to `depth` hops.
+    ///
+    /// Follows outbound edges for `depends_on`, `extends`, `publishes`,
+    /// `relates_to`; `complements` in both directions; `contains` in both
+    /// directions (reverse = inherited-upward rule). Inbound `depends_on`
+    /// is never followed (see [`Database::list_project_dependents`]).
+    /// Depth is clamped to `0..=MAX_TRAVERSAL_DEPTH`.
+    pub fn traverse_project_scope(&self, root_hash: &str, depth: usize) -> Result<TraversalScope> {
+        let depth = depth.min(MAX_TRAVERSAL_DEPTH);
+        let mut projects = vec![TraversedProject {
+            hash: root_hash.to_string(),
+            via_relation: None,
+            depth: 0,
+        }];
+        if depth == 0 {
+            return Ok(TraversalScope {
+                projects,
+                reached: 0,
+            });
+        }
+        let Some(root_node) = self.find_project_node(root_hash)? else {
+            return Ok(TraversalScope {
+                projects,
+                reached: 0,
+            });
+        };
+
+        // Load project↔project edges once; BFS in Rust over node ids.
+        let edges: Vec<IntelligenceEdgeRecord> = {
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+            let mut stmt = conn.prepare(
+                "SELECT e.id, e.from_node_id, e.to_node_id, e.relation, e.weight, e.created_at
+                 FROM intelligence_edges e
+                 JOIN intelligence_nodes a ON a.id = e.from_node_id
+                 JOIN intelligence_nodes b ON b.id = e.to_node_id
+                 WHERE a.kind = 'project' AND b.kind = 'project'",
+            )?;
+            let rows: Vec<IntelligenceEdgeRecord> = stmt
+                .query_map([], Self::read_intelligence_edge)?
+                .filter_map(|r| r.ok())
+                .collect();
+            rows
+        };
+        // Node id → project hash for reached nodes.
+        let node_hash: std::collections::HashMap<String, String> = {
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+            let mut stmt = conn.prepare(
+                "SELECT id, project_hash FROM intelligence_nodes WHERE kind = 'project'",
+            )?;
+            let mut map = std::collections::HashMap::new();
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            for row in rows.filter_map(|r| r.ok()) {
+                if let Some(hash) = row.1 {
+                    map.insert(row.0, hash);
+                }
+            }
+            map
+        };
+
+        let mut visited: HashSet<String> = HashSet::from([root_node.id.clone()]);
+        // (node_id, depth) frontier; root depth = 0.
+        let mut frontier: Vec<(String, usize)> = vec![(root_node.id, 0)];
+        for _ in 0..depth {
+            let mut next_frontier: Vec<(String, usize)> = Vec::new();
+            for (current, cur_depth) in &frontier {
+                for edge in &edges {
+                    let neighbor: Option<(&str, &str)> = if edge.from_node_id == *current {
+                        // Outbound: all relations followed.
+                        Some((edge.to_node_id.as_str(), edge.relation.as_str()))
+                    } else if edge.to_node_id == *current
+                        && (edge.relation == "complements" || edge.relation == "contains")
+                    {
+                        // Reverse: only symmetric complements + upward contains.
+                        Some((edge.from_node_id.as_str(), edge.relation.as_str()))
+                    } else {
+                        None
+                    };
+                    if let Some((neighbor_id, relation)) = neighbor {
+                        if visited.insert(neighbor_id.to_string()) {
+                            if let Some(hash) = node_hash.get(neighbor_id) {
+                                projects.push(TraversedProject {
+                                    hash: hash.clone(),
+                                    via_relation: Some(relation.to_string()),
+                                    depth: cur_depth + 1,
+                                });
+                            }
+                            next_frontier.push((neighbor_id.to_string(), cur_depth + 1));
+                        }
+                    }
+                }
+            }
+            if next_frontier.is_empty() {
+                break;
+            }
+            frontier = next_frontier;
+        }
+        let reached = projects.len().saturating_sub(1);
+        Ok(TraversalScope { projects, reached })
+    }
+
+    /// Impact warning source: projects that declare `depends_on` ON `hash`.
+    /// Inbound dependents never pull context — they only warn.
+    pub fn list_project_dependents(
+        &self,
+        hash: &str,
+    ) -> Result<Vec<IntelligenceProjectDependencyRecord>> {
+        let Some(node) = self.find_project_node(hash)? else {
+            return Ok(Vec::new());
+        };
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT
+                e.from_node_id,
+                from_node.title,
+                from_node.project_hash,
+                e.to_node_id,
+                to_node.title,
+                to_node.project_hash,
+                e.relation,
+                e.weight,
+                e.created_at
+             FROM intelligence_edges e
+             JOIN intelligence_nodes from_node ON from_node.id = e.from_node_id
+             JOIN intelligence_nodes to_node ON to_node.id = e.to_node_id
+             WHERE e.to_node_id = ?1 AND e.relation = 'depends_on'
+             ORDER BY e.created_at DESC",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![node.id],
+            |row| -> rusqlite::Result<IntelligenceProjectDependencyRecord> {
+                Ok(IntelligenceProjectDependencyRecord {
+                    from_node_id: row.get(0)?,
+                    from_title: row.get(1)?,
+                    from_project_hash: row.get(2)?,
+                    to_node_id: row.get(3)?,
+                    to_title: row.get(4)?,
+                    to_project_hash: row.get(5)?,
+                    relation: row.get(6)?,
+                    weight: row.get(7)?,
+                    created_at: row.get(8)?,
+                })
+            },
+        )?;
+        Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+
+    /// Scoped variant of [`Database::search_intelligence_nodes`]: same ranking
+    /// SQL, plus `AND project_hash IN (...)`. Empty `hashes` yields an empty
+    /// result (with the examined count). The unscoped original is untouched.
+    pub fn search_intelligence_nodes_scoped(
+        &self,
+        query: &str,
+        kind: Option<&str>,
+        limit: usize,
+        hashes: &[String],
+    ) -> Result<IntelligenceSearchResult> {
+        let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        let examined_count = self.count_intelligence_nodes_for_search(kind)?;
+
+        if terms.is_empty() || hashes.is_empty() {
+            return Ok(IntelligenceSearchResult {
+                results: Vec::new(),
+                examined_count,
+            });
+        }
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+
+        let mut match_count_parts: Vec<String> = Vec::with_capacity(terms.len());
+        let mut score_parts: Vec<String> = Vec::with_capacity(terms.len() * 5);
+        let mut or_clauses: Vec<String> = Vec::with_capacity(terms.len() * 5);
+        for i in 0..terms.len() {
+            let p = i + 2;
+            score_parts.push(format!(
+                "(CASE WHEN instr(lower(title), ?{p}) > 0 THEN 3 ELSE 0 END)"
+            ));
+            score_parts.push(format!(
+                "(CASE WHEN instr(lower(body), ?{p}) > 0 THEN 1 ELSE 0 END)"
+            ));
+            score_parts.push(format!(
+                "(CASE WHEN instr(lower(coalesce(metadata, '')), ?{p}) > 0 THEN 1 ELSE 0 END)"
+            ));
+            score_parts.push(format!(
+                "(CASE WHEN instr(lower(id), ?{p}) > 0 THEN 1 ELSE 0 END)"
+            ));
+            score_parts.push(format!(
+                "(CASE WHEN instr(lower(kind), ?{p}) > 0 THEN 1 ELSE 0 END)"
+            ));
+
+            let term_fields: Vec<String> =
+                ["id", "kind", "title", "body", "coalesce(metadata, '')"]
+                    .into_iter()
+                    .map(|field| format!("instr(lower({field}), ?{p}) > 0"))
+                    .collect();
+            match_count_parts.push(format!(
+                "(CASE WHEN {} THEN 1 ELSE 0 END)",
+                term_fields.join(" OR ")
+            ));
+            or_clauses.extend(term_fields);
+        }
+
+        let match_count_expr = match_count_parts.join(" + ");
+        let score_expr = score_parts.join(" + ");
+        let or_clause = or_clauses.join(" OR ");
+        let limit_placeholder = terms.len() + 2;
+        // project_hash placeholders shift with the term count.
+        let hash_start = terms.len() + 3;
+        let hash_placeholders: Vec<String> = (0..hashes.len())
+            .map(|i| format!("?{}", hash_start + i))
+            .collect();
+        let hash_clause = hash_placeholders.join(", ");
+        let sql = format!(
+            "SELECT id, kind, title, body, metadata, project_hash, session_id, created_at, updated_at, \
+             ({match_count_expr}) AS match_count, ({score_expr}) AS score \
+             FROM intelligence_nodes \
+             WHERE (?1 IS NULL OR kind = ?1) AND project_hash IN ({hash_clause}) AND ({or_clause}) \
+             ORDER BY match_count DESC, score DESC, updated_at DESC \
+             LIMIT ?{limit_placeholder}"
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        // Placeholder index order: ?1 kind, ?2.. terms, ?{limit} limit,
+        // then hash IN-list placeholders (rusqlite binds by index).
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> =
+            Vec::with_capacity(terms.len() + hashes.len() + 2);
+        params.push(Box::new(kind.map(str::to_string)));
+        for term in &terms {
+            params.push(Box::new(term.clone()));
+        }
+        params.push(Box::new(limit as i64));
+        for hash in hashes {
+            params.push(Box::new(hash.clone()));
+        }
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(Box::as_ref).collect();
+
+        let rows = stmt.query_map(param_refs.as_slice(), Self::read_intelligence_node)?;
+        let results: Vec<IntelligenceNodeRecord> = rows.filter_map(|row| row.ok()).collect();
+        Ok(IntelligenceSearchResult {
+            results,
+            examined_count,
+        })
+    }
+
+    /// Retype the two backlog-note nodes (`d8c3230b`, `508e398c`) from
+    /// `kind='project'` to `kind='fact'`. Skips absent or already-fixed nodes.
+    /// Refuses (Err) if a target looks like a real registry node
+    /// (`metadata.source == "registry"`) — retyping that would corrupt the graph.
+    pub fn retype_backlog_project_nodes(&self) -> Result<usize> {
+        let mut retyped = 0usize;
+        for prefix in ["d8c3230b", "508e398c"] {
+            let Some(id) = self.resolve_node_id_by_prefix(prefix)? else {
+                tracing::warn!("cm9 retype: no node matching prefix '{prefix}', skipping");
+                continue;
+            };
+            let Some(node) = self.get_intelligence_node(&id)? else {
+                continue;
+            };
+            if node.kind != "project" {
+                continue;
+            }
+            if let Some(meta) = node.metadata.as_deref() {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(meta) {
+                    if value.get("source").and_then(|s| s.as_str()) == Some("registry") {
+                        anyhow::bail!(
+                            "refusing to retype node '{id}': it is a registry project node, not a backlog note"
+                        );
+                    }
+                }
+            }
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+            conn.execute(
+                "UPDATE intelligence_nodes SET kind = 'fact' WHERE id = ?1",
+                rusqlite::params![id],
+            )?;
+            retyped += 1;
+        }
+        Ok(retyped)
+    }
+
+    /// Seed the four known cross-project `depends_on` edges (best-effort).
+    /// Each side resolves by `path.contains(substr)` against registered
+    /// projects (falling back to loop/spec workdirs for ticket-tagged
+    /// from-sides); missing or ambiguous sides are skipped with a warning and
+    /// never fail. `link_projects` dedup makes this idempotent.
+    pub fn seed_cm9_project_dependencies(&self) -> Result<usize> {
+        // (from_substrs, from_ticket, to_substr): CB3, CX1 x2, CX2, AD11.
+        let pairs: &[(&[&str], &str, &str)] = &[
+            (&["harness-canopy"], "CB3", "canopy-registry"),
+            (&["cx1"], "CX1", "ghscaff"),
+            (&["cx1"], "CX1", "demostage"),
+            (&["cx2"], "CX2", "univerlab"),
+            (&["astro-denoise"], "AD11", "harness-canopy"),
+        ];
+        let mut created = 0usize;
+        for (from_substrs, ticket, to_substr) in pairs {
+            let from_hash = self.resolve_seed_project(from_substrs, ticket);
+            let to_hash = self.resolve_seed_project(&[to_substr], "");
+            match (from_hash, to_hash) {
+                (Some(from), Some(to)) => {
+                    let before = self.list_related_projects(&from, 1000)?.len();
+                    self.link_projects(&from, &to, "depends_on", None)?;
+                    let after = self.list_related_projects(&from, 1000)?.len();
+                    if after > before {
+                        created += 1;
+                    }
+                }
+                (from, to) => {
+                    tracing::warn!(
+                        "cm9 seed: skipping {ticket} edge (from={from:?}, to={to:?}): side not registered or ambiguous"
+                    );
+                }
+            }
+        }
+        Ok(created)
+    }
+
+    /// Resolve one seed endpoint: first registered project whose path contains
+    /// any of `substrs` (exactly one match required); else the workdir of a
+    /// loop/spec whose name mentions `ticket`.
+    fn resolve_seed_project(&self, substrs: &[&str], ticket: &str) -> Option<String> {
+        let projects = self.list_projects().ok()?;
+        let mut matches: Vec<String> = Vec::new();
+        for project in &projects {
+            if substrs.iter().any(|s| project.path.contains(s)) {
+                matches.push(project.hash.clone());
+            }
+        }
+        if matches.len() == 1 {
+            return Some(matches.into_iter().next().unwrap());
+        }
+        if !ticket.is_empty() {
+            // Fall back to loop/spec workdirs tagged with the ticket id.
+            let workdir: Option<String> = {
+                let conn = self.conn.lock().ok()?;
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT workdir FROM loop_specs WHERE name LIKE ?1 AND workdir IS NOT NULL LIMIT 1",
+                    )
+                    .ok()?;
+                let pattern = format!("%{ticket}%");
+                stmt.query_row(rusqlite::params![pattern], |row| row.get(0))
+                    .ok()
+            };
+            if let Some(workdir) = workdir {
+                let hit = projects.into_iter().find(|p| p.path == workdir);
+                if let Some(project) = hit {
+                    return Some(project.hash);
+                }
+            }
+        }
+        None
     }
 
     /// Get facts and patterns linked to a specific project.

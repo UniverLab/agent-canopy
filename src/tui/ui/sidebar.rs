@@ -1741,6 +1741,10 @@ pub(crate) fn draw_project_graph(frame: &mut Frame, area: Rect, app: &App, theme
         let relation = match edge.relation.as_str() {
             "depends_on" => "(depends)",
             "complements" => "(complements)",
+            "extends" => "(extends)",
+            "publishes" => "(publishes)",
+            "contains" => "(contains)",
+            "relates_to" => "(related)",
             _ => "",
         };
         let label = format!(
