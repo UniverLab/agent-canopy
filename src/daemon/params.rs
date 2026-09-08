@@ -231,6 +231,31 @@ fn arbitrary_json_value_schema(_generator: &mut schemars::SchemaGenerator) -> sc
     })
 }
 
+/// Deserialize a doubly-optional field so "key absent" and "key present but
+/// `null`" stay distinct. `#[serde(default)]` on an `Option<Option<T>>`
+/// field gives `None` when the key is missing; without this helper a present
+/// `null` also collapses to `None`, because serde's `Option` impl maps JSON
+/// `null` straight to `None` before the inner `Option` is ever consulted.
+/// Routing the present value through here wraps it: `null` becomes
+/// `Some(None)` (clear) and a value becomes `Some(Some(v))` (set).
+fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[schemars(inline)]
+pub struct BodyReplaceParams {
+    /// Literal fragment to find in the node's body. Must occur exactly
+    /// once: zero matches or more than one match fails the write.
+    pub fragment: String,
+    /// Replacement text for the fragment. The rest of the body is untouched.
+    pub replacement: String,
+}
+
 // `#[schemars(inline)]` makes every use site of this type emit its full
 // object schema in place instead of a bare `$ref` into `$defs`. Without it,
 // `IntelligenceUpsertParams.node_data` advertises only `{"$ref": "..."}`
@@ -243,23 +268,43 @@ pub struct IntelligenceNodeParams {
     /// Optional stable node ID. If omitted, a new UUID is generated.
     pub id: Option<String>,
     /// Node kind: fact, pattern, idea, decision, or defect. Structural: project.
-    pub kind: String,
+    /// Required on create; omit on update to leave the stored kind untouched.
+    #[serde(default)]
+    pub kind: Option<String>,
     /// Node status: noted, verified, resolved, superseded, or deprecated.
     /// Defaults to 'noted' if omitted on create.
     pub status: Option<String>,
     /// Human-readable title for the node.
-    pub title: String,
-    /// Main body/content of the node.
-    pub body: String,
-    /// Optional structured metadata.
+    /// Required on create; omit on update to leave the stored title untouched.
     #[serde(default)]
+    pub title: Option<String>,
+    /// Main body/content of the node.
+    /// Required on create (unless body_replace is used on update); omit on
+    /// update to leave the stored body untouched. Mutually exclusive with
+    /// `body_replace`.
+    #[serde(default)]
+    pub body: Option<String>,
+    /// Literal fragment replacement on the stored body. Update-only: the
+    /// fragment must occur exactly once or the write fails, changing
+    /// nothing. Mutually exclusive with `body`.
+    #[serde(default)]
+    pub body_replace: Option<BodyReplaceParams>,
+    /// Optional structured metadata. Doubly-optional: omit the field to
+    /// leave it untouched, send `null` to clear it, send a value to set it.
+    #[serde(default, deserialize_with = "double_option")]
     #[schemars(schema_with = "arbitrary_json_value_schema")]
-    pub metadata: Option<serde_json::Value>,
-    /// Optional project hash this node belongs to.
-    pub project_hash: Option<String>,
-    /// Optional session ID this node belongs to.
-    pub session_id: Option<String>,
-    /// Optional outgoing relations to other nodes.
+    pub metadata: Option<Option<serde_json::Value>>,
+    /// Optional project hash this node belongs to. Omit to leave untouched
+    /// on update (auto-detected from the session workdir on create);
+    /// send `null` to clear it.
+    #[serde(default, deserialize_with = "double_option")]
+    pub project_hash: Option<Option<String>>,
+    /// Optional session ID this node belongs to. Omit to leave untouched;
+    /// send `null` to clear it.
+    #[serde(default, deserialize_with = "double_option")]
+    pub session_id: Option<Option<String>>,
+    /// Optional outgoing relations to other nodes. Omit to leave the node's
+    /// relations alone; send a list (even an empty one) to replace them.
     pub relations: Option<Vec<IntelligenceRelationParams>>,
 }
 

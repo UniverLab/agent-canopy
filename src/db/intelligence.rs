@@ -78,17 +78,54 @@ pub struct IntelligenceRelationInput {
     pub weight: Option<f64>,
 }
 
+/// Literal text replacement applied to a node's `body` on update.
+///
+/// The fragment is matched literally (never as a regular expression) and
+/// must occur exactly once: zero matches or more than one match fails the
+/// whole write, changing nothing, rather than guessing which occurrence
+/// the caller meant.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BodyReplace {
+    pub fragment: String,
+    pub replacement: String,
+}
+
+/// Input for [`Database::upsert_intelligence_node`].
+///
+/// Creation and partial update share this shape:
+/// - **Create** (no `id`, or an `id` that matches nothing): `kind`, `title`
+///   and `body` are required; the call fails without them.
+/// - **Update** (an `id` that matches an existing node): every field is
+///   optional. A field set to `Some` replaces the stored value; a field
+///   left as `None` leaves the stored value untouched. Doubly-optional
+///   fields (`metadata`, `project_hash`, `session_id`) distinguish "not
+///   mentioned" (`None`, untouched) from "set to null" (`Some(None)`,
+///   cleared where the column is nullable).
 #[derive(Debug, Clone, Deserialize)]
 pub struct IntelligenceNodeInput {
     pub id: Option<String>,
-    pub kind: String,
+    pub kind: Option<String>,
     pub status: Option<String>,
-    pub title: String,
-    pub body: String,
-    pub metadata: Option<serde_json::Value>,
-    pub project_hash: Option<String>,
-    pub session_id: Option<String>,
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub body_replace: Option<BodyReplace>,
+    pub metadata: Option<Option<serde_json::Value>>,
+    pub project_hash: Option<Option<String>>,
+    pub session_id: Option<Option<String>>,
     pub relations: Option<Vec<IntelligenceRelationInput>>,
+}
+
+/// Outcome of [`Database::upsert_intelligence_node`].
+#[derive(Debug, Clone)]
+pub struct UpsertResult {
+    pub record: IntelligenceNodeRecord,
+    pub created: bool,
+    pub duplicates: Vec<IntelligenceNodeRecord>,
+    pub undeclared_references: Vec<String>,
+    /// Fields that actually changed, so a caller does not have to read the
+    /// node back to find out. `updated_at` is always present: every write
+    /// bumps it. A `body_replace` that matched exactly once reports `body`.
+    pub changed_fields: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -315,15 +352,7 @@ impl Database {
         }
     }
 
-    pub fn upsert_intelligence_node(
-        &self,
-        input: IntelligenceNodeInput,
-    ) -> Result<(
-        IntelligenceNodeRecord,
-        bool,
-        Vec<IntelligenceNodeRecord>,
-        Vec<String>,
-    )> {
+    pub fn upsert_intelligence_node(&self, input: IntelligenceNodeInput) -> Result<UpsertResult> {
         // Destructure by value: every field is consumed below, so the
         // input stays pass-by-value without tripping needless_pass_by_value.
         let IntelligenceNodeInput {
@@ -332,13 +361,17 @@ impl Database {
             status: input_status,
             title,
             body,
+            body_replace,
             metadata,
             project_hash,
             session_id,
             relations,
         } = input;
-        // 1. Kind is validated first: cheapest check, most likely mistake.
-        validate_knowledge_kind(&kind)?;
+        // 1. Provided values are validated first: cheapest checks, most
+        // likely mistakes. `None` means "not mentioned" and skips validation.
+        if let Some(ref k) = kind {
+            validate_knowledge_kind(k)?;
+        }
 
         // 2. A provided status must be a known value. `None` resolves below
         // (create → "noted", update → preserve existing).
@@ -355,42 +388,271 @@ impl Database {
             }
         }
 
+        // 4. `body` and `body_replace` are mutually exclusive: one names the
+        // whole new text, the other names a fragment of the old text.
+        if body.is_some() && body_replace.is_some() {
+            anyhow::bail!(
+                "body and body_replace are mutually exclusive: send either the full new body or a fragment replacement, not both"
+            );
+        }
+        if let Some(ref br) = body_replace {
+            if br.fragment.is_empty() {
+                anyhow::bail!("body_replace fragment must not be empty");
+            }
+        }
+
         let node_id = id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let now = Utc::now().timestamp();
-        let metadata = metadata.map(|value| value.to_string());
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
-        // Determine creation vs update before the INSERT — ON CONFLICT would
-        // otherwise hide the distinction. For auto-generated ids this is always
-        // creation. Done inside the same lock as the INSERT to avoid a race
-        // where another thread inserts between the check and the insert.
-        // The existing status is read here too so an update that omits
-        // `status` preserves it without a second lock acquisition.
-        let existing_status: Option<String> = {
-            let mut stmt =
-                conn.prepare("SELECT status FROM intelligence_nodes WHERE id = ?1 LIMIT 1")?;
+        // Determine creation vs update before writing. For auto-generated
+        // ids this is always creation. Done inside the same lock as the
+        // write to avoid a race where another thread inserts between the
+        // check and the write. The existing row is read here too so an
+        // update that omits a field preserves it without a second lock
+        // acquisition.
+        let existing: Option<IntelligenceNodeRecord> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, kind, status, title, body, metadata, project_hash, session_id, created_at, updated_at
+                 FROM intelligence_nodes WHERE id = ?1 LIMIT 1",
+            )?;
             let mut rows = stmt.query(rusqlite::params![&node_id])?;
             match rows.next()? {
-                Some(row) => Some(row.get(0)?),
+                Some(row) => Some(Self::read_intelligence_node(row)?),
                 None => None,
             }
         };
-        let was_created = existing_status.is_none();
+        let was_created = existing.is_none();
 
-        let status = match input_status {
-            Some(s) => s,
-            None => existing_status.unwrap_or_else(|| "noted".to_string()),
+        if was_created {
+            // ── Create path: kind, title and body are required. ──
+            let kind = kind.ok_or_else(|| {
+                anyhow!("create requires kind, title and body: no node with this id exists and one of them was omitted")
+            })?;
+            let title = title.ok_or_else(|| {
+                anyhow!("create requires kind, title and body: no node with this id exists and one of them was omitted")
+            })?;
+            let body = body.ok_or_else(|| {
+                anyhow!("create requires kind, title and body: no node with this id exists and one of them was omitted")
+            })?;
+            // A create cannot carry a fragment replacement: there is no
+            // existing body to match against.
+            if let Some(br) = body_replace {
+                anyhow::bail!(
+                    "body_replace needs an existing node: no node with id '{node_id}' exists (fragment '{}')",
+                    br.fragment
+                );
+            }
+            let status = input_status.unwrap_or_else(|| "noted".to_string());
+            let metadata_str = metadata.flatten().map(|value| value.to_string());
+            let project_hash = project_hash.flatten();
+            let session_id = session_id.flatten();
+
+            // `superseded` is meaningless without the pointer to what holds
+            // instead: it requires a `supersedes` edge in the same write.
+            if status == "superseded" {
+                let has_supersedes = relations
+                    .as_ref()
+                    .map(|rels| rels.iter().any(|r| r.relation == "supersedes"))
+                    .unwrap_or(false);
+                if !has_supersedes {
+                    anyhow::bail!(
+                        "status 'superseded' requires a 'supersedes' edge pointing to the replacing node"
+                    );
+                }
+            }
+
+            conn.execute(
+                "INSERT INTO intelligence_nodes (
+                    id, kind, status, title, body, metadata, project_hash, session_id, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                rusqlite::params![
+                    node_id,
+                    kind,
+                    status,
+                    title,
+                    body,
+                    metadata_str,
+                    project_hash,
+                    session_id,
+                    now,
+                    now
+                ],
+            )?;
+
+            let mut changed_fields = vec![
+                "kind".to_string(),
+                "status".to_string(),
+                "title".to_string(),
+                "body".to_string(),
+            ];
+            if metadata_str.is_some() {
+                changed_fields.push("metadata".to_string());
+            }
+            if project_hash.is_some() {
+                changed_fields.push("project_hash".to_string());
+            }
+            if session_id.is_some() {
+                changed_fields.push("session_id".to_string());
+            }
+            let relations_changed = relations.is_some();
+            if let Some(rels) = relations {
+                for relation in rels {
+                    conn.execute(
+                        "INSERT INTO intelligence_edges (
+                            from_node_id, to_node_id, relation, weight, created_at
+                        ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        rusqlite::params![
+                            &node_id,
+                            relation.to_node_id,
+                            relation.relation,
+                            relation.weight.unwrap_or(1.0_f64),
+                            now
+                        ],
+                    )?;
+                }
+            }
+            if relations_changed {
+                changed_fields.push("relations".to_string());
+            }
+            changed_fields.push("updated_at".to_string());
+
+            drop(conn);
+            let record = self
+                .get_intelligence_node(&node_id)?
+                .ok_or_else(|| anyhow!("Failed to load intelligence node '{node_id}'"))?;
+            // Write-time signals, computed after the write lands: duplicate
+            // candidates (shared citations, then lexical ranking) and references
+            // to existing nodes that were mentioned but not declared as edges.
+            let duplicates = self.detect_duplicate_candidates(&record);
+            let undeclared_references = self.extract_undeclared_references(&record)?;
+            return Ok(UpsertResult {
+                record,
+                created: true,
+                duplicates,
+                undeclared_references,
+                changed_fields,
+            });
+        }
+
+        // ── Update path: omitted fields keep their stored values. ──
+        let prev = existing.expect("creation branch returned above");
+        let mut changed_fields: Vec<String> = Vec::new();
+
+        let final_kind = match kind {
+            Some(k) => {
+                if k != prev.kind {
+                    changed_fields.push("kind".to_string());
+                }
+                k
+            }
+            None => prev.kind,
+        };
+        let final_status = match input_status {
+            Some(s) => {
+                if s != prev.status {
+                    changed_fields.push("status".to_string());
+                }
+                s
+            }
+            None => prev.status,
+        };
+        let final_title = match title {
+            Some(t) => {
+                if t != prev.title {
+                    changed_fields.push("title".to_string());
+                }
+                t
+            }
+            None => prev.title,
+        };
+        let final_body = match (body, body_replace) {
+            (Some(b), None) => {
+                if b != prev.body {
+                    changed_fields.push("body".to_string());
+                }
+                b
+            }
+            (None, Some(br)) => {
+                // Literal match only — never a regular expression. Zero
+                // matches or more than one match fails the whole write,
+                // changing nothing, instead of guessing.
+                let count = prev.body.matches(br.fragment.as_str()).count();
+                if count == 0 {
+                    anyhow::bail!(
+                        "body_replace fragment not found: no occurrence of the given fragment in node '{node_id}', nothing was changed"
+                    );
+                }
+                if count > 1 {
+                    anyhow::bail!(
+                        "body_replace fragment is ambiguous: matches {count} times in node '{node_id}', nothing was changed"
+                    );
+                }
+                let replaced = prev
+                    .body
+                    .replacen(br.fragment.as_str(), br.replacement.as_str(), 1);
+                if replaced != prev.body {
+                    changed_fields.push("body".to_string());
+                }
+                replaced
+            }
+            (None, None) => prev.body,
+            // Rejected during validation above; unreachable here.
+            (Some(_), Some(_)) => {
+                anyhow::bail!(
+                    "body and body_replace are mutually exclusive: send either the full new body or a fragment replacement, not both"
+                );
+            }
+        };
+        // Doubly-optional: `None` = not mentioned (keep), `Some(None)` =
+        // clear, `Some(Some(v))` = set.
+        let final_metadata = match metadata {
+            Some(inner) => {
+                let as_str = inner.map(|value| value.to_string());
+                if as_str != prev.metadata {
+                    changed_fields.push("metadata".to_string());
+                }
+                as_str
+            }
+            None => prev.metadata,
+        };
+        let final_project_hash = match project_hash {
+            Some(inner) => {
+                if inner != prev.project_hash {
+                    changed_fields.push("project_hash".to_string());
+                }
+                inner
+            }
+            None => prev.project_hash,
+        };
+        let final_session_id = match session_id {
+            Some(inner) => {
+                if inner != prev.session_id {
+                    changed_fields.push("session_id".to_string());
+                }
+                inner
+            }
+            None => prev.session_id,
         };
 
-        // 4. `superseded` is meaningless without the pointer to what holds
-        // instead: it requires a `supersedes` edge in the same write.
-        if status == "superseded" {
-            let has_supersedes = relations
-                .as_ref()
-                .map(|rels| rels.iter().any(|r| r.relation == "supersedes"))
-                .unwrap_or(false);
+        // `superseded` requires a `supersedes` edge. On update the edge may
+        // already be stored: only a write that replaces the edge list must
+        // carry the edge itself; a write that leaves relations untouched is
+        // checked against the stored edges.
+        if final_status == "superseded" {
+            let has_supersedes = match relations {
+                Some(ref rels) => rels.iter().any(|r| r.relation == "supersedes"),
+                None => {
+                    let mut stmt = conn.prepare(
+                        "SELECT COUNT(*) FROM intelligence_edges WHERE from_node_id = ?1 AND relation = 'supersedes'",
+                    )?;
+                    let count: i64 =
+                        stmt.query_row(rusqlite::params![&node_id], |row| row.get(0))?;
+                    count > 0
+                }
+            };
             if !has_supersedes {
                 anyhow::bail!(
                     "status 'superseded' requires a 'supersedes' edge pointing to the replacing node"
@@ -398,40 +660,64 @@ impl Database {
             }
         }
 
-        conn.execute(
-            "INSERT INTO intelligence_nodes (
-                id, kind, status, title, body, metadata, project_hash, session_id, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-            ON CONFLICT(id) DO UPDATE SET
-                kind = excluded.kind,
-                status = excluded.status,
-                title = excluded.title,
-                body = excluded.body,
-                metadata = excluded.metadata,
-                project_hash = excluded.project_hash,
-                session_id = excluded.session_id,
-                updated_at = excluded.updated_at",
-            rusqlite::params![
-                node_id,
-                kind,
-                status,
-                title,
-                body,
-                metadata,
-                project_hash,
-                session_id,
-                now,
-                now
-            ],
-        )?;
+        // Dynamic UPDATE: only SET columns that changed (plus updated_at).
+        // Each entry is (SET clause, boxed value) so the statement text and
+        // the parameter list are built together.
+        let mut set_clauses: Vec<&str> = Vec::new();
+        let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if changed_fields.iter().any(|f| f == "kind") {
+            set_clauses.push("kind = ?");
+            values.push(Box::new(final_kind));
+        }
+        if changed_fields.iter().any(|f| f == "status") {
+            set_clauses.push("status = ?");
+            values.push(Box::new(final_status));
+        }
+        if changed_fields.iter().any(|f| f == "title") {
+            set_clauses.push("title = ?");
+            values.push(Box::new(final_title));
+        }
+        if changed_fields.iter().any(|f| f == "body") {
+            set_clauses.push("body = ?");
+            values.push(Box::new(final_body));
+        }
+        if changed_fields.iter().any(|f| f == "metadata") {
+            set_clauses.push("metadata = ?");
+            values.push(Box::new(final_metadata));
+        }
+        if changed_fields.iter().any(|f| f == "project_hash") {
+            set_clauses.push("project_hash = ?");
+            values.push(Box::new(final_project_hash));
+        }
+        if changed_fields.iter().any(|f| f == "session_id") {
+            set_clauses.push("session_id = ?");
+            values.push(Box::new(final_session_id));
+        }
+        set_clauses.push("updated_at = ?");
+        values.push(Box::new(now));
+        let sql = format!(
+            "UPDATE intelligence_nodes SET {} WHERE id = ?",
+            set_clauses.join(", ")
+        );
+        {
+            let params: Vec<&dyn rusqlite::types::ToSql> =
+                values.iter().map(|v| v.as_ref()).collect();
+            // The WHERE id is the trailing parameter after every SET value.
+            let mut all: Vec<&dyn rusqlite::types::ToSql> = params;
+            all.push(&node_id);
+            conn.execute(&sql, all.as_slice())?;
+        }
 
-        conn.execute(
-            "DELETE FROM intelligence_edges WHERE from_node_id = ?1",
-            rusqlite::params![&node_id],
-        )?;
-
-        if let Some(relations) = relations {
-            for relation in relations {
+        // Relations follow the same rule: not mentioning them leaves the
+        // node's relations alone; sending a list (even an empty one)
+        // replaces them.
+        if let Some(rels) = relations {
+            changed_fields.push("relations".to_string());
+            conn.execute(
+                "DELETE FROM intelligence_edges WHERE from_node_id = ?1",
+                rusqlite::params![&node_id],
+            )?;
+            for relation in rels {
                 conn.execute(
                     "INSERT INTO intelligence_edges (
                         from_node_id, to_node_id, relation, weight, created_at
@@ -446,17 +732,24 @@ impl Database {
                 )?;
             }
         }
+        changed_fields.push("updated_at".to_string());
 
         drop(conn);
         let record = self
             .get_intelligence_node(&node_id)?
-            .ok_or_else(|| anyhow!("Failed to load intelligence node '{}'", node_id))?;
+            .ok_or_else(|| anyhow!("Failed to load intelligence node '{node_id}'"))?;
         // Write-time signals, computed after the write lands: duplicate
         // candidates (shared citations, then lexical ranking) and references
         // to existing nodes that were mentioned but not declared as edges.
         let duplicates = self.detect_duplicate_candidates(&record);
         let undeclared_references = self.extract_undeclared_references(&record)?;
-        Ok((record, was_created, duplicates, undeclared_references))
+        Ok(UpsertResult {
+            record,
+            created: false,
+            duplicates,
+            undeclared_references,
+            changed_fields,
+        })
     }
 
     /// Write-time duplicate candidates for `node`, strongest signal first.
@@ -970,22 +1263,25 @@ impl Database {
     ) -> Result<IntelligenceNodeRecord> {
         self.upsert_intelligence_node(IntelligenceNodeInput {
             id: Some(format!("project:{}", project.hash)),
-            kind: "project".to_string(),
+            kind: Some("project".to_string()),
             status: None,
-            title: project.name.clone(),
-            body: project
-                .description
-                .clone()
-                .unwrap_or_else(|| project.path.clone()),
-            metadata: Some(serde_json::json!({
+            title: Some(project.name.clone()),
+            body: Some(
+                project
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| project.path.clone()),
+            ),
+            metadata: Some(Some(serde_json::json!({
                 "source": "registry",
                 "path": project.path,
-            })),
-            project_hash: Some(project.hash.clone()),
+            }))),
+            project_hash: Some(Some(project.hash.clone())),
             session_id: None,
+            body_replace: None,
             relations: None,
         })
-        .map(|(record, _created, _duplicates, _undeclared)| record)
+        .map(|result| result.record)
     }
 
     /// Create missing `kind='project'` root nodes for already-registered
@@ -1895,11 +2191,12 @@ mod tests {
     fn sample_node_input(id: &str) -> IntelligenceNodeInput {
         IntelligenceNodeInput {
             id: Some(id.to_string()),
-            kind: "fact".to_string(),
+            kind: Some("fact".to_string()),
             status: None,
-            title: format!("Node {id}"),
-            body: "Test body".to_string(),
-            project_hash: Some("proj1".to_string()),
+            title: Some(format!("Node {id}")),
+            body: Some("Test body".to_string()),
+            body_replace: None,
+            project_hash: Some(Some("proj1".to_string())),
             session_id: None,
             metadata: None,
             relations: None,
@@ -1949,9 +2246,9 @@ mod tests {
     fn list_intelligence_nodes_by_kind() {
         let db = test_db();
         let mut input1 = sample_node_input("node1");
-        input1.kind = "fact".to_string();
+        input1.kind = Some("fact".to_string());
         let mut input2 = sample_node_input("node2");
-        input2.kind = "pattern".to_string();
+        input2.kind = Some("pattern".to_string());
         db.upsert_intelligence_node(input1).unwrap();
         db.upsert_intelligence_node(input2).unwrap();
 
@@ -2095,9 +2392,9 @@ mod tests {
     fn list_intelligence_projects_with_projects() {
         let db = test_db();
         let mut input1 = sample_node_input("proj1");
-        input1.kind = "project".to_string();
+        input1.kind = Some("project".to_string());
         let mut input2 = sample_node_input("proj2");
-        input2.kind = "project".to_string();
+        input2.kind = Some("project".to_string());
         db.upsert_intelligence_node(input1).unwrap();
         db.upsert_intelligence_node(input2).unwrap();
 
@@ -2115,12 +2412,13 @@ mod tests {
         for id in [full, "3a476c99-dead-4860-9c18-1c784b40a4b2"] {
             db.upsert_intelligence_node(IntelligenceNodeInput {
                 id: Some(id.to_string()),
-                kind: "fact".to_string(),
+                kind: Some("fact".to_string()),
                 status: None,
-                title: "Original".to_string(),
-                body: "body".to_string(),
+                title: Some("Original".to_string()),
+                body: Some("body".to_string()),
+                body_replace: None,
                 metadata: None,
-                project_hash: Some("proj-a".to_string()),
+                project_hash: Some(Some("proj-a".to_string())),
                 session_id: None,
                 relations: None,
             })
@@ -2138,12 +2436,13 @@ mod tests {
         for id in [id1, id2] {
             db.upsert_intelligence_node(IntelligenceNodeInput {
                 id: Some(id.to_string()),
-                kind: "fact".to_string(),
+                kind: Some("fact".to_string()),
                 status: None,
-                title: format!("Node {id}"),
-                body: "body".to_string(),
+                title: Some(format!("Node {id}")),
+                body: Some("body".to_string()),
+                body_replace: None,
                 metadata: None,
-                project_hash: Some("proj-a".to_string()),
+                project_hash: Some(Some("proj-a".to_string())),
                 session_id: None,
                 relations: None,
             })
@@ -2164,12 +2463,13 @@ mod tests {
         let db = test_db();
         db.upsert_intelligence_node(IntelligenceNodeInput {
             id: Some("xyz-0000-0000-0000-000000000001".to_string()),
-            kind: "fact".to_string(),
+            kind: Some("fact".to_string()),
             status: None,
-            title: "X".to_string(),
-            body: "body".to_string(),
+            title: Some("X".to_string()),
+            body: Some("body".to_string()),
+            body_replace: None,
             metadata: None,
-            project_hash: Some("proj-a".to_string()),
+            project_hash: Some(Some("proj-a".to_string())),
             session_id: None,
             relations: None,
         })
@@ -2190,12 +2490,13 @@ mod tests {
         ] {
             db.upsert_intelligence_node(IntelligenceNodeInput {
                 id: Some(id.to_string()),
-                kind: "fact".to_string(),
+                kind: Some("fact".to_string()),
                 status: None,
-                title: "N".to_string(),
-                body: "body".to_string(),
+                title: Some("N".to_string()),
+                body: Some("body".to_string()),
+                body_replace: None,
                 metadata: None,
-                project_hash: Some("proj-a".to_string()),
+                project_hash: Some(Some("proj-a".to_string())),
                 session_id: None,
                 relations: None,
             })
@@ -2208,20 +2509,21 @@ mod tests {
     #[test]
     fn upsert_returns_created_true_for_new_node() {
         let db = test_db();
-        let (_record, created, _, _) = db
+        let result = db
             .upsert_intelligence_node(IntelligenceNodeInput {
                 id: Some("new-node-1".to_string()),
-                kind: "fact".to_string(),
+                kind: Some("fact".to_string()),
                 status: None,
-                title: "First".to_string(),
-                body: "body".to_string(),
+                title: Some("First".to_string()),
+                body: Some("body".to_string()),
+                body_replace: None,
                 metadata: None,
-                project_hash: Some("proj-a".to_string()),
+                project_hash: Some(Some("proj-a".to_string())),
                 session_id: None,
                 relations: None,
             })
             .unwrap();
-        assert!(created, "expected created=true for new node");
+        assert!(result.created, "expected created=true for new node");
     }
 
     #[test]
@@ -2230,31 +2532,33 @@ mod tests {
         let id = "existing-node-1";
         db.upsert_intelligence_node(IntelligenceNodeInput {
             id: Some(id.to_string()),
-            kind: "fact".to_string(),
+            kind: Some("fact".to_string()),
             status: None,
-            title: "First".to_string(),
-            body: "body".to_string(),
+            title: Some("First".to_string()),
+            body: Some("body".to_string()),
+            body_replace: None,
             metadata: None,
-            project_hash: Some("proj-a".to_string()),
+            project_hash: Some(Some("proj-a".to_string())),
             session_id: None,
             relations: None,
         })
         .unwrap();
-        let (record, created, _, _) = db
+        let result = db
             .upsert_intelligence_node(IntelligenceNodeInput {
                 id: Some(id.to_string()),
-                kind: "fact".to_string(),
+                kind: Some("fact".to_string()),
                 status: None,
-                title: "Updated".to_string(),
-                body: "body2".to_string(),
+                title: Some("Updated".to_string()),
+                body: Some("body2".to_string()),
+                body_replace: None,
                 metadata: None,
-                project_hash: Some("proj-a".to_string()),
+                project_hash: Some(Some("proj-a".to_string())),
                 session_id: None,
                 relations: None,
             })
             .unwrap();
-        assert!(!created, "expected created=false for update");
-        assert_eq!(record.title, "Updated");
+        assert!(!result.created, "expected created=false for update");
+        assert_eq!(result.record.title, "Updated");
     }
 
     #[test]
@@ -2263,12 +2567,13 @@ mod tests {
         let full = "3a476c63-6b4a-4860-9c18-1c784b40a4b2";
         db.upsert_intelligence_node(IntelligenceNodeInput {
             id: Some(full.to_string()),
-            kind: "fact".to_string(),
+            kind: Some("fact".to_string()),
             status: None,
-            title: "Original".to_string(),
-            body: "body".to_string(),
+            title: Some("Original".to_string()),
+            body: Some("body".to_string()),
+            body_replace: None,
             metadata: None,
-            project_hash: Some("proj-a".to_string()),
+            project_hash: Some(Some("proj-a".to_string())),
             session_id: None,
             relations: None,
         })
@@ -2276,22 +2581,26 @@ mod tests {
         // Simulate handler prefix resolution: 8-char prefix should resolve to full.
         let resolved = db.resolve_node_id_by_prefix("3a476c63").unwrap().unwrap();
         assert_eq!(resolved, full);
-        let (record, created, _, _) = db
+        let result = db
             .upsert_intelligence_node(IntelligenceNodeInput {
                 id: Some(resolved),
-                kind: "fact".to_string(),
+                kind: Some("fact".to_string()),
                 status: None,
-                title: "Updated via prefix".to_string(),
-                body: "body2".to_string(),
+                title: Some("Updated via prefix".to_string()),
+                body: Some("body2".to_string()),
+                body_replace: None,
                 metadata: None,
-                project_hash: Some("proj-a".to_string()),
+                project_hash: Some(Some("proj-a".to_string())),
                 session_id: None,
                 relations: None,
             })
             .unwrap();
-        assert!(!created, "prefix upsert should be update, not create");
-        assert_eq!(record.id, full);
-        assert_eq!(record.title, "Updated via prefix");
+        assert!(
+            !result.created,
+            "prefix upsert should be update, not create"
+        );
+        assert_eq!(result.record.id, full);
+        assert_eq!(result.record.title, "Updated via prefix");
         // Ensure no duplicate was created.
         let all = db.list_intelligence_nodes(None, 100).unwrap();
         assert_eq!(all.len(), 1);
@@ -2305,12 +2614,13 @@ mod tests {
         for id in [id1, id2] {
             db.upsert_intelligence_node(IntelligenceNodeInput {
                 id: Some(id.to_string()),
-                kind: "fact".to_string(),
+                kind: Some("fact".to_string()),
                 status: None,
-                title: format!("Node {id}"),
-                body: "body".to_string(),
+                title: Some(format!("Node {id}")),
+                body: Some("body".to_string()),
+                body_replace: None,
                 metadata: None,
-                project_hash: Some("proj-a".to_string()),
+                project_hash: Some(Some("proj-a".to_string())),
                 session_id: None,
                 relations: None,
             })
@@ -2329,12 +2639,13 @@ mod tests {
         let full = "deadbeef-0000-0000-0000-000000000001";
         db.upsert_intelligence_node(IntelligenceNodeInput {
             id: Some(full.to_string()),
-            kind: "fact".to_string(),
+            kind: Some("fact".to_string()),
             status: None,
-            title: "Root".to_string(),
-            body: "body".to_string(),
+            title: Some("Root".to_string()),
+            body: Some("body".to_string()),
+            body_replace: None,
             metadata: None,
-            project_hash: Some("proj-a".to_string()),
+            project_hash: Some(Some("proj-a".to_string())),
             session_id: None,
             relations: None,
         })
@@ -2350,12 +2661,13 @@ mod tests {
         let full = "feedface-0000-0000-0000-000000000001";
         db.upsert_intelligence_node(IntelligenceNodeInput {
             id: Some(full.to_string()),
-            kind: "fact".to_string(),
+            kind: Some("fact".to_string()),
             status: None,
-            title: "To delete".to_string(),
-            body: "body".to_string(),
+            title: Some("To delete".to_string()),
+            body: Some("body".to_string()),
+            body_replace: None,
             metadata: None,
-            project_hash: Some("proj-a".to_string()),
+            project_hash: Some(Some("proj-a".to_string())),
             session_id: None,
             relations: None,
         })
@@ -2392,10 +2704,11 @@ mod tests {
             for (id, kind) in [("fact1", "fact"), ("pattern1", "pattern")] {
                 db.upsert_intelligence_node(IntelligenceNodeInput {
                     id: Some(id.to_string()),
-                    kind: kind.to_string(),
+                    kind: Some(kind.to_string()),
                     status: None,
-                    title: format!("Knowledge {id}"),
-                    body: "knowledge body".to_string(),
+                    title: Some(format!("Knowledge {id}")),
+                    body: Some("knowledge body".to_string()),
+                    body_replace: None,
                     metadata: None,
                     project_hash: None,
                     session_id: None,
@@ -2524,10 +2837,11 @@ mod tests {
         let db = test_db();
         db.upsert_intelligence_node(IntelligenceNodeInput {
             id: Some("fact-search".to_string()),
-            kind: "fact".to_string(),
+            kind: Some("fact".to_string()),
             status: None,
-            title: "UniqueSearchTerm Fact Title".to_string(),
-            body: "body".to_string(),
+            title: Some("UniqueSearchTerm Fact Title".to_string()),
+            body: Some("body".to_string()),
+            body_replace: None,
             metadata: None,
             project_hash: None,
             session_id: None,
@@ -2590,7 +2904,7 @@ mod tests {
         let db = test_db();
         let err = db
             .upsert_intelligence_node(IntelligenceNodeInput {
-                kind: "unknown".to_string(),
+                kind: Some("unknown".to_string()),
                 ..sample_node_input("bad-kind")
             })
             .unwrap_err();
@@ -2618,10 +2932,10 @@ mod tests {
     #[test]
     fn upsert_defaults_status_to_noted() {
         let db = test_db();
-        let (record, _, _, _) = db
+        let result = db
             .upsert_intelligence_node(sample_node_input("default-status"))
             .unwrap();
-        assert_eq!(record.status, "noted");
+        assert_eq!(result.record.status, "noted");
     }
 
     #[test]
@@ -2643,7 +2957,7 @@ mod tests {
         let db = test_db();
         db.upsert_intelligence_node(sample_node_input("sup-a"))
             .unwrap();
-        let (record, _, _, _) = db
+        let result = db
             .upsert_intelligence_node(IntelligenceNodeInput {
                 status: Some("superseded".to_string()),
                 relations: Some(vec![IntelligenceRelationInput {
@@ -2654,7 +2968,7 @@ mod tests {
                 ..sample_node_input("sup-b")
             })
             .unwrap();
-        assert_eq!(record.status, "superseded");
+        assert_eq!(result.record.status, "superseded");
     }
 
     #[test]
@@ -2682,20 +2996,22 @@ mod tests {
     fn duplicate_detection_shared_citations() {
         let db = test_db();
         db.upsert_intelligence_node(IntelligenceNodeInput {
-            body: "see src/foo.rs:42 for the implementation".to_string(),
+            body: Some("see src/foo.rs:42 for the implementation".to_string()),
+            body_replace: None,
             ..sample_node_input("cite-a")
         })
         .unwrap();
-        let (_, _, duplicates, _) = db
+        let result = db
             .upsert_intelligence_node(IntelligenceNodeInput {
-                body: "also see src/foo.rs:42".to_string(),
+                body: Some("also see src/foo.rs:42".to_string()),
+                body_replace: None,
                 ..sample_node_input("cite-b")
             })
             .unwrap();
         assert!(
-            duplicates.iter().any(|n| n.id == "cite-a"),
+            result.duplicates.iter().any(|n| n.id == "cite-a"),
             "expected cite-a among duplicates, got: {:?}",
-            duplicates.iter().map(|n| &n.id).collect::<Vec<_>>()
+            result.duplicates.iter().map(|n| &n.id).collect::<Vec<_>>()
         );
     }
 
@@ -2703,20 +3019,20 @@ mod tests {
     fn duplicate_detection_lexical_similarity() {
         let db = test_db();
         db.upsert_intelligence_node(IntelligenceNodeInput {
-            title: "Database connection cache".to_string(),
+            title: Some("Database connection cache".to_string()),
             ..sample_node_input("lex-a")
         })
         .unwrap();
-        let (_, _, duplicates, _) = db
+        let result = db
             .upsert_intelligence_node(IntelligenceNodeInput {
-                title: "Database connection cache strategy".to_string(),
+                title: Some("Database connection cache strategy".to_string()),
                 ..sample_node_input("lex-b")
             })
             .unwrap();
         assert!(
-            duplicates.iter().any(|n| n.id == "lex-a"),
+            result.duplicates.iter().any(|n| n.id == "lex-a"),
             "expected lex-a among duplicates, got: {:?}",
-            duplicates.iter().map(|n| &n.id).collect::<Vec<_>>()
+            result.duplicates.iter().map(|n| &n.id).collect::<Vec<_>>()
         );
     }
 
@@ -2733,9 +3049,10 @@ mod tests {
         // alongside its undeclared reference.
         db.upsert_intelligence_node(sample_node_input("undecl-c"))
             .unwrap();
-        let (_, _, _, undeclared) = db
+        let result = db
             .upsert_intelligence_node(IntelligenceNodeInput {
-                body: format!("this builds on {node_a_id}"),
+                body: Some(format!("this builds on {node_a_id}")),
+                body_replace: None,
                 relations: Some(vec![IntelligenceRelationInput {
                     to_node_id: "undecl-c".to_string(),
                     relation: "extends".to_string(),
@@ -2745,23 +3062,29 @@ mod tests {
             })
             .unwrap();
         assert!(
-            undeclared.iter().any(|id| id == node_a_id),
-            "expected undeclared ref to {node_a_id}, got: {undeclared:?}"
+            result
+                .undeclared_references
+                .iter()
+                .any(|id| id == node_a_id),
+            "expected undeclared ref to {node_a_id}, got: {:?}",
+            result.undeclared_references
         );
     }
 
     #[test]
     fn no_warning_for_node_without_edges() {
         let db = test_db();
-        let (_, _, _, undeclared) = db
+        let result = db
             .upsert_intelligence_node(IntelligenceNodeInput {
-                body: "a fresh finding with no links".to_string(),
+                body: Some("a fresh finding with no links".to_string()),
+                body_replace: None,
                 ..sample_node_input("orphan")
             })
             .unwrap();
         assert!(
-            undeclared.is_empty(),
-            "expected no warning, got: {undeclared:?}"
+            result.undeclared_references.is_empty(),
+            "expected no warning, got: {:?}",
+            result.undeclared_references
         );
     }
 
@@ -2775,27 +3098,28 @@ mod tests {
         })
         .unwrap();
 
-        let (_, _, _, undeclared) = db
+        let result = db
             .upsert_intelligence_node(IntelligenceNodeInput {
-                body: format!("this builds on {referenced}"),
+                body: Some(format!("this builds on {referenced}")),
+                body_replace: None,
                 relations: None,
                 ..sample_node_input("unlinked")
             })
             .unwrap();
 
-        assert_eq!(undeclared, vec![referenced.to_string()]);
+        assert_eq!(result.undeclared_references, vec![referenced.to_string()]);
     }
 
     #[test]
     fn project_kind_exempt_from_kind_validation() {
         let db = test_db();
-        let (record, _, _, _) = db
+        let result = db
             .upsert_intelligence_node(IntelligenceNodeInput {
-                kind: "project".to_string(),
+                kind: Some("project".to_string()),
                 ..sample_node_input("proj-exempt")
             })
             .unwrap();
-        assert_eq!(record.kind, "project");
+        assert_eq!(result.record.kind, "project");
     }
 
     #[test]
@@ -2806,13 +3130,475 @@ mod tests {
             ..sample_node_input("keep-status")
         })
         .unwrap();
-        let (record, created, _, _) = db
+        let result = db
             .upsert_intelligence_node(IntelligenceNodeInput {
-                title: "Updated title".to_string(),
+                title: Some("Updated title".to_string()),
                 ..sample_node_input("keep-status")
             })
             .unwrap();
-        assert!(!created);
-        assert_eq!(record.status, "verified");
+        assert!(!result.created);
+        assert_eq!(result.record.status, "verified");
+    }
+
+    // ── CM11: partial update ───────────────────────────────────────
+
+    #[test]
+    fn partial_update_title_only_leaves_other_fields_unchanged() {
+        let db = test_db();
+        db.upsert_intelligence_node(IntelligenceNodeInput {
+            id: Some("partial-1".to_string()),
+            kind: Some("fact".to_string()),
+            status: Some("verified".to_string()),
+            title: Some("Original title".to_string()),
+            body: Some("Original body".to_string()),
+            body_replace: None,
+            metadata: Some(Some(serde_json::json!({"k": "v"}))),
+            project_hash: Some(Some("proj-a".to_string())),
+            session_id: Some(Some("sess-1".to_string())),
+            relations: None,
+        })
+        .unwrap();
+
+        let result = db
+            .upsert_intelligence_node(IntelligenceNodeInput {
+                id: Some("partial-1".to_string()),
+                kind: None,
+                status: None,
+                title: Some("Updated title".to_string()),
+                body: None,
+                body_replace: None,
+                metadata: None,
+                project_hash: None,
+                session_id: None,
+                relations: None,
+            })
+            .unwrap();
+
+        assert!(!result.created);
+        assert_eq!(result.record.title, "Updated title");
+        assert_eq!(result.record.body, "Original body");
+        assert_eq!(result.record.kind, "fact");
+        assert_eq!(result.record.status, "verified");
+        assert_eq!(result.record.metadata.as_deref(), Some(r#"{"k":"v"}"#));
+        assert_eq!(result.record.project_hash.as_deref(), Some("proj-a"));
+        assert_eq!(result.record.session_id.as_deref(), Some("sess-1"));
+        assert!(result.changed_fields.contains(&"title".to_string()));
+        assert!(result.changed_fields.contains(&"updated_at".to_string()));
+        assert!(!result.changed_fields.contains(&"body".to_string()));
+        assert!(!result.changed_fields.contains(&"kind".to_string()));
+        assert!(!result.changed_fields.contains(&"metadata".to_string()));
+    }
+
+    #[test]
+    fn partial_update_omitting_relations_leaves_them_in_place() {
+        let db = test_db();
+        db.upsert_intelligence_node(sample_node_input("rel-keep-target"))
+            .unwrap();
+        db.upsert_intelligence_node(IntelligenceNodeInput {
+            relations: Some(vec![IntelligenceRelationInput {
+                to_node_id: "rel-keep-target".to_string(),
+                relation: "extends".to_string(),
+                weight: None,
+            }]),
+            ..sample_node_input("rel-keep-src")
+        })
+        .unwrap();
+
+        let result = db
+            .upsert_intelligence_node(IntelligenceNodeInput {
+                id: Some("rel-keep-src".to_string()),
+                kind: None,
+                status: None,
+                title: Some("New title".to_string()),
+                body: None,
+                body_replace: None,
+                metadata: None,
+                project_hash: None,
+                session_id: None,
+                relations: None,
+            })
+            .unwrap();
+
+        assert!(!result.created);
+        assert!(
+            !result.changed_fields.contains(&"relations".to_string()),
+            "omitted relations must not be reported as changed: {:?}",
+            result.changed_fields
+        );
+        let edges = db
+            .list_recent_intelligence_edges("rel-keep-target")
+            .unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].from_node_id, "rel-keep-src");
+    }
+
+    #[test]
+    fn partial_update_empty_relations_clears_them() {
+        let db = test_db();
+        db.upsert_intelligence_node(sample_node_input("rel-clear-target"))
+            .unwrap();
+        db.upsert_intelligence_node(IntelligenceNodeInput {
+            relations: Some(vec![IntelligenceRelationInput {
+                to_node_id: "rel-clear-target".to_string(),
+                relation: "extends".to_string(),
+                weight: None,
+            }]),
+            ..sample_node_input("rel-clear-src")
+        })
+        .unwrap();
+
+        let result = db
+            .upsert_intelligence_node(IntelligenceNodeInput {
+                id: Some("rel-clear-src".to_string()),
+                kind: None,
+                status: None,
+                title: None,
+                body: None,
+                body_replace: None,
+                metadata: None,
+                project_hash: None,
+                session_id: None,
+                relations: Some(vec![]),
+            })
+            .unwrap();
+
+        assert!(!result.created);
+        assert!(result.changed_fields.contains(&"relations".to_string()));
+        assert!(db
+            .list_recent_intelligence_edges("rel-clear-target")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn body_replace_single_match_changes_only_fragment() {
+        let db = test_db();
+        db.upsert_intelligence_node(IntelligenceNodeInput {
+            id: Some("br-1".to_string()),
+            kind: Some("fact".to_string()),
+            status: None,
+            title: Some("T".to_string()),
+            body: Some("foo bar baz".to_string()),
+            body_replace: None,
+            metadata: None,
+            project_hash: None,
+            session_id: None,
+            relations: None,
+        })
+        .unwrap();
+
+        let result = db
+            .upsert_intelligence_node(IntelligenceNodeInput {
+                id: Some("br-1".to_string()),
+                kind: None,
+                status: None,
+                title: None,
+                body: None,
+                body_replace: Some(BodyReplace {
+                    fragment: "bar".to_string(),
+                    replacement: "qux".to_string(),
+                }),
+                metadata: None,
+                project_hash: None,
+                session_id: None,
+                relations: None,
+            })
+            .unwrap();
+
+        assert!(!result.created);
+        assert_eq!(result.record.body, "foo qux baz");
+        assert_eq!(
+            result.changed_fields,
+            vec!["body".to_string(), "updated_at".to_string()]
+        );
+    }
+
+    #[test]
+    fn body_replace_zero_matches_fails_and_changes_nothing() {
+        let db = test_db();
+        db.upsert_intelligence_node(IntelligenceNodeInput {
+            id: Some("br-zero".to_string()),
+            kind: Some("fact".to_string()),
+            status: None,
+            title: Some("T".to_string()),
+            body: Some("foo bar".to_string()),
+            body_replace: None,
+            metadata: None,
+            project_hash: None,
+            session_id: None,
+            relations: None,
+        })
+        .unwrap();
+
+        let err = db
+            .upsert_intelligence_node(IntelligenceNodeInput {
+                id: Some("br-zero".to_string()),
+                kind: None,
+                status: None,
+                title: None,
+                body: None,
+                body_replace: Some(BodyReplace {
+                    fragment: "xyz".to_string(),
+                    replacement: "qux".to_string(),
+                }),
+                metadata: None,
+                project_hash: None,
+                session_id: None,
+                relations: None,
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not found"),
+            "expected a not-found refusal, got: {err}"
+        );
+        let after = db.get_intelligence_node("br-zero").unwrap().unwrap();
+        assert_eq!(after.body, "foo bar");
+    }
+
+    #[test]
+    fn body_replace_two_matches_fails_and_changes_nothing() {
+        let db = test_db();
+        db.upsert_intelligence_node(IntelligenceNodeInput {
+            id: Some("br-two".to_string()),
+            kind: Some("fact".to_string()),
+            status: None,
+            title: Some("T".to_string()),
+            body: Some("bar foo bar".to_string()),
+            body_replace: None,
+            metadata: None,
+            project_hash: None,
+            session_id: None,
+            relations: None,
+        })
+        .unwrap();
+
+        let err = db
+            .upsert_intelligence_node(IntelligenceNodeInput {
+                id: Some("br-two".to_string()),
+                kind: None,
+                status: None,
+                title: None,
+                body: None,
+                body_replace: Some(BodyReplace {
+                    fragment: "bar".to_string(),
+                    replacement: "qux".to_string(),
+                }),
+                metadata: None,
+                project_hash: None,
+                session_id: None,
+                relations: None,
+            })
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ambiguous") && msg.contains("2 times"),
+            "expected an ambiguous-target refusal naming the count, got: {msg}"
+        );
+        let after = db.get_intelligence_node("br-two").unwrap().unwrap();
+        assert_eq!(after.body, "bar foo bar");
+    }
+
+    #[test]
+    fn body_and_body_replace_are_mutually_exclusive() {
+        let db = test_db();
+        db.upsert_intelligence_node(sample_node_input("br-excl"))
+            .unwrap();
+        let err = db
+            .upsert_intelligence_node(IntelligenceNodeInput {
+                body: Some("whole new body".to_string()),
+                body_replace: Some(BodyReplace {
+                    fragment: "Test".to_string(),
+                    replacement: "Best".to_string(),
+                }),
+                ..sample_node_input("br-excl")
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("mutually exclusive"),
+            "expected a mutual-exclusion refusal, got: {err}"
+        );
+    }
+
+    #[test]
+    fn create_without_id_still_works() {
+        let db = test_db();
+        let result = db
+            .upsert_intelligence_node(IntelligenceNodeInput {
+                id: None,
+                kind: Some("fact".to_string()),
+                status: None,
+                title: Some("Created".to_string()),
+                body: Some("Fresh body".to_string()),
+                body_replace: None,
+                metadata: None,
+                project_hash: Some(Some("proj-a".to_string())),
+                session_id: None,
+                relations: None,
+            })
+            .unwrap();
+        assert!(result.created);
+        assert!(!result.record.id.is_empty());
+        assert_eq!(result.record.title, "Created");
+        assert!(result.changed_fields.contains(&"title".to_string()));
+    }
+
+    #[test]
+    fn create_requires_kind_title_body() {
+        let db = test_db();
+        let err = db
+            .upsert_intelligence_node(IntelligenceNodeInput {
+                id: None,
+                kind: None,
+                status: None,
+                title: Some("T".to_string()),
+                body: Some("B".to_string()),
+                body_replace: None,
+                metadata: None,
+                project_hash: None,
+                session_id: None,
+                relations: None,
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("create requires"),
+            "expected a create-requires refusal, got: {err}"
+        );
+    }
+
+    #[test]
+    fn changed_fields_names_what_changed() {
+        let db = test_db();
+        db.upsert_intelligence_node(IntelligenceNodeInput {
+            id: Some("cf-1".to_string()),
+            kind: Some("fact".to_string()),
+            status: None,
+            title: Some("T".to_string()),
+            body: Some("B".to_string()),
+            body_replace: None,
+            metadata: Some(Some(serde_json::json!({"a": 1}))),
+            project_hash: None,
+            session_id: None,
+            relations: None,
+        })
+        .unwrap();
+
+        let result = db
+            .upsert_intelligence_node(IntelligenceNodeInput {
+                id: Some("cf-1".to_string()),
+                kind: None,
+                status: None,
+                title: Some("T2".to_string()),
+                body: None,
+                body_replace: None,
+                metadata: Some(Some(serde_json::json!({"a": 2}))),
+                project_hash: None,
+                session_id: None,
+                relations: None,
+            })
+            .unwrap();
+
+        assert!(result.changed_fields.contains(&"title".to_string()));
+        assert!(result.changed_fields.contains(&"metadata".to_string()));
+        assert!(!result.changed_fields.contains(&"body".to_string()));
+        assert!(!result.changed_fields.contains(&"kind".to_string()));
+        assert!(!result.changed_fields.contains(&"status".to_string()));
+        assert!(!result.changed_fields.contains(&"relations".to_string()));
+    }
+
+    #[test]
+    fn explicit_null_clears_nullable_fields() {
+        let db = test_db();
+        db.upsert_intelligence_node(IntelligenceNodeInput {
+            id: Some("null-1".to_string()),
+            kind: Some("fact".to_string()),
+            status: None,
+            title: Some("T".to_string()),
+            body: Some("B".to_string()),
+            body_replace: None,
+            metadata: Some(Some(serde_json::json!({"a": 1}))),
+            project_hash: Some(Some("proj-a".to_string())),
+            session_id: None,
+            relations: None,
+        })
+        .unwrap();
+
+        let result = db
+            .upsert_intelligence_node(IntelligenceNodeInput {
+                id: Some("null-1".to_string()),
+                kind: None,
+                status: None,
+                title: None,
+                body: None,
+                body_replace: None,
+                metadata: Some(None),
+                project_hash: Some(None),
+                session_id: None,
+                relations: None,
+            })
+            .unwrap();
+
+        assert!(!result.created);
+        assert_eq!(result.record.metadata, None);
+        assert_eq!(result.record.project_hash, None);
+        assert_eq!(result.record.title, "T");
+        assert!(result.changed_fields.contains(&"metadata".to_string()));
+        assert!(result.changed_fields.contains(&"project_hash".to_string()));
+    }
+
+    #[test]
+    fn body_replace_real_case_hooks_decision() {
+        // The real case: one stale line inside a body of several thousand
+        // characters, corrected without touching anything else.
+        let db = test_db();
+        let filler = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. ".repeat(100);
+        let stale = "fuera de esta versión: hooks internos";
+        let body = format!("{filler}\n{stale}\n{filler}");
+        assert!(body.len() > 6000);
+        assert_eq!(body.matches(stale).count(), 1);
+        db.upsert_intelligence_node(IntelligenceNodeInput {
+            id: Some("hooks-decision".to_string()),
+            kind: Some("decision".to_string()),
+            status: None,
+            title: Some("Scope".to_string()),
+            body: Some(body.clone()),
+            body_replace: None,
+            metadata: None,
+            project_hash: None,
+            session_id: None,
+            relations: None,
+        })
+        .unwrap();
+
+        let result = db
+            .upsert_intelligence_node(IntelligenceNodeInput {
+                id: Some("hooks-decision".to_string()),
+                kind: None,
+                status: None,
+                title: None,
+                body: None,
+                body_replace: Some(BodyReplace {
+                    fragment: stale.to_string(),
+                    replacement: "dentro de esta versión: hooks internos".to_string(),
+                }),
+                metadata: None,
+                project_hash: None,
+                session_id: None,
+                relations: None,
+            })
+            .unwrap();
+
+        let expected = body.replacen(stale, "dentro de esta versión: hooks internos", 1);
+        assert_eq!(result.record.body, expected);
+        // Everything before and after the fragment is byte-identical.
+        let at = body.find(stale).unwrap();
+        assert_eq!(&result.record.body[..at], &body[..at]);
+        assert_eq!(
+            &result.record.body[at + "dentro de esta versión: hooks internos".len()..],
+            &body[at + stale.len()..]
+        );
+        assert_eq!(
+            result.changed_fields,
+            vec!["body".to_string(), "updated_at".to_string()]
+        );
     }
 }

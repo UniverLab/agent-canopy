@@ -413,10 +413,45 @@ mod tests {
         });
         let params: IntelligenceUpsertParams =
             deserialize_params(&value).expect("well-formed nested params should still deserialize");
-        assert_eq!(params.node_data.kind, "fact");
+        assert_eq!(params.node_data.kind.as_deref(), Some("fact"));
         let relations = params.node_data.relations.expect("relations present");
         assert_eq!(relations.len(), 1);
         assert_eq!(relations[0].relation, "depends_on");
+    }
+
+    #[test]
+    fn nullable_node_fields_distinguish_absent_from_explicit_null() {
+        // FR2: omitting a doubly-optional field must leave the stored value
+        // untouched (`None`), while sending it as JSON `null` must be a
+        // request to clear it (`Some(None)`). Without `deserialize_with`
+        // both collapse to `None` and the clear path becomes unreachable
+        // over the MCP boundary.
+        let absent: IntelligenceUpsertParams = deserialize_params(&serde_json::json!({
+            "node_data": { "kind": "fact", "title": "t", "body": "b" }
+        }))
+        .expect("absent nullable fields deserialize");
+        assert_eq!(absent.node_data.metadata, None);
+        assert_eq!(absent.node_data.project_hash, None);
+        assert_eq!(absent.node_data.session_id, None);
+
+        let cleared: IntelligenceUpsertParams = deserialize_params(&serde_json::json!({
+            "node_data": {
+                "id": "n1",
+                "metadata": null,
+                "project_hash": null,
+                "session_id": null,
+            }
+        }))
+        .expect("explicit-null nullable fields deserialize");
+        assert_eq!(cleared.node_data.metadata, Some(None));
+        assert_eq!(cleared.node_data.project_hash, Some(None));
+        assert_eq!(cleared.node_data.session_id, Some(None));
+
+        let set: IntelligenceUpsertParams = deserialize_params(&serde_json::json!({
+            "node_data": { "id": "n1", "project_hash": "proj-a" }
+        }))
+        .expect("value-bearing nullable field deserializes");
+        assert_eq!(set.node_data.project_hash, Some(Some("proj-a".to_string())));
     }
 
     #[test]

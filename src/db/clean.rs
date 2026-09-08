@@ -735,12 +735,13 @@ mod tests {
             .unwrap();
         db.upsert_intelligence_node(crate::db::intelligence::IntelligenceNodeInput {
             id: None,
-            kind: "fact".to_string(),
+            kind: Some("fact".to_string()),
             status: None,
-            title: "x".to_string(),
-            body: "y".to_string(),
+            title: Some("x".to_string()),
+            body: Some("y".to_string()),
+            body_replace: None,
             metadata: None,
-            project_hash: Some("hash-x".to_string()),
+            project_hash: Some(Some("hash-x".to_string())),
             session_id: None,
             relations: None,
         })
@@ -954,12 +955,13 @@ mod tests {
             .unwrap();
         db.upsert_intelligence_node(crate::db::intelligence::IntelligenceNodeInput {
             id: None,
-            kind: "fact".to_string(),
+            kind: Some("fact".to_string()),
             status: None,
-            title: "c".to_string(),
-            body: "d".to_string(),
+            title: Some("c".to_string()),
+            body: Some("d".to_string()),
+            body_replace: None,
             metadata: None,
-            project_hash: Some(hash.to_string()),
+            project_hash: Some(Some(hash.to_string())),
             session_id: None,
             relations: None,
         })

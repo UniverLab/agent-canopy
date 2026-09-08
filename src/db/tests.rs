@@ -525,12 +525,13 @@ fn test_intelligence_upsert_search_and_graph_walk() {
     let db = test_db();
     db.upsert_intelligence_node(IntelligenceNodeInput {
         id: Some("node-b".to_string()),
-        kind: "pattern".to_string(),
+        kind: Some("pattern".to_string()),
         status: None,
-        title: "Connection caching".to_string(),
-        body: "Cache expensive clients".to_string(),
+        title: Some("Connection caching".to_string()),
+        body: Some("Cache expensive clients".to_string()),
+        body_replace: None,
         metadata: None,
-        project_hash: Some("project-1".to_string()),
+        project_hash: Some(Some("project-1".to_string())),
         session_id: None,
         relations: None,
     })
@@ -538,13 +539,14 @@ fn test_intelligence_upsert_search_and_graph_walk() {
     let base = db
         .upsert_intelligence_node(IntelligenceNodeInput {
             id: Some("node-a".to_string()),
-            kind: "fact".to_string(),
+            kind: Some("fact".to_string()),
             status: None,
-            title: "Database rule".to_string(),
-            body: "Use a single connection".to_string(),
-            metadata: Some(serde_json::json!({"topic": "db"})),
-            project_hash: Some("project-1".to_string()),
-            session_id: Some("session-1".to_string()),
+            title: Some("Database rule".to_string()),
+            body: Some("Use a single connection".to_string()),
+            body_replace: None,
+            metadata: Some(Some(serde_json::json!({"topic": "db"}))),
+            project_hash: Some(Some("project-1".to_string())),
+            session_id: Some(Some("session-1".to_string())),
             relations: Some(vec![IntelligenceRelationInput {
                 to_node_id: "node-b".to_string(),
                 relation: "extends".to_string(),
@@ -552,7 +554,7 @@ fn test_intelligence_upsert_search_and_graph_walk() {
             }]),
         })
         .unwrap()
-        .0;
+        .record;
 
     let search = db
         .search_intelligence_nodes("connection", Some("pattern"), 10)
@@ -574,12 +576,15 @@ fn test_intelligence_search_tokenizes_multi_term_queries() {
     let db = test_db();
     db.upsert_intelligence_node(IntelligenceNodeInput {
         id: Some("node-multi".to_string()),
-        kind: "fact".to_string(),
+        kind: Some("fact".to_string()),
         status: None,
-        title: "Alpha overview".to_string(),
-        body: "This section covers alpha in detail. Later on we discuss beta too.".to_string(),
+        title: Some("Alpha overview".to_string()),
+        body: Some(
+            "This section covers alpha in detail. Later on we discuss beta too.".to_string(),
+        ),
+        body_replace: None,
         metadata: None,
-        project_hash: Some("project-1".to_string()),
+        project_hash: Some(Some("project-1".to_string())),
         session_id: None,
         relations: None,
     })
@@ -616,12 +621,13 @@ fn test_intelligence_search_or_ranking() {
     // Node A: matches "retry" in body only → 1pt
     db.upsert_intelligence_node(IntelligenceNodeInput {
         id: Some("node-a".to_string()),
-        kind: "fact".to_string(),
+        kind: Some("fact".to_string()),
         status: None,
-        title: "Unrelated title".to_string(),
-        body: "Discusses retry strategies.".to_string(),
+        title: Some("Unrelated title".to_string()),
+        body: Some("Discusses retry strategies.".to_string()),
+        body_replace: None,
         metadata: None,
-        project_hash: Some("proj".to_string()),
+        project_hash: Some(Some("proj".to_string())),
         session_id: None,
         relations: None,
     })
@@ -630,12 +636,13 @@ fn test_intelligence_search_or_ranking() {
     // Node B: matches "retry" in title + "backoff" in body → 2 terms
     db.upsert_intelligence_node(IntelligenceNodeInput {
         id: Some("node-b".to_string()),
-        kind: "fact".to_string(),
+        kind: Some("fact".to_string()),
         status: None,
-        title: "Retry patterns".to_string(),
-        body: "Covers backoff strategies.".to_string(),
+        title: Some("Retry patterns".to_string()),
+        body: Some("Covers backoff strategies.".to_string()),
+        body_replace: None,
         metadata: None,
-        project_hash: Some("proj".to_string()),
+        project_hash: Some(Some("proj".to_string())),
         session_id: None,
         relations: None,
     })
@@ -644,12 +651,13 @@ fn test_intelligence_search_or_ranking() {
     // Node C: matches "retry", "backoff" and "future" in body → 3 terms
     db.upsert_intelligence_node(IntelligenceNodeInput {
         id: Some("node-c".to_string()),
-        kind: "fact".to_string(),
+        kind: Some("fact".to_string()),
         status: None,
-        title: "Overview".to_string(),
-        body: "Retry logic, backoff, and future plans.".to_string(),
+        title: Some("Overview".to_string()),
+        body: Some("Retry logic, backoff, and future plans.".to_string()),
+        body_replace: None,
         metadata: None,
-        project_hash: Some("proj".to_string()),
+        project_hash: Some(Some("proj".to_string())),
         session_id: None,
         relations: None,
     })
@@ -658,12 +666,13 @@ fn test_intelligence_search_or_ranking() {
     // Node D: matches nothing
     db.upsert_intelligence_node(IntelligenceNodeInput {
         id: Some("node-d".to_string()),
-        kind: "fact".to_string(),
+        kind: Some("fact".to_string()),
         status: None,
-        title: "Other".to_string(),
-        body: "Nothing relevant.".to_string(),
+        title: Some("Other".to_string()),
+        body: Some("Nothing relevant.".to_string()),
+        body_replace: None,
         metadata: None,
-        project_hash: Some("proj".to_string()),
+        project_hash: Some(Some("proj".to_string())),
         session_id: None,
         relations: None,
     })
@@ -701,24 +710,26 @@ fn test_intelligence_search_ranks_title_over_body_on_equal_term_count() {
     // would put the body match on top — only the field weighting flips them.
     db.upsert_intelligence_node(IntelligenceNodeInput {
         id: Some("title-hit".to_string()),
-        kind: "fact".to_string(),
+        kind: Some("fact".to_string()),
         status: None,
-        title: "Resilience".to_string(),
-        body: "Body text with no query terms at all.".to_string(),
+        title: Some("Resilience".to_string()),
+        body: Some("Body text with no query terms at all.".to_string()),
+        body_replace: None,
         metadata: None,
-        project_hash: Some("proj".to_string()),
+        project_hash: Some(Some("proj".to_string())),
         session_id: None,
         relations: None,
     })
     .unwrap();
     db.upsert_intelligence_node(IntelligenceNodeInput {
         id: Some("body-hit".to_string()),
-        kind: "fact".to_string(),
+        kind: Some("fact".to_string()),
         status: None,
-        title: "Generic heading".to_string(),
-        body: "A passing mention of resilience somewhere in here.".to_string(),
+        title: Some("Generic heading".to_string()),
+        body: Some("A passing mention of resilience somewhere in here.".to_string()),
+        body_replace: None,
         metadata: None,
-        project_hash: Some("proj".to_string()),
+        project_hash: Some(Some("proj".to_string())),
         session_id: None,
         relations: None,
     })
@@ -739,12 +750,13 @@ fn test_intelligence_search_zero_match_returns_count() {
     for i in 0..3 {
         db.upsert_intelligence_node(IntelligenceNodeInput {
             id: Some(format!("node-{i}")),
-            kind: "fact".to_string(),
+            kind: Some("fact".to_string()),
             status: None,
-            title: format!("Fact {i}"),
-            body: format!("Body {i}"),
+            title: Some(format!("Fact {i}")),
+            body: Some(format!("Body {i}")),
+            body_replace: None,
             metadata: None,
-            project_hash: Some("proj".to_string()),
+            project_hash: Some(Some("proj".to_string())),
             session_id: None,
             relations: None,
         })
@@ -2898,24 +2910,26 @@ fn test_list_cross_project_dependencies_returns_only_project_links() {
 
     db.upsert_intelligence_node(IntelligenceNodeInput {
         id: Some("project-b".to_string()),
-        kind: "project".to_string(),
+        kind: Some("project".to_string()),
         status: None,
-        title: "Project B".to_string(),
-        body: "B".to_string(),
+        title: Some("Project B".to_string()),
+        body: Some("B".to_string()),
+        body_replace: None,
         metadata: None,
-        project_hash: Some("hash-b".to_string()),
+        project_hash: Some(Some("hash-b".to_string())),
         session_id: None,
         relations: None,
     })
     .unwrap();
     db.upsert_intelligence_node(IntelligenceNodeInput {
         id: Some("project-a".to_string()),
-        kind: "project".to_string(),
+        kind: Some("project".to_string()),
         status: None,
-        title: "Project A".to_string(),
-        body: "A".to_string(),
+        title: Some("Project A".to_string()),
+        body: Some("A".to_string()),
+        body_replace: None,
         metadata: None,
-        project_hash: Some("hash-a".to_string()),
+        project_hash: Some(Some("hash-a".to_string())),
         session_id: None,
         relations: Some(vec![IntelligenceRelationInput {
             to_node_id: "project-b".to_string(),
@@ -2926,10 +2940,11 @@ fn test_list_cross_project_dependencies_returns_only_project_links() {
     .unwrap();
     db.upsert_intelligence_node(IntelligenceNodeInput {
         id: Some("fact-1".to_string()),
-        kind: "fact".to_string(),
+        kind: Some("fact".to_string()),
         status: None,
-        title: "Fact".to_string(),
-        body: "Fact body".to_string(),
+        title: Some("Fact".to_string()),
+        body: Some("Fact body".to_string()),
+        body_replace: None,
         metadata: None,
         project_hash: None,
         session_id: None,
@@ -3665,12 +3680,13 @@ fn test_list_projects_returns_project_nodes() {
 
     db.upsert_intelligence_node(IntelligenceNodeInput {
         id: Some("proj-a".to_string()),
-        kind: "project".to_string(),
+        kind: Some("project".to_string()),
         status: None,
-        title: "Project Alpha".to_string(),
-        body: "Alpha project description".to_string(),
-        metadata: Some(serde_json::json!({"hash": "hash-a"})),
-        project_hash: Some("hash-a".to_string()),
+        title: Some("Project Alpha".to_string()),
+        body: Some("Alpha project description".to_string()),
+        body_replace: None,
+        metadata: Some(Some(serde_json::json!({"hash": "hash-a"}))),
+        project_hash: Some(Some("hash-a".to_string())),
         session_id: None,
         relations: None,
     })
@@ -3678,12 +3694,13 @@ fn test_list_projects_returns_project_nodes() {
 
     db.upsert_intelligence_node(IntelligenceNodeInput {
         id: Some("fact-1".to_string()),
-        kind: "fact".to_string(),
+        kind: Some("fact".to_string()),
         status: None,
-        title: "Some fact".to_string(),
-        body: "fact body".to_string(),
+        title: Some("Some fact".to_string()),
+        body: Some("fact body".to_string()),
+        body_replace: None,
         metadata: None,
-        project_hash: Some("hash-a".to_string()),
+        project_hash: Some(Some("hash-a".to_string())),
         session_id: None,
         relations: None,
     })
@@ -3701,12 +3718,13 @@ fn test_list_projects_filters_by_query() {
 
     db.upsert_intelligence_node(IntelligenceNodeInput {
         id: Some("proj-a".to_string()),
-        kind: "project".to_string(),
+        kind: Some("project".to_string()),
         status: None,
-        title: "Alpha Backend".to_string(),
-        body: "Backend services".to_string(),
-        metadata: Some(serde_json::json!({"hash": "hash-a"})),
-        project_hash: Some("hash-a".to_string()),
+        title: Some("Alpha Backend".to_string()),
+        body: Some("Backend services".to_string()),
+        body_replace: None,
+        metadata: Some(Some(serde_json::json!({"hash": "hash-a"}))),
+        project_hash: Some(Some("hash-a".to_string())),
         session_id: None,
         relations: None,
     })
@@ -3714,12 +3732,13 @@ fn test_list_projects_filters_by_query() {
 
     db.upsert_intelligence_node(IntelligenceNodeInput {
         id: Some("proj-b".to_string()),
-        kind: "project".to_string(),
+        kind: Some("project".to_string()),
         status: None,
-        title: "Beta Frontend".to_string(),
-        body: "Frontend app".to_string(),
-        metadata: Some(serde_json::json!({"hash": "hash-b"})),
-        project_hash: Some("hash-b".to_string()),
+        title: Some("Beta Frontend".to_string()),
+        body: Some("Frontend app".to_string()),
+        body_replace: None,
+        metadata: Some(Some(serde_json::json!({"hash": "hash-b"}))),
+        project_hash: Some(Some("hash-b".to_string())),
         session_id: None,
         relations: None,
     })
@@ -3736,12 +3755,13 @@ fn test_link_projects_creates_edge_between_projects() {
 
     db.upsert_intelligence_node(IntelligenceNodeInput {
         id: Some("proj-a".to_string()),
-        kind: "project".to_string(),
+        kind: Some("project".to_string()),
         status: None,
-        title: "Project A".to_string(),
-        body: "A".to_string(),
-        metadata: Some(serde_json::json!({"hash": "hash-a"})),
-        project_hash: Some("hash-a".to_string()),
+        title: Some("Project A".to_string()),
+        body: Some("A".to_string()),
+        body_replace: None,
+        metadata: Some(Some(serde_json::json!({"hash": "hash-a"}))),
+        project_hash: Some(Some("hash-a".to_string())),
         session_id: None,
         relations: None,
     })
@@ -3749,12 +3769,13 @@ fn test_link_projects_creates_edge_between_projects() {
 
     db.upsert_intelligence_node(IntelligenceNodeInput {
         id: Some("proj-b".to_string()),
-        kind: "project".to_string(),
+        kind: Some("project".to_string()),
         status: None,
-        title: "Project B".to_string(),
-        body: "B".to_string(),
-        metadata: Some(serde_json::json!({"hash": "hash-b"})),
-        project_hash: Some("hash-b".to_string()),
+        title: Some("Project B".to_string()),
+        body: Some("B".to_string()),
+        body_replace: None,
+        metadata: Some(Some(serde_json::json!({"hash": "hash-b"}))),
+        project_hash: Some(Some("hash-b".to_string())),
         session_id: None,
         relations: None,
     })
@@ -3782,12 +3803,13 @@ fn test_list_project_knowledge_returns_facts_and_patterns() {
 
     db.upsert_intelligence_node(IntelligenceNodeInput {
         id: Some("proj-a".to_string()),
-        kind: "project".to_string(),
+        kind: Some("project".to_string()),
         status: None,
-        title: "Project A".to_string(),
-        body: "A".to_string(),
-        metadata: Some(serde_json::json!({"hash": "hash-a"})),
-        project_hash: Some("hash-a".to_string()),
+        title: Some("Project A".to_string()),
+        body: Some("A".to_string()),
+        body_replace: None,
+        metadata: Some(Some(serde_json::json!({"hash": "hash-a"}))),
+        project_hash: Some(Some("hash-a".to_string())),
         session_id: None,
         relations: None,
     })
@@ -3795,12 +3817,13 @@ fn test_list_project_knowledge_returns_facts_and_patterns() {
 
     db.upsert_intelligence_node(IntelligenceNodeInput {
         id: Some("fact-1".to_string()),
-        kind: "fact".to_string(),
+        kind: Some("fact".to_string()),
         status: None,
-        title: "DB convention".to_string(),
-        body: "Always use SQLite".to_string(),
+        title: Some("DB convention".to_string()),
+        body: Some("Always use SQLite".to_string()),
+        body_replace: None,
         metadata: None,
-        project_hash: Some("hash-a".to_string()),
+        project_hash: Some(Some("hash-a".to_string())),
         session_id: None,
         relations: None,
     })
@@ -3808,12 +3831,13 @@ fn test_list_project_knowledge_returns_facts_and_patterns() {
 
     db.upsert_intelligence_node(IntelligenceNodeInput {
         id: Some("pattern-1".to_string()),
-        kind: "pattern".to_string(),
+        kind: Some("pattern".to_string()),
         status: None,
-        title: "Error handling".to_string(),
-        body: "Use anyhow".to_string(),
+        title: Some("Error handling".to_string()),
+        body: Some("Use anyhow".to_string()),
+        body_replace: None,
         metadata: None,
-        project_hash: Some("hash-a".to_string()),
+        project_hash: Some(Some("hash-a".to_string())),
         session_id: None,
         relations: None,
     })
@@ -3821,12 +3845,13 @@ fn test_list_project_knowledge_returns_facts_and_patterns() {
 
     db.upsert_intelligence_node(IntelligenceNodeInput {
         id: Some("fact-other".to_string()),
-        kind: "fact".to_string(),
+        kind: Some("fact".to_string()),
         status: None,
-        title: "Other fact".to_string(),
-        body: "unrelated".to_string(),
+        title: Some("Other fact".to_string()),
+        body: Some("unrelated".to_string()),
+        body_replace: None,
         metadata: None,
-        project_hash: Some("hash-other".to_string()),
+        project_hash: Some(Some("hash-other".to_string())),
         session_id: None,
         relations: None,
     })
@@ -3854,12 +3879,13 @@ fn test_list_related_projects_finds_linked_projects() {
 
     db.upsert_intelligence_node(IntelligenceNodeInput {
         id: Some("proj-a".to_string()),
-        kind: "project".to_string(),
+        kind: Some("project".to_string()),
         status: None,
-        title: "Project A".to_string(),
-        body: "A".to_string(),
-        metadata: Some(serde_json::json!({"hash": "hash-a"})),
-        project_hash: Some("hash-a".to_string()),
+        title: Some("Project A".to_string()),
+        body: Some("A".to_string()),
+        body_replace: None,
+        metadata: Some(Some(serde_json::json!({"hash": "hash-a"}))),
+        project_hash: Some(Some("hash-a".to_string())),
         session_id: None,
         relations: None,
     })
@@ -3867,12 +3893,13 @@ fn test_list_related_projects_finds_linked_projects() {
 
     db.upsert_intelligence_node(IntelligenceNodeInput {
         id: Some("proj-b".to_string()),
-        kind: "project".to_string(),
+        kind: Some("project".to_string()),
         status: None,
-        title: "Project B".to_string(),
-        body: "B".to_string(),
-        metadata: Some(serde_json::json!({"hash": "hash-b"})),
-        project_hash: Some("hash-b".to_string()),
+        title: Some("Project B".to_string()),
+        body: Some("B".to_string()),
+        body_replace: None,
+        metadata: Some(Some(serde_json::json!({"hash": "hash-b"}))),
+        project_hash: Some(Some("hash-b".to_string())),
         session_id: None,
         relations: None,
     })
@@ -3880,12 +3907,13 @@ fn test_list_related_projects_finds_linked_projects() {
 
     db.upsert_intelligence_node(IntelligenceNodeInput {
         id: Some("proj-c".to_string()),
-        kind: "project".to_string(),
+        kind: Some("project".to_string()),
         status: None,
-        title: "Project C".to_string(),
-        body: "C".to_string(),
-        metadata: Some(serde_json::json!({"hash": "hash-c"})),
-        project_hash: Some("hash-c".to_string()),
+        title: Some("Project C".to_string()),
+        body: Some("C".to_string()),
+        body_replace: None,
+        metadata: Some(Some(serde_json::json!({"hash": "hash-c"}))),
+        project_hash: Some(Some("hash-c".to_string())),
         session_id: None,
         relations: None,
     })
@@ -3910,12 +3938,13 @@ fn test_list_related_projects_returns_empty_for_unlinked_project() {
 
     db.upsert_intelligence_node(IntelligenceNodeInput {
         id: Some("proj-lone".to_string()),
-        kind: "project".to_string(),
+        kind: Some("project".to_string()),
         status: None,
-        title: "Lone Project".to_string(),
-        body: "No relations".to_string(),
-        metadata: Some(serde_json::json!({"hash": "hash-lone"})),
-        project_hash: Some("hash-lone".to_string()),
+        title: Some("Lone Project".to_string()),
+        body: Some("No relations".to_string()),
+        body_replace: None,
+        metadata: Some(Some(serde_json::json!({"hash": "hash-lone"}))),
+        project_hash: Some(Some("hash-lone".to_string())),
         session_id: None,
         relations: None,
     })
@@ -5948,12 +5977,13 @@ fn cm9_register_at(db: &Database, path: &std::path::Path) -> String {
 fn cm9_put_fact(db: &Database, id: &str, hash: &str, title: &str) {
     db.upsert_intelligence_node(IntelligenceNodeInput {
         id: Some(id.to_string()),
-        kind: "fact".to_string(),
+        kind: Some("fact".to_string()),
         status: None,
-        title: title.to_string(),
-        body: format!("{title} body"),
+        title: Some(title.to_string()),
+        body: Some(format!("{title} body")),
+        body_replace: None,
         metadata: None,
-        project_hash: Some(hash.to_string()),
+        project_hash: Some(Some(hash.to_string())),
         session_id: None,
         relations: None,
     })
@@ -6290,12 +6320,13 @@ fn cm9_retype_backlog_nodes() {
     ] {
         db.upsert_intelligence_node(IntelligenceNodeInput {
             id: Some(id.to_string()),
-            kind: "project".to_string(),
+            kind: Some("project".to_string()),
             status: None,
-            title: title.to_string(),
-            body: format!("{title} body text"),
-            metadata: Some(serde_json::json!({"origin": "backlog"})),
-            project_hash: Some("hash-backlog".to_string()),
+            title: Some(title.to_string()),
+            body: Some(format!("{title} body text")),
+            body_replace: None,
+            metadata: Some(Some(serde_json::json!({"origin": "backlog"}))),
+            project_hash: Some(Some("hash-backlog".to_string())),
             session_id: None,
             relations: None,
         })
@@ -6312,12 +6343,15 @@ fn cm9_retype_backlog_nodes() {
     // Registry nodes are refused, never retyped.
     db.upsert_intelligence_node(IntelligenceNodeInput {
         id: Some("d8c3230b-real".to_string()),
-        kind: "project".to_string(),
+        kind: Some("project".to_string()),
         status: None,
-        title: "Real Project".to_string(),
-        body: "real".to_string(),
-        metadata: Some(serde_json::json!({"source": "registry", "path": "/x"})),
-        project_hash: Some("hash-real".to_string()),
+        title: Some("Real Project".to_string()),
+        body: Some("real".to_string()),
+        body_replace: None,
+        metadata: Some(Some(
+            serde_json::json!({"source": "registry", "path": "/x"}),
+        )),
+        project_hash: Some(Some("hash-real".to_string())),
         session_id: None,
         relations: None,
     })

@@ -1348,12 +1348,13 @@ mod tests {
         .unwrap();
         db.upsert_intelligence_node(crate::db::intelligence::IntelligenceNodeInput {
             id: None,
-            kind: "fact".to_string(),
+            kind: Some("fact".to_string()),
             status: None,
-            title: "a fact".to_string(),
-            body: "body".to_string(),
+            title: Some("a fact".to_string()),
+            body: Some("body".to_string()),
+            body_replace: None,
             metadata: None,
-            project_hash: Some(hash.to_string()),
+            project_hash: Some(Some(hash.to_string())),
             session_id: None,
             relations: None,
         })

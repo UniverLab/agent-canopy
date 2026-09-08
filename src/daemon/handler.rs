@@ -3575,13 +3575,6 @@ impl TaskTriggerHandler {
         OptionalExtension(parts): OptionalExtension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_nursery(parts.as_ref())?;
-        // Auto-detect project_hash from session workdir if not provided.
-        let project_hash = params.node_data.project_hash.or_else(|| {
-            let agent_id = self.resolve_sync_agent_id(parts.as_ref()).ok()?;
-            let workdir = self.db.get_session_workdir(&agent_id).ok()??;
-            Some(crate::domain::project::workdir_hash(&workdir))
-        });
-
         // Track an explicit id that resolved to nothing: the caller almost
         // certainly mistyped or truncated the id of a node they meant to
         // update, so a bare `created: true` (which also fires for the normal
@@ -3602,12 +3595,40 @@ impl TaskTriggerHandler {
             _ => params.node_data.id.clone(),
         };
 
+        // Whether this write will update an existing node. An omitted
+        // project_hash leaves the stored value untouched on update, but is
+        // still auto-detected from the session workdir on create.
+        let updating_existing = resolved_id
+            .as_deref()
+            .and_then(|id| self.db.get_intelligence_node(id).ok())
+            .flatten()
+            .is_some();
+        let project_hash: Option<Option<String>> = match params.node_data.project_hash {
+            Some(explicit) => Some(explicit),
+            None if updating_existing => None,
+            None => {
+                let detected = self
+                    .resolve_sync_agent_id(parts.as_ref())
+                    .ok()
+                    .and_then(|agent_id| self.db.get_session_workdir(&agent_id).ok())
+                    .flatten()
+                    .map(|workdir| crate::domain::project::workdir_hash(&workdir));
+                Some(detected)
+            }
+        };
+
         let node = crate::db::intelligence::IntelligenceNodeInput {
             id: resolved_id,
             kind: params.node_data.kind,
             status: params.node_data.status,
             title: params.node_data.title,
             body: params.node_data.body,
+            body_replace: params.node_data.body_replace.map(|br| {
+                crate::db::intelligence::BodyReplace {
+                    fragment: br.fragment,
+                    replacement: br.replacement,
+                }
+            }),
             metadata: params.node_data.metadata,
             project_hash,
             session_id: params.node_data.session_id,
@@ -3625,14 +3646,22 @@ impl TaskTriggerHandler {
             }),
         };
 
-        let (record, created, duplicate_candidates, undeclared_references) = self
+        let result = self
             .db
             .upsert_intelligence_node(node)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let crate::db::intelligence::UpsertResult {
+            record,
+            created,
+            duplicates: duplicate_candidates,
+            undeclared_references,
+            changed_fields,
+        } = result;
 
         let mut out = serde_json::json!({
             "node": intelligence_node_json(&record),
             "created": created,
+            "changed_fields": changed_fields,
             "duplicate_detection_note":
                 crate::db::intelligence::LEXICAL_DUPLICATE_LIMITATION,
         });
@@ -21397,10 +21426,11 @@ mod endpoint_tests {
                 Parameters(IntelligenceUpsertParams {
                     node_data: IntelligenceNodeParams {
                         id: Some("fact-1".to_string()),
-                        kind: "fact".to_string(),
+                        kind: Some("fact".to_string()),
                         status: None,
-                        title: "Rust is memory safe".to_string(),
-                        body: "Ownership rules prevent data races.".to_string(),
+                        title: Some("Rust is memory safe".to_string()),
+                        body: Some("Ownership rules prevent data races.".to_string()),
+                        body_replace: None,
                         metadata: None,
                         project_hash: None,
                         session_id: None,
@@ -21418,10 +21448,11 @@ mod endpoint_tests {
                 Parameters(IntelligenceUpsertParams {
                     node_data: IntelligenceNodeParams {
                         id: Some("fact-2".to_string()),
-                        kind: "fact".to_string(),
+                        kind: Some("fact".to_string()),
                         status: None,
-                        title: "Ownership rules".to_string(),
-                        body: "One owner at a time.".to_string(),
+                        title: Some("Ownership rules".to_string()),
+                        body: Some("One owner at a time.".to_string()),
+                        body_replace: None,
                         metadata: None,
                         project_hash: None,
                         session_id: None,
@@ -21477,6 +21508,167 @@ mod endpoint_tests {
 
     // ── intelligence_delete_node / intelligence_delete_relation ──────────
 
+    #[tokio::test]
+    async fn intelligence_upsert_partial_update_via_mcp() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let _agent_guard = AgentIdVar::set("agent-intel-partial-1");
+
+        let created = handler
+            .intelligence_upsert(
+                Parameters(IntelligenceUpsertParams {
+                    node_data: IntelligenceNodeParams {
+                        id: Some("partial-mcp-1".to_string()),
+                        kind: Some("fact".to_string()),
+                        status: None,
+                        title: Some("Original title".to_string()),
+                        body: Some("Original body text".to_string()),
+                        body_replace: None,
+                        metadata: None,
+                        project_hash: None,
+                        session_id: None,
+                        relations: None,
+                    },
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!is_err(&created), "{}", text(&created));
+
+        // A call carrying only id + title changes the title and leaves
+        // everything else exactly as it was.
+        let updated = handler
+            .intelligence_upsert(
+                Parameters(IntelligenceUpsertParams {
+                    node_data: IntelligenceNodeParams {
+                        id: Some("partial-mcp-1".to_string()),
+                        kind: None,
+                        status: None,
+                        title: Some("Corrected title".to_string()),
+                        body: None,
+                        body_replace: None,
+                        metadata: None,
+                        project_hash: None,
+                        session_id: None,
+                        relations: None,
+                    },
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!is_err(&updated), "{}", text(&updated));
+        let value: serde_json::Value = serde_json::from_str(&raw_text(&updated)).unwrap();
+        assert_eq!(value["created"], false);
+        let changed: Vec<String> = serde_json::from_value(value["changed_fields"].clone()).unwrap();
+        assert!(
+            changed.contains(&"title".to_string()),
+            "changed_fields should name title: {changed:?}"
+        );
+        assert!(
+            !changed.contains(&"body".to_string()),
+            "changed_fields should not name untouched body: {changed:?}"
+        );
+        assert_eq!(value["node"]["title"], "Corrected title");
+        assert_eq!(value["node"]["body"], "Original body text");
+    }
+
+    #[tokio::test]
+    async fn intelligence_upsert_body_replace_via_mcp() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let _agent_guard = AgentIdVar::set("agent-intel-partial-2");
+
+        let created = handler
+            .intelligence_upsert(
+                Parameters(IntelligenceUpsertParams {
+                    node_data: IntelligenceNodeParams {
+                        id: Some("hooks-mcp-1".to_string()),
+                        kind: Some("decision".to_string()),
+                        status: None,
+                        title: Some("Scope".to_string()),
+                        body: Some(
+                            "Scope notes.\nfuera de esta versión: hooks internos\nMore notes."
+                                .to_string(),
+                        ),
+                        body_replace: None,
+                        metadata: None,
+                        project_hash: None,
+                        session_id: None,
+                        relations: None,
+                    },
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!is_err(&created), "{}", text(&created));
+
+        let updated = handler
+            .intelligence_upsert(
+                Parameters(IntelligenceUpsertParams {
+                    node_data: IntelligenceNodeParams {
+                        id: Some("hooks-mcp-1".to_string()),
+                        kind: None,
+                        status: None,
+                        title: None,
+                        body: None,
+                        body_replace: Some(crate::daemon::params::BodyReplaceParams {
+                            fragment: "fuera de esta versión: hooks internos".to_string(),
+                            replacement: "dentro de esta versión: hooks internos".to_string(),
+                        }),
+                        metadata: None,
+                        project_hash: None,
+                        session_id: None,
+                        relations: None,
+                    },
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+        assert!(!is_err(&updated), "{}", text(&updated));
+        let value: serde_json::Value = serde_json::from_str(&raw_text(&updated)).unwrap();
+        assert_eq!(value["created"], false);
+        let changed: Vec<String> = serde_json::from_value(value["changed_fields"].clone()).unwrap();
+        assert!(
+            changed.contains(&"body".to_string()),
+            "changed_fields should name body: {changed:?}"
+        );
+        assert_eq!(
+            value["node"]["body"],
+            "Scope notes.\ndentro de esta versión: hooks internos\nMore notes."
+        );
+
+        // A fragment that matches twice is refused instead of guessed.
+        let err = handler
+            .intelligence_upsert(
+                Parameters(IntelligenceUpsertParams {
+                    node_data: IntelligenceNodeParams {
+                        id: Some("hooks-mcp-1".to_string()),
+                        kind: None,
+                        status: None,
+                        title: None,
+                        body: None,
+                        body_replace: Some(crate::daemon::params::BodyReplaceParams {
+                            fragment: "notes".to_string(),
+                            replacement: "remarks".to_string(),
+                        }),
+                        metadata: None,
+                        project_hash: None,
+                        session_id: None,
+                        relations: None,
+                    },
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .expect_err("ambiguous fragment must fail the write");
+        assert!(
+            format!("{err:?}").contains("ambiguous"),
+            "refusal should say ambiguous: {err:?}"
+        );
+    }
+
     async fn upsert_intel_fact(
         handler: &TaskTriggerHandler,
         id: &str,
@@ -21488,10 +21680,11 @@ mod endpoint_tests {
                 Parameters(IntelligenceUpsertParams {
                     node_data: IntelligenceNodeParams {
                         id: Some(id.to_string()),
-                        kind: "fact".to_string(),
+                        kind: Some("fact".to_string()),
                         status: None,
-                        title: title.to_string(),
-                        body: "Test body".to_string(),
+                        title: Some(title.to_string()),
+                        body: Some("Test body".to_string()),
+                        body_replace: None,
                         metadata: None,
                         project_hash: None,
                         session_id: None,
@@ -21813,12 +22006,13 @@ mod endpoint_tests {
         ] {
             db.upsert_intelligence_node(crate::db::intelligence::IntelligenceNodeInput {
                 id: Some(id.to_string()),
-                kind: "fact".to_string(),
+                kind: Some("fact".to_string()),
                 status: None,
-                title: title.to_string(),
-                body: format!("{title} body"),
+                title: Some(title.to_string()),
+                body: Some(format!("{title} body")),
+                body_replace: None,
                 metadata: None,
-                project_hash: Some(hash),
+                project_hash: Some(Some(hash)),
                 session_id: None,
                 relations: None,
             })
@@ -22206,10 +22400,11 @@ mod endpoint_tests {
                 Parameters(IntelligenceUpsertParams {
                     node_data: IntelligenceNodeParams {
                         id: Some("brand-new-node-1".to_string()),
-                        kind: "fact".to_string(),
+                        kind: Some("fact".to_string()),
                         status: None,
-                        title: "First time".to_string(),
-                        body: "body".to_string(),
+                        title: Some("First time".to_string()),
+                        body: Some("body".to_string()),
+                        body_replace: None,
                         metadata: None,
                         project_hash: None,
                         session_id: None,
@@ -22244,10 +22439,11 @@ mod endpoint_tests {
                 Parameters(IntelligenceUpsertParams {
                     node_data: IntelligenceNodeParams {
                         id: Some("update-me-1".to_string()),
-                        kind: "fact".to_string(),
+                        kind: Some("fact".to_string()),
                         status: None,
-                        title: "Original".to_string(),
-                        body: "v1".to_string(),
+                        title: Some("Original".to_string()),
+                        body: Some("v1".to_string()),
+                        body_replace: None,
                         metadata: None,
                         project_hash: None,
                         session_id: None,
@@ -22270,10 +22466,11 @@ mod endpoint_tests {
                 Parameters(IntelligenceUpsertParams {
                     node_data: IntelligenceNodeParams {
                         id: Some("update-me-1".to_string()),
-                        kind: "fact".to_string(),
+                        kind: Some("fact".to_string()),
                         status: None,
-                        title: "Updated".to_string(),
-                        body: "v2".to_string(),
+                        title: Some("Updated".to_string()),
+                        body: Some("v2".to_string()),
+                        body_replace: None,
                         metadata: None,
                         project_hash: None,
                         session_id: None,
@@ -22310,10 +22507,11 @@ mod endpoint_tests {
                 Parameters(IntelligenceUpsertParams {
                     node_data: IntelligenceNodeParams {
                         id: Some(full_id.to_string()),
-                        kind: "fact".to_string(),
+                        kind: Some("fact".to_string()),
                         status: None,
-                        title: "Original".to_string(),
-                        body: "v1".to_string(),
+                        title: Some("Original".to_string()),
+                        body: Some("v1".to_string()),
+                        body_replace: None,
                         metadata: None,
                         project_hash: None,
                         session_id: None,
@@ -22331,10 +22529,11 @@ mod endpoint_tests {
                 Parameters(IntelligenceUpsertParams {
                     node_data: IntelligenceNodeParams {
                         id: Some("3a476c63".to_string()),
-                        kind: "fact".to_string(),
+                        kind: Some("fact".to_string()),
                         status: None,
-                        title: "Updated via prefix".to_string(),
-                        body: "v2".to_string(),
+                        title: Some("Updated via prefix".to_string()),
+                        body: Some("v2".to_string()),
+                        body_replace: None,
                         metadata: None,
                         project_hash: None,
                         session_id: None,
@@ -22397,10 +22596,11 @@ mod endpoint_tests {
                     Parameters(IntelligenceUpsertParams {
                         node_data: IntelligenceNodeParams {
                             id: Some(id.to_string()),
-                            kind: "fact".to_string(),
+                            kind: Some("fact".to_string()),
                             status: None,
-                            title: format!("Node {id}"),
-                            body: "body".to_string(),
+                            title: Some(format!("Node {id}")),
+                            body: Some("body".to_string()),
+                            body_replace: None,
                             metadata: None,
                             project_hash: None,
                             session_id: None,
@@ -22419,10 +22619,11 @@ mod endpoint_tests {
                 Parameters(IntelligenceUpsertParams {
                     node_data: IntelligenceNodeParams {
                         id: Some("abc".to_string()),
-                        kind: "fact".to_string(),
+                        kind: Some("fact".to_string()),
                         status: None,
-                        title: "Should fail".to_string(),
-                        body: "body".to_string(),
+                        title: Some("Should fail".to_string()),
+                        body: Some("body".to_string()),
+                        body_replace: None,
                         metadata: None,
                         project_hash: None,
                         session_id: None,
@@ -22464,10 +22665,11 @@ mod endpoint_tests {
                 Parameters(IntelligenceUpsertParams {
                     node_data: IntelligenceNodeParams {
                         id: Some(full_id.to_string()),
-                        kind: "fact".to_string(),
+                        kind: Some("fact".to_string()),
                         status: None,
-                        title: "Walk me".to_string(),
-                        body: "body".to_string(),
+                        title: Some("Walk me".to_string()),
+                        body: Some("body".to_string()),
+                        body_replace: None,
                         metadata: None,
                         project_hash: None,
                         session_id: None,
@@ -22511,10 +22713,11 @@ mod endpoint_tests {
                 Parameters(IntelligenceUpsertParams {
                     node_data: IntelligenceNodeParams {
                         id: Some(full_id.to_string()),
-                        kind: "fact".to_string(),
+                        kind: Some("fact".to_string()),
                         status: None,
-                        title: "Delete me by prefix".to_string(),
-                        body: "body".to_string(),
+                        title: Some("Delete me by prefix".to_string()),
+                        body: Some("body".to_string()),
+                        body_replace: None,
                         metadata: None,
                         project_hash: None,
                         session_id: None,
@@ -22642,10 +22845,11 @@ mod endpoint_tests {
                 Parameters(IntelligenceUpsertParams {
                     node_data: IntelligenceNodeParams {
                         id: Some(id.to_string()),
-                        kind: "fact".to_string(),
+                        kind: Some("fact".to_string()),
                         status: None,
-                        title: title.to_string(),
-                        body,
+                        title: Some(title.to_string()),
+                        body: Some(body),
+                        body_replace: None,
                         metadata: None,
                         project_hash: None,
                         session_id: None,
