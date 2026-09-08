@@ -3074,54 +3074,7 @@ impl TaskTriggerHandler {
 
         // models.dev-derived path: the all-providers listing, or a platform
         // without native enumeration (e.g. claude, whose bare ids are correct).
-        let ttl = configured_models().catalog_ttl();
-        let load = tokio::task::spawn_blocking(move || {
-            crate::domain::models_db::load_catalog_with_source(force_refresh, ttl)
-        })
-        .await
-        .ok()
-        .flatten();
-
-        let Some(load) = load else {
-            return Ok(error_result(
-                "Model catalog unavailable: could not reach models.dev and no local \
-                 cache exists at ~/.canopy/cache/models_catalog.json. Omit the model field to \
-                 use the CLI's default, or retry once network access is restored.",
-            ));
-        };
-        let crate::domain::models_db::CatalogLoad { catalog, source } = load;
-
-        let (listing, truncation) = match platform {
-            Some(platform) => {
-                let providers = crate::domain::models_db::providers_for_cli(platform);
-                if providers.is_empty() {
-                    return Ok(error_result(&format!(
-                        "No known model providers are mapped for platform '{platform}'. \
-                         Omit `platform` to list all providers.",
-                    )));
-                }
-                let (formatted, trunc) = format_platform_models(&catalog, providers, full);
-                let mut listing = format!(
-                    "Models available to platform '{platform}' (providers: {}):\n{formatted}",
-                    providers.join(", ")
-                );
-                if let Some(warning) = platform_model_selection_warning(platform) {
-                    listing = format!("{warning}\n\n{listing}");
-                }
-                (listing, trunc)
-            }
-            None => {
-                let (formatted, trunc) = format_catalog_models(&catalog, full);
-                (
-                    format!("Available models (use the model id as the model field):\n{formatted}"),
-                    trunc,
-                )
-            }
-        };
-
-        Ok(CallToolResult::success(vec![Content::text(
-            model_result_footer(&listing, source, catalog.fetched_at, ttl, &truncation),
-        )]))
+        Ok(catalogue_models_result(platform, force_refresh, full).await)
     }
 
     /// Get log output for an agent.
@@ -8722,10 +8675,21 @@ async fn native_models_result(
     .flatten();
 
     let Some(load) = load else {
-        return error_result(&format!(
-            "Could not enumerate '{platform}' models: running its model-list command \
-             failed and no cached enumeration exists. Retry once the CLI is reachable."
-        ));
+        // Enumeration failed — fall back to the provider catalogue rather than
+        // returning a hard error, per FR3. The NOTE tells the caller what
+        // happened; the catalogue path provides whatever models.dev knows about.
+        let note = format!(
+            "NOTE: '{platform}' model enumeration failed (CLI unreachable); showing \
+             the provider catalogue instead.\n\n"
+        );
+        let fallback_text = catalogue_models_text(Some(platform), force_refresh, full).await;
+        return match fallback_text {
+            Ok(text) => CallToolResult::success(vec![Content::text(format!("{note}{text}"))]),
+            Err(_) => error_result(&format!(
+                "Could not enumerate '{platform}' models and no provider catalogue \
+                 is available as fallback. Retry once the CLI is reachable."
+            )),
+        };
     };
     let crate::domain::models_db::NativeLoad { catalog, source } = load;
 
@@ -8748,7 +8712,96 @@ async fn native_models_result(
         catalog.fetched_at,
         ttl,
         &truncation,
+        true,
     ))])
+}
+
+/// Why [`catalogue_models_text`] could not produce a listing — the two cases
+/// have different remedies, so the caller must tell them apart.
+enum CatalogTextError {
+    /// `platform` has no models.dev provider mapping at all, so no id list can
+    /// be derived from the catalogue. Not a transient outage — retrying or
+    /// `refresh: true` will not help.
+    NoProviderMapping,
+    /// models.dev is unreachable and no local cache exists.
+    Unavailable,
+}
+
+/// Format the models.dev provider catalogue as text (without wrapping in a
+/// `CallToolResult`). Returns [`CatalogTextError`] when no listing can be
+/// produced. Used by both `catalogue_models_result` (normal path) and
+/// `native_models_result` (enumeration-failure fallback).
+async fn catalogue_models_text(
+    platform: Option<&str>,
+    force_refresh: bool,
+    full: bool,
+) -> Result<String, CatalogTextError> {
+    let ttl = configured_models().catalog_ttl();
+    let load = tokio::task::spawn_blocking(move || {
+        crate::domain::models_db::load_catalog_with_source(force_refresh, ttl)
+    })
+    .await
+    .ok()
+    .flatten()
+    .ok_or(CatalogTextError::Unavailable)?;
+
+    let crate::domain::models_db::CatalogLoad { catalog, source } = load;
+
+    let (listing, truncation) = match platform {
+        Some(platform) => {
+            let providers = crate::domain::models_db::providers_for_cli(platform);
+            if providers.is_empty() {
+                return Err(CatalogTextError::NoProviderMapping);
+            }
+            let (formatted, trunc) = format_platform_models(&catalog, providers, full);
+            let mut listing = format!(
+                "Models available to platform '{platform}' (providers: {}):\n{formatted}",
+                providers.join(", ")
+            );
+            if let Some(warning) = platform_model_selection_warning(platform) {
+                listing = format!("{warning}\n\n{listing}");
+            }
+            (listing, trunc)
+        }
+        None => {
+            let (formatted, trunc) = format_catalog_models(&catalog, full);
+            (
+                format!("Available models (use the model id as the model field):\n{formatted}"),
+                trunc,
+            )
+        }
+    };
+
+    Ok(model_result_footer(
+        &listing,
+        source,
+        catalog.fetched_at,
+        ttl,
+        &truncation,
+        false,
+    ))
+}
+
+/// Build the `agent_models` result from the models.dev provider catalogue.
+/// Used by `task_models` for platforms without native enumeration.
+async fn catalogue_models_result(
+    platform: Option<&str>,
+    force_refresh: bool,
+    full: bool,
+) -> CallToolResult {
+    match catalogue_models_text(platform, force_refresh, full).await {
+        Ok(text) => CallToolResult::success(vec![Content::text(text)]),
+        Err(CatalogTextError::NoProviderMapping) => error_result(&format!(
+            "No known model providers are mapped for platform '{}'. \
+             Omit `platform` to list all providers.",
+            platform.unwrap_or_default(),
+        )),
+        Err(CatalogTextError::Unavailable) => error_result(
+            "Model catalog unavailable: could not reach models.dev and no local \
+             cache exists at ~/.canopy/cache/models_catalog.json. Omit the model field to \
+             use the CLI's default, or retry once network access is restored.",
+        ),
+    }
 }
 
 /// This daemon's `[models]` TTL configuration, read fresh from
@@ -8772,6 +8825,7 @@ fn model_result_footer(
     fetched_at: std::time::SystemTime,
     ttl: std::time::Duration,
     truncation: &crate::daemon::handler_formatting::ModelTruncation,
+    from_cli: bool,
 ) -> String {
     let age = fetched_at.elapsed().unwrap_or_default();
     let age_str = format_duration_short(age);
@@ -8793,17 +8847,29 @@ fn model_result_footer(
         .notice()
         .map(|n| format!("\n{n}"))
         .unwrap_or_default();
-    format!(
-        "{listing}\n\n\
-         Source: {}{provenance_note} · age: {age_str} (refresh interval {ttl_str}) · \
-         fetched_at: {}\n\
-         WARNING: This lists the PROVIDER'S CATALOG, not what your account can use.\n\
-         Actual availability depends on your API key tier, account type, and region.\n\
-         A model listed here may still fail at runtime — use `agent_probe` or `loop_preflight`\n\
-         to validate a specific platform+model pair before relying on it.{truncation_notice}",
-        source.as_str(),
-        format_system_time(fetched_at),
-    )
+    if from_cli {
+        format!(
+            "{listing}\n\n\
+             Source: CLI enumeration — every id above is accepted verbatim by this \
+             platform's model flag. {}{provenance_note} · age: {age_str} \
+             (refresh interval {ttl_str}) · fetched_at: {}{truncation_notice}",
+            source.as_str(),
+            format_system_time(fetched_at),
+        )
+    } else {
+        format!(
+            "{listing}\n\n\
+             Source: provider catalogue (models.dev) — advertised, not \
+             account-verified. {}{provenance_note} · age: {age_str} \
+             (refresh interval {ttl_str}) · fetched_at: {}\n\
+             WARNING: This lists the PROVIDER'S CATALOG, not what your account can use.\n\
+             Actual availability depends on your API key tier, account type, and region.\n\
+             A model listed here may still fail at runtime — use `agent_probe` or `loop_preflight`\n\
+             to validate a specific platform+model pair before relying on it.{truncation_notice}",
+            source.as_str(),
+            format_system_time(fetched_at),
+        )
+    }
 }
 
 /// Format a `SystemTime` as an RFC 3339 / ISO 8601 UTC timestamp for the
@@ -16366,8 +16432,9 @@ mod coverage_tests {
             std::time::SystemTime::now(),
             std::time::Duration::from_secs(24 * 60 * 60),
             &ModelTruncation::default(),
+            false,
         );
-        assert!(f.contains("Source: live"));
+        assert!(f.contains("Source:"));
         assert!(!f.contains("unreachable"));
         assert!(f.contains("age:"));
         assert!(f.contains("refresh interval"));
@@ -16384,6 +16451,7 @@ mod coverage_tests {
             fetched_at,
             std::time::Duration::from_secs(24 * 60 * 60),
             &ModelTruncation::default(),
+            false,
         );
         let source_line = f
             .lines()
@@ -16405,6 +16473,7 @@ mod coverage_tests {
             std::time::SystemTime::now() - std::time::Duration::from_secs(60),
             std::time::Duration::from_secs(24 * 60 * 60),
             &ModelTruncation::default(),
+            false,
         );
         assert!(!f.contains("refresh due"));
         assert!(f.contains("age: 1m"));
@@ -16424,6 +16493,7 @@ mod coverage_tests {
             fetched_at,
             std::time::Duration::from_secs(3600),
             &ModelTruncation::default(),
+            false,
         );
         assert!(f.contains("refresh due"));
     }
@@ -17723,7 +17793,6 @@ mod endpoint_tests {
     }
 
     #[tokio::test]
-    #[ignore]
     async fn task_models_enumerates_native_platform_models() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -17762,8 +17831,12 @@ mod endpoint_tests {
         assert!(out.contains("model-b"));
         assert!(out.contains("Source:"));
         assert!(
-            out.contains("PROVIDER'S CATALOG") || out.contains("WARNING"),
-            "footer must warn that this is the provider catalog, not account availability: {out}"
+            out.contains("CLI enumeration"),
+            "native-enumerated result must state it came from the CLI: {out}"
+        );
+        assert!(
+            !out.contains("PROVIDER'S CATALOG"),
+            "native-enumerated result must NOT carry the provider catalogue warning: {out}"
         );
     }
 
@@ -17857,6 +17930,289 @@ mod endpoint_tests {
         assert!(
             out.contains("does not support model selection") || out.contains("NOT valid input"),
             "native-enumeration output must also warn when there is no model_flag: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_result_labels_source_as_cli_and_drops_catalogue_warning() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempdir().unwrap();
+        let canopy_dir = home.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        let script = home.path().join("list-models.sh");
+        // Print ids that match the kiro-shaped regression: use the dot
+        // separator the CLI accepts, not the hyphenated provider form.
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho claude-sonnet-4.5\necho deepseek-3.2\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config = crate::domain::canopy_config::CanopyConfig {
+            clis: vec![crate::domain::cli_config::CliConfig {
+                name: "kiro-shaped".to_string(),
+                binary: script.to_string_lossy().to_string(),
+                models_list_cmd: Some("--list".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        config.save(&canopy_dir).unwrap();
+        let _home_guard = HomeVar::set(home.path());
+
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let result = handler
+            .task_models(Parameters(TaskModelsParams {
+                platform: Some("kiro-shaped".to_string()),
+                refresh: Some(true),
+                full: None,
+            }))
+            .await
+            .unwrap();
+
+        assert!(!is_err(&result), "{}", text(&result));
+        let out = text(&result);
+        // Must come from the CLI, not the catalogue.
+        assert!(
+            out.contains("CLI enumeration"),
+            "native result must label its source as CLI: {out}"
+        );
+        assert!(
+            !out.contains("PROVIDER'S CATALOG"),
+            "native result must NOT carry the catalogue warning: {out}"
+        );
+        // Regression guard: the kiro-shaped dot-separated ids must be present.
+        assert!(
+            out.contains("claude-sonnet-4.5"),
+            "must include the CLI-accepted id, not the provider form: {out}"
+        );
+        assert!(
+            !out.contains("claude-sonnet-5"),
+            "must NOT offer the provider-catalogue id that kiro rejects: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn catalogue_result_keeps_cb9_warning_and_labels_source() {
+        let home = tempdir().unwrap();
+        let canopy_dir = home.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        // Seed a models.dev catalog so the catalogue path succeeds without
+        // network — same pattern as `task_models_warns_for_platform_without_model_flag`.
+        let cache_dir = canopy_dir.join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let catalog_json = format!(
+            r#"{{"models":[{{"id":"some-model","name":"Some Model","provider":"mistral"}}],"fetched_at":{now_secs}}}"#
+        );
+        std::fs::write(cache_dir.join("models_catalog.json"), catalog_json).unwrap();
+        let config = crate::domain::canopy_config::CanopyConfig {
+            clis: vec![crate::domain::cli_config::CliConfig {
+                name: "mistral".to_string(),
+                binary: "/bin/echo".to_string(),
+                // No models_list_cmd → catalogue path.
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        config.save(&canopy_dir).unwrap();
+        let _home_guard = HomeVar::set(home.path());
+
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let result = handler
+            .task_models(Parameters(TaskModelsParams {
+                platform: Some("mistral".to_string()),
+                refresh: None,
+                full: None,
+            }))
+            .await
+            .unwrap();
+
+        assert!(!is_err(&result), "{}", text(&result));
+        let out = text(&result);
+        assert!(
+            out.contains("PROVIDER'S CATALOG"),
+            "catalogue result must carry CB9 warning: {out}"
+        );
+        assert!(
+            out.contains("provider catalogue (models.dev)"),
+            "catalogue result must label its source: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_enumeration_failure_falls_back_to_catalogue_and_says_so() {
+        let home = tempdir().unwrap();
+        let canopy_dir = home.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        // Seed a models.dev catalog for the fallback path.
+        let cache_dir = canopy_dir.join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let catalog_json = format!(
+            r#"{{"models":[{{"id":"fallback-model","name":"Fallback","provider":"mistral"}}],"fetched_at":{now_secs}}}"#
+        );
+        std::fs::write(cache_dir.join("models_catalog.json"), catalog_json).unwrap();
+
+        // Configure a platform whose models_list_cmd binary does NOT exist,
+        // so enumeration fails and the fallback triggers. Use `mistral`
+        // (a platform with a known provider mapping) so the catalogue
+        // fallback has a provider list to render.
+        let config = crate::domain::canopy_config::CanopyConfig {
+            clis: vec![crate::domain::cli_config::CliConfig {
+                name: "mistral".to_string(),
+                binary: "/nonexistent/binary".to_string(),
+                models_list_cmd: Some("--list".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        config.save(&canopy_dir).unwrap();
+        let _home_guard = HomeVar::set(home.path());
+
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let result = handler
+            .task_models(Parameters(TaskModelsParams {
+                platform: Some("mistral".to_string()),
+                refresh: None,
+                full: None,
+            }))
+            .await
+            .unwrap();
+
+        // Must NOT be an error — the fallback is a degraded but usable result.
+        assert!(!is_err(&result), "{}", text(&result));
+        let out = text(&result);
+        assert!(
+            out.contains("enumeration failed"),
+            "must explain that enumeration failed: {out}"
+        );
+        // The catalogue models must still be present as fallback.
+        assert!(
+            out.contains("fallback-model"),
+            "catalogue fallback models must be present: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_cache_and_refresh_match_catalogue_semantics() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempdir().unwrap();
+        let canopy_dir = home.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        let script = home.path().join("list-models.sh");
+        std::fs::write(&script, "#!/bin/sh\necho model-x\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let config = crate::domain::canopy_config::CanopyConfig {
+            clis: vec![crate::domain::cli_config::CliConfig {
+                name: "cache-test-cli".to_string(),
+                binary: script.to_string_lossy().to_string(),
+                models_list_cmd: Some("--list".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        config.save(&canopy_dir).unwrap();
+        let _home_guard = HomeVar::set(home.path());
+
+        let (_dir, _db, handler) = endpoint_test_handler();
+
+        // First call with refresh: true → should be Live.
+        let result1 = handler
+            .task_models(Parameters(TaskModelsParams {
+                platform: Some("cache-test-cli".to_string()),
+                refresh: Some(true),
+                full: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&result1), "{}", text(&result1));
+        let out1 = text(&result1);
+        assert!(
+            out1.contains("live"),
+            "first call with refresh should be live: {out1}"
+        );
+
+        // Second call without refresh → should be Cache (served from the
+        // fresh cache populated by the first call).
+        let result2 = handler
+            .task_models(Parameters(TaskModelsParams {
+                platform: Some("cache-test-cli".to_string()),
+                refresh: None,
+                full: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&result2), "{}", text(&result2));
+        let out2 = text(&result2);
+        assert!(
+            out2.contains("cache"),
+            "second call without refresh should be cache: {out2}"
+        );
+    }
+
+    #[tokio::test]
+    async fn catalogue_platform_without_provider_mapping_says_so_not_network_error() {
+        // A platform that is configured but has no models.dev provider mapping
+        // and no `models_list_cmd` must report *that* — not a misleading
+        // "could not reach models.dev". FR3: behaviour here is unchanged from
+        // before native enumeration was factored out.
+        let home = tempdir().unwrap();
+        let canopy_dir = home.path().join(".canopy");
+        std::fs::create_dir_all(&canopy_dir).unwrap();
+        // Seed a fresh catalog so the failure cannot be blamed on the network.
+        let cache_dir = canopy_dir.join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let catalog_json = format!(
+            r#"{{"models":[{{"id":"some-model","name":"Some Model","provider":"mistral"}}],"fetched_at":{now_secs}}}"#
+        );
+        std::fs::write(cache_dir.join("models_catalog.json"), catalog_json).unwrap();
+        let config = crate::domain::canopy_config::CanopyConfig {
+            clis: vec![crate::domain::cli_config::CliConfig {
+                // Not among `providers_for_cli`'s arms → empty provider list.
+                name: "unmapped-cli".to_string(),
+                binary: "/bin/echo".to_string(),
+                // No models_list_cmd → catalogue path.
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        config.save(&canopy_dir).unwrap();
+        let _home_guard = HomeVar::set(home.path());
+
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let result = handler
+            .task_models(Parameters(TaskModelsParams {
+                platform: Some("unmapped-cli".to_string()),
+                refresh: None,
+                full: None,
+            }))
+            .await
+            .unwrap();
+
+        assert!(is_err(&result), "{}", text(&result));
+        let out = text(&result);
+        assert!(
+            out.contains("No known model providers are mapped for platform 'unmapped-cli'"),
+            "must name the real cause (no provider mapping): {out}"
+        );
+        assert!(
+            !out.contains("could not reach models.dev"),
+            "must NOT blame the network when the catalog is reachable: {out}"
         );
     }
 
