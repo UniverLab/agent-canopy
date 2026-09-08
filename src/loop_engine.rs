@@ -18959,4 +18959,73 @@ exit 0
             "no idea and no graph must leave the loop's status untouched"
         );
     }
+
+    #[test]
+    fn render_agent_prompt_preserves_tagged_spec_body_verbatim() {
+        let lp = crate::domain::loops::Loop {
+            archived: false,
+            paused_by_reconciliation: false,
+            infra_node_id: None,
+            id: "wf".to_string(),
+            name: "Loop".to_string(),
+            description: None,
+            workdir: "/tmp/project".to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        };
+        let tagged_body = "<spec>\n  <objective>Ship it.</objective>\n  <functional_requirements>Does thing.</functional_requirements>\n  <non_functional_requirements>Fast.</non_functional_requirements>\n  <constraints>None.</constraints>\n  <guidelines>Style.</guidelines>\n  <in_scope>This.</in_scope>\n  <out_of_scope>Nothing.</out_of_scope>\n</spec>";
+        let spec = LoopSpec {
+            id: "spec".to_string(),
+            loop_id: Some("wf".to_string()),
+            name: "Spec".to_string(),
+            description: Some(tagged_body.to_string()),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        let node = LoopNode {
+            id: "node-1".to_string(),
+            spec_id: Some("spec".to_string()),
+            loop_id: None,
+            name: "Agent".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+
+        let prompt = render_agent_prompt(
+            &lp,
+            &spec,
+            &node,
+            "{{spec_content}}",
+            None,
+            &lp.workdir,
+            "run-1",
+            &HashMap::new(),
+            &[],
+        )
+        .unwrap();
+
+        assert!(prompt.contains(tagged_body));
+        assert!(prompt.contains("# [SPEC]"));
+        assert!(!prompt.contains("# Objective"));
+        assert!(!prompt.contains("# Functional Requirements"));
+    }
 }

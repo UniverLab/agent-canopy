@@ -835,6 +835,37 @@ impl Database {
         Ok(rows > 0)
     }
 
+    pub fn list_all_specs_for_conversion(&self) -> Result<Vec<LoopSpec>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir, completed_via, completed_via_reason, completed_via_at, spec_committed_head
+             FROM loop_specs
+             ORDER BY rowid ASC",
+        )?;
+        let rows = stmt.query_map([], map_loop_spec_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn update_spec_description_if_not_running(
+        &self,
+        spec_id: &str,
+        new_description: &str,
+    ) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE loop_specs SET description = ?1 WHERE id = ?2 AND status != 'running'",
+            params![new_description, spec_id],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// Delete a spec outright. Callers must enforce the loop-binding guard
     /// (see `spec_delete`'s handler) before calling this — this function
     /// performs no such check itself.

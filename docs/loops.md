@@ -284,6 +284,17 @@ a workdir for filtering:
 | `spec_update` | Update a spec's name, description, or workdir tag |
 | `spec_delete` | Delete an unbound spec |
 | `spec_set_status` | Admin transition: complete, skip, or reopen a standalone spec |
+| `spec_section_get` | Extract one canonical section from a spec body |
+| `spec_convert` | Migrate legacy heading-format spec bodies to the tagged `<spec>` format |
+
+Spec bodies are written in the tagged `<spec>` format — all seven canonical
+section tags (`<objective>`, `<functional_requirements>`,
+`<non_functional_requirements>`, `<constraints>`, `<guidelines>`, `<in_scope>`,
+`<out_of_scope>`) with markdown inside each. A body that does not parse is
+rejected on write with the offending tag named. Existing heading-format specs
+stay readable during the transition and are reported as needing conversion;
+`spec_convert` migrates them one row at a time and never rewrites a running
+spec.
 
 The TUI sidebar shows backlog specs under the **Backlog** section,
 filtered to the selected project's workdir.

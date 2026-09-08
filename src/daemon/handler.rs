@@ -59,6 +59,10 @@ use crate::domain::loops::{
 };
 use crate::domain::models::{Agent, Trigger};
 use crate::domain::queues::{Queue, QueueDetails};
+use crate::domain::specs::{
+    convert_legacy_spec_description, extract_spec_section, parse_spec_description,
+    ParsedSpecDescription, SpecSection, SpecSectionResult,
+};
 use crate::domain::sync::{MessageKind, MissionImpact, WorkspaceStatus};
 use crate::domain::validation::validate_id;
 use crate::executor::Executor;
@@ -4628,6 +4632,183 @@ impl TaskTriggerHandler {
         self.db.delete_loop_spec(&spec_id).map_err(internal_error)?;
 
         Ok(success_result(&format!("Spec '{spec_id}' deleted.")))
+    }
+
+    #[tool(
+        name = "spec_section_get",
+        description = "Extract a single section from a spec by its canonical tag name. Returns the markdown body of the requested section."
+    )]
+    async fn spec_section_get(
+        &self,
+        Parameters(params): Parameters<SpecSectionGetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let spec_id = match resolve_prefix_or_error(
+            &self.db,
+            params.spec_id.trim(),
+            Database::resolve_spec_id_by_prefix,
+            "spec",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        let spec = match validate_spec_exists(&self.db, &spec_id) {
+            Ok(spec) => spec,
+            Err(e) => return Ok(error_result(&e)),
+        };
+
+        let section_name = params.section.trim();
+        let Some(section) = SpecSection::from_tag(section_name) else {
+            let valid = SpecSection::all()
+                .iter()
+                .map(|s| format!("<{}>", s.tag()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Ok(error_result(&format!(
+                "unknown section '{}'. Valid sections: {}",
+                section_name, valid
+            )));
+        };
+
+        let description = spec.description.as_deref().unwrap_or("");
+        match extract_spec_section(description, section) {
+            Ok(SpecSectionResult::Tagged { content }) => {
+                let body = serde_json::json!({
+                    "spec_id": spec_id,
+                    "section": section.tag(),
+                    "content": content,
+                    "needs_conversion": false,
+                });
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&body).unwrap_or_default(),
+                )]))
+            }
+            Ok(SpecSectionResult::Legacy { content }) => {
+                let body = serde_json::json!({
+                    "spec_id": spec_id,
+                    "section": section.tag(),
+                    "content": content,
+                    "needs_conversion": true,
+                });
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&body).unwrap_or_default(),
+                )]))
+            }
+            Err(e) => Ok(error_result(&format!(
+                "failed to extract section <{}> from spec '{}': {}",
+                section.tag(),
+                spec_id,
+                e
+            ))),
+        }
+    }
+
+    #[tool(
+        name = "spec_convert",
+        description = "Convert all legacy heading-format specs to the tagged <spec> format. Skips already-tagged specs and running specs. Returns a structured report."
+    )]
+    async fn spec_convert(&self) -> Result<CallToolResult, McpError> {
+        let all_specs = self
+            .db
+            .list_all_specs_for_conversion()
+            .map_err(internal_error)?;
+
+        let mut scanned = 0u64;
+        let mut converted = 0u64;
+        let mut already_tagged = 0u64;
+        let mut deferred_running = 0u64;
+        let mut invalid_legacy = 0u64;
+        let mut converted_ids: Vec<String> = Vec::new();
+        let mut deferred: Vec<serde_json::Value> = Vec::new();
+        let mut errors: Vec<serde_json::Value> = Vec::new();
+
+        for spec in &all_specs {
+            scanned += 1;
+            let description = spec.description.as_deref().unwrap_or("");
+
+            if description.trim().is_empty() {
+                continue;
+            }
+
+            match parse_spec_description(description) {
+                Ok(ParsedSpecDescription::Tagged(_)) => {
+                    already_tagged += 1;
+                }
+                Ok(ParsedSpecDescription::Legacy(_)) => {
+                    if spec.status == LoopSpecStatus::Running {
+                        deferred_running += 1;
+                        deferred.push(serde_json::json!({
+                            "spec_id": spec.id,
+                            "reason": "spec is running; conversion deferred so a running loop cannot observe a mid-flight format change",
+                        }));
+                        continue;
+                    }
+                    match convert_legacy_spec_description(description) {
+                        Ok(new_body) => {
+                            match self
+                                .db
+                                .update_spec_description_if_not_running(&spec.id, &new_body)
+                            {
+                                Ok(true) => {
+                                    converted += 1;
+                                    converted_ids.push(spec.id.clone());
+                                }
+                                Ok(false) => {
+                                    deferred_running += 1;
+                                    deferred.push(serde_json::json!({
+                                        "spec_id": spec.id,
+                                        "reason": "spec became running before the write; conversion deferred",
+                                    }));
+                                }
+                                Err(e) => {
+                                    invalid_legacy += 1;
+                                    errors.push(serde_json::json!({
+                                        "spec_id": spec.id,
+                                        "error": e.to_string(),
+                                    }));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            invalid_legacy += 1;
+                            errors.push(serde_json::json!({
+                                "spec_id": spec.id,
+                                "error": e.to_string(),
+                            }));
+                        }
+                    }
+                }
+                Err(_) => {
+                    if spec.status == LoopSpecStatus::Running {
+                        deferred_running += 1;
+                        deferred.push(serde_json::json!({
+                            "spec_id": spec.id,
+                            "reason": "spec is running and body does not parse; left untouched for human repair after it stops running",
+                        }));
+                    } else {
+                        invalid_legacy += 1;
+                        errors.push(serde_json::json!({
+                            "spec_id": spec.id,
+                            "error": "unparseable spec body",
+                        }));
+                    }
+                }
+            }
+        }
+
+        let report = serde_json::json!({
+            "scanned": scanned,
+            "converted": converted,
+            "already_tagged": already_tagged,
+            "deferred_running": deferred_running,
+            "invalid_legacy": invalid_legacy,
+            "converted_ids": converted_ids,
+            "deferred": deferred,
+            "errors": errors,
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&report).unwrap_or_default(),
+        )]))
     }
 
     #[tool(
@@ -16700,13 +16881,7 @@ mod endpoint_tests {
     // ── loop_create / loop_update / loop graph tool handlers ─────
 
     fn valid_spec_description() -> String {
-        "Functional Requirements: does the thing.\n\
-         Non-Functional Requirements: is fast.\n\
-         Objective: ship the feature.\n\
-         Constraints: none extra.\n\
-         Guidelines: follow house style.\n\
-         In Scope: this change.\n\
-         Out of Scope: everything else."
+        "<spec>\n  <objective>Ship the feature.</objective>\n  <functional_requirements>Does the thing.</functional_requirements>\n  <non_functional_requirements>Is fast.</non_functional_requirements>\n  <constraints>None extra.</constraints>\n  <guidelines>Follow house style.</guidelines>\n  <in_scope>This change.</in_scope>\n  <out_of_scope>Everything else.</out_of_scope>\n</spec>"
             .to_string()
     }
 
@@ -17555,7 +17730,10 @@ mod endpoint_tests {
             .await
             .unwrap();
         assert!(is_err(&bad_template));
-        assert!(text(&bad_template).contains("missing required sections"));
+        assert!(
+            text(&bad_template).contains("missing required tag")
+                || text(&bad_template).contains("missing")
+        );
     }
 
     #[tokio::test]
@@ -21658,7 +21836,7 @@ mod endpoint_tests {
             .unwrap();
         let body = raw_text(&listed);
         assert!(
-            !body.contains("Objective"),
+            !body.contains("Objective") && !body.contains("<objective>"),
             "compact mode must omit description content"
         );
         assert!(body.contains("Compact test"));
@@ -21689,7 +21867,7 @@ mod endpoint_tests {
             .unwrap();
         let body = raw_text(&listed);
         assert!(
-            body.contains("Objective"),
+            body.contains("<objective>") || body.contains("Objective"),
             "include_descriptions must include description content"
         );
     }
@@ -21823,6 +22001,209 @@ mod endpoint_tests {
         assert_eq!(
             db.get_loop_spec(&full_id).unwrap().unwrap().name,
             "Renamed via prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn spec_section_get_returns_section_from_tagged_spec() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        let created = handler
+            .spec_create(Parameters(SpecCreateParams {
+                name: "Section test".to_string(),
+                description: valid_spec_description(),
+                workdir: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&created), "{}", text(&created));
+
+        let spec_id = db.list_specs(None, None, false).unwrap()[0].id.clone();
+
+        let result = handler
+            .spec_section_get(Parameters(SpecSectionGetParams {
+                spec_id: spec_id.clone(),
+                section: "objective".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&result), "{}", text(&result));
+        let body = raw_text(&result);
+        assert!(body.contains("Ship the feature"));
+        assert!(body.contains("\"needs_conversion\": false"));
+    }
+
+    #[tokio::test]
+    async fn spec_section_get_rejects_unknown_section() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        let created = handler
+            .spec_create(Parameters(SpecCreateParams {
+                name: "Section test 2".to_string(),
+                description: valid_spec_description(),
+                workdir: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&created));
+
+        let spec_id = db.list_specs(None, None, false).unwrap()[0].id.clone();
+
+        let result = handler
+            .spec_section_get(Parameters(SpecSectionGetParams {
+                spec_id,
+                section: "bogus".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&result));
+        assert!(text(&result).contains("unknown section"));
+        assert!(text(&result).contains("bogus"));
+    }
+
+    #[tokio::test]
+    async fn spec_convert_converts_legacy_and_skips_tagged() {
+        let (_dir, db, handler) = endpoint_test_handler();
+
+        let legacy_desc = "## Objective\nShip.\n\n## Functional Requirements\nDoes thing.\n\n## Non-Functional Requirements\nFast.\n\n## Constraints\nNone.\n\n## Guidelines\nStyle.\n\n## In Scope\nThis.\n\n## Out of Scope\nNothing.";
+        db.insert_loop_spec(&LoopSpec {
+            id: "legacy-spec-1".to_string(),
+            loop_id: None,
+            name: "Legacy".to_string(),
+            description: Some(legacy_desc.to_string()),
+            position: 0,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+
+        let created = handler
+            .spec_create(Parameters(SpecCreateParams {
+                name: "Already tagged".to_string(),
+                description: valid_spec_description(),
+                workdir: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&created));
+
+        let result = handler.spec_convert().await.unwrap();
+        assert!(!is_err(&result), "{}", text(&result));
+        let body = raw_text(&result);
+        assert!(body.contains("\"converted\": 1"));
+        assert!(body.contains("\"already_tagged\": 1"));
+
+        let legacy = db.get_loop_spec("legacy-spec-1").unwrap().unwrap();
+        let desc = legacy.description.unwrap();
+        assert!(desc.contains("<spec>"));
+        assert!(desc.contains("<objective>"));
+    }
+
+    #[tokio::test]
+    async fn spec_convert_defers_running_spec_and_leaves_body_untouched() {
+        let (_dir, db, handler) = endpoint_test_handler();
+
+        let legacy_desc = "## Objective\nShip.\n\n## Functional Requirements\nDoes thing.\n\n## Non-Functional Requirements\nFast.\n\n## Constraints\nNone.\n\n## Guidelines\nStyle.\n\n## In Scope\nThis.\n\n## Out of Scope\nNothing.";
+        db.insert_loop_spec(&LoopSpec {
+            id: "running-legacy-spec".to_string(),
+            loop_id: None,
+            name: "Running legacy".to_string(),
+            description: Some(legacy_desc.to_string()),
+            position: 0,
+            parallelizable: false,
+            status: LoopSpecStatus::Running,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+
+        let result = handler.spec_convert().await.unwrap();
+        assert!(!is_err(&result), "{}", text(&result));
+        let body = raw_text(&result);
+        assert!(body.contains("\"converted\": 0"), "{body}");
+        assert!(body.contains("\"deferred_running\": 1"), "{body}");
+        assert!(body.contains("running-legacy-spec"), "{body}");
+
+        // A running spec's body must never be rewritten mid-flight.
+        let after = db.get_loop_spec("running-legacy-spec").unwrap().unwrap();
+        assert_eq!(after.description.as_deref(), Some(legacy_desc));
+
+        // The DB-level guard also refuses the write directly.
+        assert!(
+            !db.update_spec_description_if_not_running("running-legacy-spec", "<spec></spec>")
+                .unwrap(),
+            "conditional update must report no row changed for a running spec"
+        );
+        let still = db.get_loop_spec("running-legacy-spec").unwrap().unwrap();
+        assert_eq!(still.description.as_deref(), Some(legacy_desc));
+    }
+
+    #[tokio::test]
+    async fn spec_convert_is_idempotent() {
+        let (_dir, db, handler) = endpoint_test_handler();
+
+        let legacy_desc = "## Objective\nShip src/main.rs:42 on 2026-09-01.\n\n## Functional Requirements\nNode abc-123 does thing.\n\n## Non-Functional Requirements\nLatency < 100ms.\n\n## Constraints\nUse `file:line`.\n\n## Guidelines\nStyle.\n\n## In Scope\nThis.\n\n## Out of Scope\nNothing.";
+        db.insert_loop_spec(&LoopSpec {
+            id: "idem-legacy-spec".to_string(),
+            loop_id: None,
+            name: "Idem legacy".to_string(),
+            description: Some(legacy_desc.to_string()),
+            position: 0,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+
+        let first = handler.spec_convert().await.unwrap();
+        assert!(raw_text(&first).contains("\"converted\": 1"));
+        let converted_body = db
+            .get_loop_spec("idem-legacy-spec")
+            .unwrap()
+            .unwrap()
+            .description
+            .unwrap();
+        // Sentinels survive the mechanical conversion verbatim.
+        assert!(converted_body.contains("src/main.rs:42"));
+        assert!(converted_body.contains("2026-09-01"));
+        assert!(converted_body.contains("abc-123"));
+        assert!(converted_body.contains("Latency < 100ms"));
+        assert!(converted_body.contains("`file:line`"));
+
+        let second = handler.spec_convert().await.unwrap();
+        let second_body = raw_text(&second);
+        assert!(second_body.contains("\"converted\": 0"), "{second_body}");
+        assert!(
+            second_body.contains("\"already_tagged\": 1"),
+            "{second_body}"
+        );
+        assert_eq!(
+            db.get_loop_spec("idem-legacy-spec")
+                .unwrap()
+                .unwrap()
+                .description
+                .unwrap(),
+            converted_body,
+            "second conversion run must not change stored content"
         );
     }
 

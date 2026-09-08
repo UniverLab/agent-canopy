@@ -73,7 +73,7 @@ stdio. Connect any MCP-capable AI CLI with `canopy mcp`.
 `loop_audit_node_configs`, `loop_schedule_continue`,
 `loop_preflight` — see [Loops](loops.md).
 
-## Spec backlog (5)
+## Spec backlog (7)
 
 | Tool | Description |
 |---|---|
@@ -82,6 +82,15 @@ stdio. Connect any MCP-capable AI CLI with `canopy mcp`.
 | `spec_update` | Update a spec's name, description, or workdir tag |
 | `spec_delete` | Delete an unbound spec |
 | `spec_set_status` | Admin transition: complete, skip, or reopen a standalone spec |
+| `spec_section_get` | Extract one canonical section (`<objective>`, `<constraints>`, …) from a spec body |
+| `spec_convert` | Convert legacy heading-format spec bodies to the tagged `<spec>` format (skips tagged and running specs) |
+
+Spec bodies use the tagged `<spec>` format with all seven canonical section
+tags — `<objective>`, `<functional_requirements>`,
+`<non_functional_requirements>`, `<constraints>`, `<guidelines>`, `<in_scope>`,
+`<out_of_scope>` — with markdown inside each section. Writes that do not parse
+are rejected naming the offending tag; legacy heading-format bodies remain
+readable until `spec_convert` migrates them.
 
 ## Spec queues (5)
 

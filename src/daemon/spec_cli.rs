@@ -44,10 +44,10 @@ pub enum SpecAction {
         /// Human-readable spec name.
         #[arg(long)]
         name: String,
-        /// Spec description. Must include the required sections
-        /// (objective/expected outcome, functional requirements,
-        /// non-functional requirements, constraints, guidelines, in scope,
-        /// out of scope) — the same template `loop_add_spec` requires.
+        /// Spec description. Must use the tagged `<spec>` format with all
+        /// seven section tags: `<objective>`, `<functional_requirements>`,
+        /// `<non_functional_requirements>`, `<constraints>`, `<guidelines>`,
+        /// `<in_scope>`, `<out_of_scope>`. Markdown is allowed inside each section.
         #[arg(long)]
         description: String,
         /// Absolute workdir tag, for backlog filtering only.
@@ -60,6 +60,8 @@ pub enum SpecAction {
         #[arg(long)]
         group: Option<String>,
     },
+    /// Convert all legacy heading-format specs to the tagged `<spec>` format.
+    Convert,
 }
 
 pub async fn handle_spec_action(action: SpecAction, port_override: Option<u16>) -> Result<()> {
@@ -87,6 +89,7 @@ pub async fn handle_spec_action(action: SpecAction, port_override: Option<u16>) 
             queue.as_deref(),
             group.as_deref(),
         ),
+        SpecAction::Convert => convert_specs(port_override),
     }
 }
 
@@ -134,6 +137,12 @@ fn create_spec(
         println!("{queue_text}");
     }
 
+    Ok(())
+}
+
+fn convert_specs(port_override: Option<u16>) -> Result<()> {
+    let text = call_tool(port_override, "spec_convert", &serde_json::json!({}))?;
+    println!("{text}");
     Ok(())
 }
 
@@ -339,5 +348,26 @@ mod tests {
             }
         }
         panic!("port kept getting claimed by another test after 5 attempts");
+    }
+
+    #[test]
+    fn spec_action_convert_variant_parses() {
+        let cli = TestCli::try_parse_from(["test", "convert"]).expect("should parse");
+        assert!(matches!(cli.action, SpecAction::Convert));
+    }
+
+    #[test]
+    fn convert_specs_calls_spec_convert_and_prints_report() {
+        let fake = spawn_fake_daemon(serde_json::json!({
+            "content": [{"type": "text", "text": "{\"scanned\":3,\"converted\":1}"}],
+            "isError": false
+        }));
+        let port: u16 = fake.port.parse().unwrap();
+
+        convert_specs(Some(port)).expect("should succeed");
+
+        let calls = fake.recorded_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["name"], "spec_convert");
     }
 }
