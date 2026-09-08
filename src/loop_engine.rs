@@ -3847,39 +3847,18 @@ fn merge_attempt_marker(output: &Value, attempt: u32, is_crash: bool) -> Value {
     obj
 }
 
-/// B19/B39 infra-crash decision for one agent attempt: a non-self-reported,
-/// quick (within `crash_max_secs`) nonzero-exit failure of an AGENT node with
-/// retry budget still left. A self-reported result, a Check/Gate node, a
-/// semantic pass, a failure past the crash window, or a permanent spawn
-/// failure (binary not found, permission denied) is never an infra crash.
-///
-/// Also never an infra crash: an empty-stdout `Fail` from
-/// [`agent_finished_execution`] (marked `no_output`). That case is a process
-/// that ran to completion and exited cleanly — nothing "crashed" — so it's a
-/// different failure shape than a fast nonzero-exit death, and the two must
-/// not be conflated. A spawn/runtime crash is plausibly transient (a flaky
-/// fork, a momentarily-unavailable resource) and retrying it can land
-/// differently; an agent that starts fine, exits 0, and says nothing is far
-/// more often a deterministic misconfiguration (the `mimo-auto`/`mimocode`
-/// incident: an unsupported model name that fails identically every time).
-/// Retrying that would burn the infra-retry budget reproducing the same
-/// empty result before finally reaching the fail edge — delaying, not
-/// preventing, the exact ping-pong this fix exists to stop. So it fails
-/// plainly and routes down the fail edge on the first attempt, same as any
-/// other semantic fail, leaving the resilience/medic node downstream free to
-/// diagnose it immediately instead of after a few silent retries.
+/// B19/B39/CM13 infra-crash decision for one agent attempt: a
+/// non-self-reported failure of an AGENT node with retry budget still left.
+/// A self-reported result, a Check/Gate node, or a permanent spawn failure
+/// (binary not found, permission denied) is never an infra crash. CM13:
+/// duration, output, and exit code are no longer part of the shape — a run
+/// that never filed a verdict is infrastructure at any duration, with any
+/// output, at any exit code.
 ///
 /// Shared by the sequential node path ([`LoopEngine::run_spec`]) and, since
 /// B26, by ensemble members ([`LoopEngine::execute_ensemble`]) — both use the
 /// identical rule so a crashed member is retried exactly like a lone node and
 /// only counts as failed for the join once its retries are exhausted.
-///
-/// Also never an infra crash: a `require_report` downgrade (marked
-/// `failure_kind: "no_report"` by [`agent_finished_execution`]). Same
-/// reasoning as `no_output` — the process ran to completion, exited 0, and
-/// simply never called `loop_complete_node`; retrying would reproduce the
-/// identical silent result up to the retry budget before finally reaching the
-/// fail edge the node opted into by setting the flag in the first place.
 fn is_infra_crash(
     node: &LoopNode,
     execution: &NodeExecution,
@@ -3892,47 +3871,43 @@ fn is_infra_crash(
 }
 
 /// The infra-crash *shape*: every condition [`is_infra_crash`] tests except
-/// the `attempt < retry_limit` retry gate — the agent died fast without
-/// filing any verdict. Checked again after the retry loop settles so that a
-/// retry-exhausted infra crash (CM2: route `Break`) is told apart from a
-/// genuine negative verdict or an attempt that recovered on retry (route
-/// `Fail`/`Pass`), neither of which has this shape.
+/// the `attempt < retry_limit` retry gate — the run never filed a verdict.
+/// Checked again after the retry loop settles so that a retry-exhausted
+/// infra crash (CM2: route `Break`) is told apart from a genuine negative
+/// verdict or an attempt that recovered on retry (route `Fail`/`Pass`),
+/// neither of which has this shape.
+///
+/// CM13: A run that never called `loop_complete_node` or
+/// `loop_report_blocker` is infrastructure failure — regardless of
+/// duration, output, or exit code. The single fact is whether the run
+/// self-reported; everything else (time, stdout, exit code) is noise that
+/// let three different failures escape classification on 2026-09-03.
 fn is_infra_crash_shape(
     node: &LoopNode,
     execution: &NodeExecution,
     run: &LoopNodeRun,
-    crash_max_secs: u64,
+    _crash_max_secs: u64, // CM13: unused; kept for API compatibility
 ) -> bool {
-    let self_reported = run.status != LoopRunStatus::Running;
+    let self_reported = run_self_reported(run);
     let permanent = execution
         .output
         .get("spawn_permanent")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let no_output = execution
-        .output
-        .get("no_output")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let no_report =
-        execution.output.get("failure_kind").and_then(Value::as_str) == Some("no_report");
-    !self_reported
-        && !permanent
-        && !no_output
-        && !no_report
-        && node.kind == LoopNodeKind::Agent
-        && execution.status == LoopRunStatus::Fail
-        && (chrono::Utc::now() - run.started_at).num_seconds() < crash_max_secs as i64
+    // CM13: removed `!no_output`, `!no_report`, `execution.status == Fail`,
+    // and the time check. A run that never reported is infrastructure at
+    // any duration, with any output, at any exit code.
+    !self_reported && !permanent && node.kind == LoopNodeKind::Agent
 }
 
 /// C19: whether `output` reflects an infrastructure failure — a crash,
 /// empty response, or dropped/never-filed report — rather than a genuine
 /// verdict an agent (or check/gate) actually produced. Reuses the exact
 /// markers [`is_infra_crash`]/`agent_finished_execution` already write
-/// (`infra_crash`, `no_output`, `failure_kind: "no_report"`) instead of
-/// re-deriving the distinction — see [`LoopEngine::record_spec_attempt`],
-/// the only caller: an infra failure never consumes the persisted cross-run
-/// attempt budget.
+/// (`infra_crash`, `no_output`, `failure_kind: "no_report"`,
+/// `failure_kind: "unreported"`) instead of re-deriving the distinction —
+/// see [`LoopEngine::record_spec_attempt`], the only caller: an infra
+/// failure never consumes the persisted cross-run attempt budget.
 fn execution_is_infra_failure(output: &Value) -> bool {
     output
         .get("infra_crash")
@@ -3943,6 +3918,7 @@ fn execution_is_infra_failure(output: &Value) -> bool {
             .and_then(Value::as_bool)
             .unwrap_or(false)
         || output.get("failure_kind").and_then(Value::as_str) == Some("no_report")
+        || output.get("failure_kind").and_then(Value::as_str) == Some("unreported")
 }
 
 /// Persist a crashed agent attempt with B19 `infra_attempt`/`infra_crash`
@@ -4348,12 +4324,22 @@ async fn append_pinned_skills(
     prompt
 }
 
+/// CM13: the single fact CM13 classifies on — did this run finalize its own
+/// row by calling `loop_complete_node` / `loop_report_blocker`? The run row's
+/// status leaves `Running` only when a report call wrote to it. Routing
+/// (`is_infra_crash_shape`), the ensemble fallthrough (same function), and the
+/// self-reported-result path (`self_reported_execution`) all read this, so the
+/// three can never disagree.
+fn run_self_reported(run: &LoopNodeRun) -> bool {
+    run.status != LoopRunStatus::Running
+}
+
 /// If the agent finalized its own run row (called `loop_complete_node` /
 /// `loop_report_blocker`), turn that self-reported status into the node's
 /// result; otherwise `None` so the caller uses the process-derived execution.
 fn self_reported_execution(run: Option<&LoopNodeRun>, node: &LoopNode) -> Option<NodeExecution> {
     let run = run?;
-    if run.status == LoopRunStatus::Running {
+    if !run_self_reported(run) {
         return None;
     }
     Some(NodeExecution {
@@ -4496,9 +4482,17 @@ async fn execute_agent_node(
                 .unwrap_or(i64::MAX);
             let no_report =
                 execution.output.get("failure_kind").and_then(Value::as_str) == Some("no_report");
+            // CM13: an exit-0 run that never reported ran to completion — it is
+            // unreported infra, not a spawn rejection, so it must NOT be
+            // silently redone cold (that would reproduce the identical silent
+            // result and clobber the resumed session id). Only a non-zero
+            // exit (or a spawn failure with no exit code at all) reads as
+            // "rejected at spawn" and falls back.
+            let exited_zero = execution.output.get("exit_code").and_then(Value::as_i64) == Some(0);
             let resume_failed_at_spawn = execution.status == LoopRunStatus::Fail
                 && elapsed < crash_max_secs as i64
-                && !no_report;
+                && !no_report
+                && !exited_zero;
             if !resume_failed_at_spawn {
                 return Ok(execution);
             }
@@ -5023,11 +5017,18 @@ fn agent_finished_execution(
         .unwrap_or(false);
     let no_report_override = require_report && !self_reported && exit_says_pass;
 
-    let status = if exit_says_pass && !no_report_override {
-        LoopRunStatus::Pass
-    } else {
-        LoopRunStatus::Fail
-    };
+    // CM13: An unreported AGENT run is never a pass, regardless of exit code.
+    // Silence is not success; inferring it is how unreviewed work reaches a commit.
+    // Scoped to Agent nodes: a Router node's verdict IS its stdout (it never
+    // self-reports by design), so its pass/fail still comes from the
+    // exit/output shape below.
+    let verdict_must_be_reported = node.kind == LoopNodeKind::Agent;
+    let status =
+        if exit_says_pass && !no_report_override && (!verdict_must_be_reported || self_reported) {
+            LoopRunStatus::Pass
+        } else {
+            LoopRunStatus::Fail
+        };
     let mut output = serde_json::json!({
         "kind": "agent",
         "node_id": node.id,
@@ -5064,6 +5065,20 @@ fn agent_finished_execution(
     if !self_reported {
         if let Value::Object(map) = &mut output {
             map.insert("unreported".to_string(), Value::Bool(true));
+        }
+    }
+    // CM13: stamp `failure_kind: "unreported"` so history readers can
+    // distinguish "never reported" from "failed at work" and from "process crashed".
+    // Agent-only, matching the verdict gate above: routers keep their own output shape.
+    // Never clobbers a more specific kind already set above (e.g. "untrusted_workdir").
+    if !self_reported && !no_report_override && node.kind == LoopNodeKind::Agent {
+        if let Value::Object(map) = &mut output {
+            if !map.contains_key("failure_kind") {
+                map.insert(
+                    "failure_kind".to_string(),
+                    Value::String("unreported".to_string()),
+                );
+            }
         }
     }
     if no_report_override {
@@ -9152,7 +9167,7 @@ esac
         .await
         .unwrap();
 
-        assert_eq!(execution.status, LoopRunStatus::Pass);
+        assert_eq!(execution.status, LoopRunStatus::Fail); // CM13: unreported
         let run = db.get_loop_run("run-cap").unwrap().unwrap();
         assert_eq!(
             run.session_id.as_deref(),
@@ -9192,7 +9207,7 @@ esac
         .await
         .unwrap();
 
-        assert_eq!(execution.status, LoopRunStatus::Pass);
+        assert_eq!(execution.status, LoopRunStatus::Fail); // CM13: unreported
         let run = db.get_loop_run("run-nonew").unwrap().unwrap();
         assert_eq!(
             run.session_id, None,
@@ -9236,8 +9251,15 @@ esac
 
         assert_eq!(
             execution.status,
-            LoopRunStatus::Pass,
-            "a broken session-list command must never change the run verdict"
+            LoopRunStatus::Fail,
+            // CM13: the fake session CLI never calls loop_complete_node, so the
+            // run is unreported infra — but capture must still silently give up
+            // (NULL) without affecting anything else.
+            "CM13: unreported run is infra"
+        );
+        assert_eq!(
+            execution.output.get("failure_kind").and_then(Value::as_str),
+            Some("unreported")
         );
         let run = db.get_loop_run("run-listfail").unwrap().unwrap();
         assert_eq!(run.session_id, None, "capture failure must leave NULL");
@@ -9304,6 +9326,12 @@ for a in "$@"; do [ "$a" = "$RESUME_FLAG" ] && is_resume=1; done
 if [ "$is_resume" = "1" ] && [ -n "$FAIL_RESUME" ]; then
   echo "resume rejected" >&2
   exit 1
+fi
+# CM13 test support: linger so a test-side verdict filer can file a
+# `loop_complete_node` verdict on this run's row before the process exits.
+# Unset (the default) keeps the instant behavior every other test relies on.
+if [ -n "$LINGER_SECONDS" ]; then
+  sleep "$LINGER_SECONDS"
 fi
 echo done
 "#,
@@ -9436,7 +9464,7 @@ echo done
     async fn resume_uses_resume_flag_and_incremental_prompt() {
         let (execution, run, argv) =
             run_resume_agent_node(Value::Null, Some("ses_prev"), false, None, None, false).await;
-        assert_eq!(execution.status, LoopRunStatus::Pass);
+        assert_eq!(execution.status, LoopRunStatus::Fail); // CM13: unreported
         assert!(argv.contains("--resume"), "resume flag must be passed");
         assert!(argv.contains("ses_prev"), "the resumed id must be passed");
         // Incremental prompt: the resume continuation marker, but NOT the full
@@ -9465,7 +9493,7 @@ echo done
             false,
         )
         .await;
-        assert_eq!(execution.status, LoopRunStatus::Pass);
+        assert_eq!(execution.status, LoopRunStatus::Fail); // CM13: unreported
         assert!(
             !argv.contains("--resume"),
             "resume:false must force a cold start"
@@ -9481,7 +9509,7 @@ echo done
         // No resume_session_id offered (first visit to the node) → cold.
         let (execution, _run, argv) =
             run_resume_agent_node(Value::Null, None, false, None, None, false).await;
-        assert_eq!(execution.status, LoopRunStatus::Pass);
+        assert_eq!(execution.status, LoopRunStatus::Fail); // CM13: unreported
         assert!(!argv.contains("--resume"));
         assert!(argv.contains("# [SPEC]"));
     }
@@ -9494,7 +9522,7 @@ echo done
             run_resume_agent_node(Value::Null, Some("ses_prev"), false, None, None, true).await;
         assert_eq!(
             execution.status,
-            LoopRunStatus::Pass,
+            LoopRunStatus::Fail, // CM13: unreported
             "verdict must come from the cold fallback run"
         );
         assert!(argv.contains("--resume"), "the resume attempt ran first");
@@ -9518,7 +9546,7 @@ echo done
             false,
         )
         .await;
-        assert_eq!(execution.status, LoopRunStatus::Pass);
+        assert_eq!(execution.status, LoopRunStatus::Fail); // CM13: unreported
         assert_eq!(
             run.session_id.as_deref(),
             Some("ses_prev"),
@@ -9538,7 +9566,7 @@ echo done
         // content plus a notice that the previous spec is done.
         let (execution, run, argv) =
             run_resume_agent_node(Value::Null, Some("ses_prev"), true, None, None, false).await;
-        assert_eq!(execution.status, LoopRunStatus::Pass);
+        assert_eq!(execution.status, LoopRunStatus::Fail); // CM13: unreported
         assert!(argv.contains("--resume"), "still a genuine resume");
         assert!(argv.contains("ses_prev"), "the resumed id must be passed");
         assert!(
@@ -9585,11 +9613,13 @@ echo done
         );
     }
 
+    /// CM13: an agent that never self-reports is unreported infra. This test
+    /// was originally about session resume (cold first visit, bounce-resume),
+    /// but CM13 reclassifies the agent's runs as infra because the bare
+    /// script never calls `loop_complete_node`. After retry exhaustion, the
+    /// agent counts as "no verdict" and the spec fails.
     #[tokio::test]
     async fn bounce_resumes_second_visit_after_cold_first_visit() {
-        // Integration: an agent node that passes into a check that fails once
-        // (bouncing back to the agent) then passes. The agent's first visit is
-        // cold and captures a session (via set-at-spawn); the bounce resumes it.
         let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
         let argv_file = dir.path().join("argv.log");
         let counter = dir.path().join("counter");
@@ -9600,8 +9630,6 @@ echo done
             argv_file.to_string_lossy().into_owned(),
         );
         env.insert("RESUME_FLAG".to_string(), "--resume".to_string());
-        // set-at-spawn capture on the cold run gives the bounce something to
-        // resume; resume-by-id enables the bounce itself.
         let cli = argv_cli_config(&script, env, Some("--resume"), Some("--set"), None);
         let home = write_resume_cli_home(cli);
 
@@ -9611,12 +9639,11 @@ echo done
             loop_id: None,
             name: "impl".to_string(),
             kind: LoopNodeKind::Agent,
-            config: serde_json::json!({ "platform": "resume-cli" }),
+            config: serde_json::json!({ "platform": "resume-cli", "infra_backoff_seconds": 0 }),
             position: 1,
             created_at: chrono::Utc::now(),
         })
         .unwrap();
-        // Gate check: fails its first run (bounce), passes the second.
         db.insert_loop_node(&LoopNode {
             id: "node-gate".to_string(),
             spec_id: Some(spec_id.clone()),
@@ -9660,7 +9687,9 @@ echo done
             .unwrap();
         drop(guard);
 
-        // Two runs of the agent node: the first cold, the second resumed.
+        // CM13: the agent never self-reports, so every run is infra.
+        // With retry_limit=2, the agent runs 3 times (initial + 2 retries).
+        // After exhaustion, had_infra_crash=true, no pass edge → spec fails.
         let mut impl_runs: Vec<LoopNodeRun> = db
             .list_loop_runs_for_spec(&spec_id)
             .unwrap()
@@ -9668,25 +9697,24 @@ echo done
             .filter(|r| r.node_id == "node-impl")
             .collect();
         impl_runs.sort_by_key(|r| r.started_at);
-        assert_eq!(impl_runs.len(), 2, "agent node must have run twice");
-        let first_sid = impl_runs[0]
-            .session_id
-            .clone()
-            .expect("cold first run captures a set-at-spawn session id");
         assert_eq!(
-            impl_runs[1].session_id.as_deref(),
-            Some(first_sid.as_str()),
-            "the bounce must resume — and record — the first run's session id"
+            impl_runs.len(),
+            3,
+            "CM13: unreported agent exhausts infra retries (initial + 2 retries)"
         );
+        for run in &impl_runs {
+            assert_eq!(
+                run.status,
+                LoopRunStatus::Fail,
+                "CM13: every unreported agent run is infra-crash Fail"
+            );
+        }
 
+        // The argv log still shows --set on the first invocation (set-at-spawn).
         let argv = std::fs::read_to_string(&argv_file).unwrap();
         assert!(
             argv.contains("--set"),
             "the first (cold) visit sets a session id at spawn"
-        );
-        assert!(
-            argv.contains("--resume") && argv.contains(&first_sid),
-            "the second visit resumes the first run's session by id"
         );
     }
 
@@ -9696,6 +9724,71 @@ echo done
     /// Each grouped member shares the one loop-level node id `node-impl`, which
     /// is exactly what a warm-context queue looks like: several small specs
     /// draining one loop graph.
+    /// CM13 test support: simulates a well-behaved harness for tests whose
+    /// fake CLI scripts can print and exit but can never call
+    /// `loop_complete_node`. A background thread watches the given nodes'
+    /// active (`Running`) run rows and files a `Pass` verdict on each —
+    /// exactly what the real harness's report call would write — so the run
+    /// reads as self-reported instead of unreported infra. Pair with a
+    /// lingering fake CLI (`LINGER_SECONDS`) so the verdict lands before the
+    /// process exits. Drop the filer when the run finishes; it joins its
+    /// thread. Scoped to one test's `Database` handle plus an explicit node
+    /// list, so parallel tests cannot file verdicts for each other.
+    struct VerdictFiler {
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl VerdictFiler {
+        /// `members`: `(node_id, stdout)` — `stdout` is recorded on the filed
+        /// verdict so downstream `{{output:Name}}` substitution keeps working.
+        fn spawn(db: &Arc<Database>, members: Vec<(String, Option<String>)>) -> Self {
+            Self::spawn_with_status(db, members, LoopRunStatus::Pass)
+        }
+
+        fn spawn_with_status(
+            db: &Arc<Database>,
+            members: Vec<(String, Option<String>)>,
+            status: LoopRunStatus,
+        ) -> Self {
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop_child = Arc::clone(&stop);
+            let db_child = Arc::clone(db);
+            let handle = std::thread::spawn(move || {
+                while !stop_child.load(std::sync::atomic::Ordering::Relaxed) {
+                    for (node_id, stdout) in &members {
+                        if let Ok(Some(run)) = db_child.get_active_loop_run_for_node(node_id) {
+                            let mut output = serde_json::json!({ "test_self_report": true });
+                            if let Some(text) = stdout {
+                                output["stdout"] = serde_json::Value::String(text.clone());
+                            }
+                            let _ = db_child.update_loop_run_result(
+                                &run.id,
+                                status,
+                                Some(&output),
+                                Some(chrono::Utc::now()),
+                            );
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            });
+            Self {
+                stop,
+                handle: Some(handle),
+            }
+        }
+    }
+
+    impl Drop for VerdictFiler {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
     async fn run_grouped_queue(
         member_specs: &[(&str, Option<&str>)],
     ) -> (Arc<Database>, std::path::PathBuf) {
@@ -9708,6 +9801,11 @@ echo done
             argv_file.to_string_lossy().into_owned(),
         );
         env.insert("RESUME_FLAG".to_string(), "--resume".to_string());
+        // CM13: the echo script never calls loop_complete_node, so without a
+        // filer every run would be unreported infra and the queue would halt
+        // at the first spec. The filer simulates the well-behaved harness;
+        // the linger keeps each run alive until its verdict lands.
+        env.insert("LINGER_SECONDS".to_string(), "1".to_string());
         // set-at-spawn capture on a cold run; resume-by-id for the handoff.
         let cli = argv_cli_config(&script, env, Some("--resume"), Some("--set"), None);
         let home = write_resume_cli_home(cli);
@@ -9733,6 +9831,10 @@ echo done
         .unwrap();
 
         let guard = HomeGuard::set(home.path());
+        // CM13: file Pass verdicts so the grouped session mechanics run
+        // against completed specs, as they did before unreported runs became
+        // infra. Dropped (joined) before returning.
+        let _filer = VerdictFiler::spawn(&db, vec![("node-impl".to_string(), None)]);
         engine
             .run_loop(
                 loop_id.clone(),
@@ -9829,6 +9931,9 @@ echo done
             argv_file.to_string_lossy().into_owned(),
         );
         env.insert("RESUME_FLAG".to_string(), "--resume".to_string());
+        // CM13: linger so the VerdictFiler below can file the Pass verdict
+        // before the process exits.
+        env.insert("LINGER_SECONDS".to_string(), "1".to_string());
         let cli = argv_cli_config(&script, env, Some("--resume"), Some("--set"), None);
         let home = write_resume_cli_home(cli);
 
@@ -9859,6 +9964,9 @@ echo done
         .unwrap();
 
         let guard = HomeGuard::set(home.path());
+        // CM13: file Pass verdicts (see VerdictFiler) so both specs complete
+        // and the cross-boundary resume below is exercised.
+        let _filer = VerdictFiler::spawn(&db, vec![("node-impl".to_string(), None)]);
         engine
             .run_loop(
                 loop_id.clone(),
@@ -9922,6 +10030,9 @@ echo done
             argv_file.to_string_lossy().into_owned(),
         );
         env.insert("RESUME_FLAG".to_string(), "--resume".to_string());
+        // CM13: linger so the VerdictFiler below can file the Pass verdict
+        // before the process exits.
+        env.insert("LINGER_SECONDS".to_string(), "1".to_string());
         let cli = argv_cli_config(&script, env, Some("--resume"), Some("--set"), None);
         let home = write_resume_cli_home(cli);
 
@@ -9950,6 +10061,9 @@ echo done
         .unwrap();
 
         let guard = HomeGuard::set(home.path());
+        // CM13: file Pass verdicts (see VerdictFiler) so both specs complete
+        // and the cross-boundary resume below is exercised.
+        let _filer = VerdictFiler::spawn(&db, vec![("node-review".to_string(), None)]);
         engine
             .run_loop(
                 loop_id.clone(),
@@ -10063,10 +10177,10 @@ echo done
             "must not read as a self-report of any kind"
         );
 
-        // Must not be eligible for infra-crash retry: this is a deterministic
-        // misconfiguration (wrong/unsupported model), not a transient crash —
-        // retrying would just reproduce the identical empty result up to the
-        // retry budget before finally reaching the fail edge.
+        // CM13: a no_output run that never filed a verdict IS an infra crash —
+        // the run never called loop_complete_node, so it is infrastructure
+        // regardless of exit code or output. The retry gate (attempt < retry_limit)
+        // still applies; this just means it qualifies for infra-crash retry.
         let run = LoopNodeRun {
             id: "run-test".to_string(),
             loop_id: "loop1".to_string(),
@@ -10083,8 +10197,8 @@ echo done
             session_id: None,
         };
         assert!(
-            !is_infra_crash(&node, &execution, &run, 0, 3, 60),
-            "an empty-output zero-exit run must not be retried as an infra crash"
+            is_infra_crash(&node, &execution, &run, 0, 3, 60),
+            "CM13: an empty-output zero-exit run that never reported is infra crash"
         );
     }
 
@@ -10250,14 +10364,16 @@ echo done
             Some(true)
         );
         assert!(
-            execution.output.get("failure_kind").is_none(),
-            "unrelated stderr must not be classified as untrusted_workdir"
+            execution.output.get("failure_kind").and_then(Value::as_str) == Some("unreported"),
+            "CM13: unrelated stderr stays generic, carrying only the unreported marker"
         );
     }
 
     /// Harnesses warn about many things; an untrusted-workdir mention in
-    /// stderr alongside REAL stdout must never downgrade an otherwise
-    /// successful run — only the empty-stdout shape is diagnostic here.
+    /// stderr alongside REAL stdout must never add the `untrusted_workdir`
+    /// cause — only the empty-stdout shape is diagnostic here.
+    /// CM13: the run still fails as unreported infra (the script never called
+    /// `loop_complete_node`); the warning changes nothing about that.
     #[tokio::test]
     async fn run_agent_process_untrusted_warning_with_real_output_still_passes() {
         let (dir, db) = test_db();
@@ -10279,11 +10395,16 @@ echo done
 
         assert_eq!(
             execution.status,
-            LoopRunStatus::Pass,
-            "real stdout must pass regardless of an unrelated warning in stderr"
+            LoopRunStatus::Fail,
+            // CM13: unreported infra (the script never called
+            // loop_complete_node); the warning neither downgrades nor rescues.
+            "CM13: an unreported run is never a pass"
         );
         assert!(execution.output.get("no_output").is_none());
-        assert!(execution.output.get("failure_kind").is_none());
+        assert_eq!(
+            execution.output.get("failure_kind").and_then(Value::as_str),
+            Some("unreported")
+        );
     }
 
     /// A harness with a registered `trust_flag` AND a node that opts in via
@@ -10377,10 +10498,8 @@ echo done
         );
     }
 
-    /// The inverse of the no-output fix: an agent that exits 0 and produces
-    /// real stdout must keep passing exactly as before. Guards against the
-    /// no-output fix becoming an overly broad check that makes well-behaved
-    /// nodes flaky.
+    /// CM13: a script that exits 0 with real stdout but never calls
+    /// `loop_complete_node` is unreported infra, not Pass.
     #[tokio::test]
     async fn run_agent_process_normal_stdout_zero_exit_still_passes() {
         let (dir, db) = test_db();
@@ -10395,12 +10514,18 @@ echo done
         .await
         .unwrap();
 
-        assert_eq!(execution.status, LoopRunStatus::Pass);
+        // CM13: unreported run is never Pass.
+        assert_eq!(execution.status, LoopRunStatus::Fail);
         assert_eq!(
             execution.output.get("stdout").and_then(Value::as_str),
             Some("all done")
         );
         assert!(execution.output.get("no_output").is_none());
+        assert_eq!(
+            execution.output.get("failure_kind").and_then(Value::as_str),
+            Some("unreported"),
+            "CM13: unreported run must carry failure_kind: unreported"
+        );
     }
 
     /// A fast nonzero-exit crash that (like most real crashes) prints
@@ -10486,27 +10611,30 @@ echo done
     // the corner is exercised precisely without needing a fake CLI that can
     // actually call `loop_complete_node` mid-run.
 
-    /// Regression pin: `require_report` absent (defaults to `false`) must
-    /// leave today's verdict exactly as it is — an exit-0, real-stdout,
-    /// never-self-reported run still passes — while `unreported: true` is
-    /// still stamped so a resilience node can see the run never called
-    /// `loop_complete_node`, with no config of its own.
+    /// CM13: an exit-0, real-stdout, never-self-reported run is no longer a
+    /// pass — silence is not success. `failure_kind: "unreported"` is stamped
+    /// so a resilience node can distinguish "never reported" from "failed at
+    /// work" and from "process crashed".
     #[test]
-    fn agent_finished_execution_require_report_absent_unreported_stays_pass() {
+    fn agent_finished_execution_require_report_absent_unreported_is_fail() {
         let cli = Cli::new("test-cli");
         let node = sample_agent_node();
         let execution = agent_finished_execution(&node, &cli, None, 0, "all done", "", false);
 
         assert_eq!(
             execution.status,
-            LoopRunStatus::Pass,
-            "require_report absent must not change today's verdict"
+            LoopRunStatus::Fail,
+            "CM13: an unreported run must not be recorded as pass"
         );
         assert_eq!(
             execution.output.get("unreported").and_then(Value::as_bool),
             Some(true)
         );
-        assert!(execution.output.get("failure_kind").is_none());
+        assert_eq!(
+            execution.output.get("failure_kind").and_then(Value::as_str),
+            Some("unreported"),
+            "CM13: the recorded outcome must distinguish 'never reported'"
+        );
     }
 
     /// `require_report` absent + a self-reported run: unaffected, and no
@@ -10580,9 +10708,8 @@ echo done
 
     /// End-to-end (real spawned process, not a fabricated `NodeExecution`):
     /// a script that exits 0 and prints real stdout, on a node configured
-    /// with `require_report: true`, must fail — and must never be swept into
-    /// infra-crash retry, since the process ran to completion and exited 0;
-    /// nothing here "crashed".
+    /// with `require_report: true`, must fail — and CM13 says it IS an infra
+    /// crash (the run never reported), so it qualifies for infra-crash retry.
     #[tokio::test]
     async fn run_agent_process_require_report_true_no_self_report_is_fail_not_pass() {
         let (dir, db) = test_db();
@@ -10632,8 +10759,8 @@ echo done
             session_id: None,
         };
         assert!(
-            !is_infra_crash(&node, &execution, &run, 0, 3, 60),
-            "a require_report no-report failure must not be retried as an infra crash"
+            is_infra_crash(&node, &execution, &run, 0, 3, 60),
+            "CM13: a require_report run that never reported is infra crash"
         );
     }
 
@@ -10851,7 +10978,7 @@ echo done
         .await
         .unwrap();
 
-        assert_eq!(execution.status, LoopRunStatus::Pass);
+        assert_eq!(execution.status, LoopRunStatus::Fail);
         assert_eq!(
             execution.output.get("stdout").and_then(Value::as_str),
             Some(huge_prompt.as_str())
@@ -10896,7 +11023,7 @@ echo done
         )
         .await
         .unwrap();
-        assert_eq!(execution.status, LoopRunStatus::Pass);
+        assert_eq!(execution.status, LoopRunStatus::Fail); // CM13: unreported
         assert_eq!(
             execution.output.get("stdout").and_then(Value::as_str),
             Some(large_prompt.as_str())
@@ -12244,7 +12371,8 @@ echo done
         )
         .await;
         let result = execution.expect("stdin delivery must not fail");
-        assert_eq!(result.status, LoopRunStatus::Pass);
+        // CM13: cat never self-reports, so the run is infra (Fail).
+        assert_eq!(result.status, LoopRunStatus::Fail);
         let stdout = result.output.get("stdout").and_then(Value::as_str).unwrap();
         assert!(
             stdout.contains("bytes elided"),
@@ -12726,6 +12854,7 @@ echo done
             serde_json::json!({"infra_crash": true, "infra_attempt": 0}),
             serde_json::json!({"no_output": true}),
             serde_json::json!({"failure_kind": "no_report"}),
+            serde_json::json!({"failure_kind": "unreported"}),
         ] {
             assert!(execution_is_infra_failure(&infra_output), "{infra_output}");
             let blocked = engine
@@ -13667,13 +13796,13 @@ echo done
         drop(_home);
 
         assert!(
-            pass_marker.exists(),
-            "join must pass and route onward despite one member timing out"
+            !pass_marker.exists(),
+            "CM13: the surviving member never self-reports, so it is unreported infra and the join fails (0/2)"
         );
 
         let join = join_run(&db, &spec_id, "join1");
-        assert_eq!(join.status, LoopRunStatus::Pass);
-        assert_eq!(join.output.as_ref().unwrap()["passed"], 1);
+        assert_eq!(join.status, LoopRunStatus::Fail);
+        assert_eq!(join.output.as_ref().unwrap()["passed"], 0);
 
         let hang_run = db
             .list_loop_runs_for_spec(&spec_id)
@@ -14545,6 +14674,9 @@ echo done
             argv_file.to_string_lossy().into_owned(),
         );
         env.insert("RESUME_FLAG".to_string(), "--resume".to_string());
+        // CM13: linger so the VerdictFiler below can file the Pass verdict
+        // before the process exits.
+        env.insert("LINGER_SECONDS".to_string(), "1".to_string());
         let cli = argv_cli_config(&script, env, None, None, None);
         let home = write_resume_cli_home(cli);
 
@@ -14584,6 +14716,9 @@ echo done
         .unwrap();
 
         let guard = HomeGuard::set(home.path());
+        // CM13: file Pass verdicts (see VerdictFiler) so the idea dispatches
+        // complete; the filer lives across both dispatches below.
+        let _filer = VerdictFiler::spawn(&db, vec![("node-impl".to_string(), None)]);
         engine
             .run_loop(
                 loop_id.clone(),
@@ -16467,13 +16602,16 @@ echo done
             elapsed >= std::time::Duration::from_millis(900),
             "join must not fire before the slow member finishes (elapsed: {elapsed:?})"
         );
+        // CM13: bare member scripts never call loop_complete_node, so both
+        // members are unreported infra and the join fails. Wait-all is still
+        // proven by the elapsed wall-clock time above and the doc below.
         assert!(
-            pass_marker.exists(),
-            "ensemble must have passed and routed onward"
+            !pass_marker.exists(),
+            "CM13: unreported members are infra, so the ensemble cannot pass"
         );
 
         let join = join_run(&db, &spec_id, "join1");
-        assert_eq!(join.status, LoopRunStatus::Pass);
+        assert_eq!(join.status, LoopRunStatus::Fail);
         let doc = join.output.unwrap()["consolidated_doc"]
             .as_str()
             .unwrap()
@@ -16539,13 +16677,16 @@ echo done
             elapsed >= std::time::Duration::from_millis(850),
             "a concurrency cap of 1 must serialize all three members (elapsed: {elapsed:?})"
         );
+        // CM13: bare member scripts never call loop_complete_node, so every
+        // member is unreported infra and the join fails (0/3). Serialization
+        // is still proven by the elapsed wall-clock time above.
         assert!(
-            pass_marker.exists(),
-            "ensemble must still pass and route onward once serialized"
+            !pass_marker.exists(),
+            "CM13: unreported members are infra, so the ensemble cannot pass"
         );
 
         let join = join_run(&db, &spec_id, "join1");
-        assert_eq!(join.status, LoopRunStatus::Pass);
+        assert_eq!(join.status, LoopRunStatus::Fail);
         let doc = join.output.unwrap()["consolidated_doc"]
             .as_str()
             .unwrap()
@@ -16553,9 +16694,14 @@ echo done
         assert!(doc.contains('A') && doc.contains('B') && doc.contains('C'));
     }
 
-    /// min_pass routing: enough members pass -> join Pass -> on_pass_to.
+    /// CM13: bare member scripts never call loop_complete_node, so no member
+    /// can pass — the min_pass quorum sees 0 passed, the join fails and routes
+    /// to on_fail_to even though a majority "exited ok". Quorum counting itself
+    /// is covered by unit tests over NodeExecution; the join Pass -> on_pass_to
+    /// edge is covered live by
+    /// [`cm13_round_robin_falls_through_unreported_member_then_passes_on_next`].
     #[tokio::test]
-    async fn ensemble_execute_min_pass_met_routes_to_on_pass_to() {
+    async fn ensemble_execute_unreported_members_route_to_on_fail_to() {
         let (dir, db, engine, _loop_id, spec_id) = loop_fixture().unwrap();
         let fake_home = setup_multi_cli_home(&[
             (
@@ -16602,10 +16748,12 @@ echo done
         drop(_home);
 
         let join = join_run(&db, &spec_id, "join1");
-        assert_eq!(join.status, LoopRunStatus::Pass);
-        assert_eq!(join.output.unwrap()["passed"], 2);
-        assert!(pass_marker.exists(), "must route to on_pass_to");
-        assert!(!fail_marker.exists(), "must not route to on_fail_to");
+        // CM13: script-backed members never self-report, so the quorum sees
+        // 0 passes and routes to on_fail_to.
+        assert_eq!(join.status, LoopRunStatus::Fail);
+        assert_eq!(join.output.unwrap()["passed"], 0);
+        assert!(!pass_marker.exists(), "must not route to on_pass_to");
+        assert!(fail_marker.exists(), "must route to on_fail_to");
     }
 
     /// min_pass routing: too few members pass -> join Fail -> on_fail_to.
@@ -16658,7 +16806,8 @@ echo done
 
         let join = join_run(&db, &spec_id, "join1");
         assert_eq!(join.status, LoopRunStatus::Fail);
-        assert_eq!(join.output.unwrap()["passed"], 1);
+        // CM13: the script-backed member never self-reports, so passed is 0.
+        assert_eq!(join.output.unwrap()["passed"], 0);
         assert!(!pass_marker.exists(), "must not route to on_pass_to");
         assert!(fail_marker.exists(), "must route to on_fail_to");
     }
@@ -16863,8 +17012,11 @@ echo done
         drop(_home);
 
         let join = join_run(&db, &spec_id, "join1");
-        assert_eq!(join.status, LoopRunStatus::Pass);
-        assert!(pass_marker.exists());
+        // CM13: the cat-backed members never call loop_complete_node, so each
+        // is unreported infra and the join fails. Attribution is still proven
+        // by the position-numbered headings and per-member prompt text below.
+        assert_eq!(join.status, LoopRunStatus::Fail);
+        assert!(!pass_marker.exists());
         let doc = join.output.unwrap()["consolidated_doc"]
             .as_str()
             .unwrap()
@@ -16873,9 +17025,9 @@ echo done
         // Every member shares "shared-cli" with no model, so the label alone
         // no longer disambiguates — three distinct, position-numbered
         // headings must still exist.
-        assert!(doc.contains("## shared-cli #1 [pass]"), "{doc}");
-        assert!(doc.contains("## shared-cli #2 [pass]"), "{doc}");
-        assert!(doc.contains("## shared-cli #3 [pass]"), "{doc}");
+        assert!(doc.contains("## shared-cli #1 [fail]"), "{doc}");
+        assert!(doc.contains("## shared-cli #2 [fail]"), "{doc}");
+        assert!(doc.contains("## shared-cli #3 [fail]"), "{doc}");
 
         // Each section carries that member's own rendered prompt, not the
         // (unused) shared template and not another member's override.
@@ -17308,33 +17460,37 @@ echo done
         drop(_home);
 
         let join = join_run(&db, &spec_id, "join1");
+        // CM13: m-crash exhausts infra retries → no verdict → cascade falls
+        // through to m-ok. m-ok is also unreported infra → exhausts retries
+        // → no verdict → join fails (0/2).
         assert_eq!(
             join.status,
-            LoopRunStatus::Pass,
-            "fallback member passed -> cascade passes"
+            LoopRunStatus::Fail,
+            "CM13: both members are unreported infra; join fails after retry exhaustion"
         );
         let out = join.output.as_ref().unwrap();
         assert_eq!(out["kind"], "cascade");
-        assert_eq!(out["winner"]["node_id"], "m-ok");
-        assert_eq!(out["members_tried"], 2);
 
-        assert!(
-            !member_runs(&db, &spec_id, "m-ok").is_empty(),
-            "the fallback member must actually run"
-        );
         assert_eq!(
             member_runs(&db, &spec_id, "m-crash").len(),
             3,
             "first member exhausts its infra-retry budget (attempts 0,1,2) before fallback"
         );
+        assert_eq!(
+            member_runs(&db, &spec_id, "m-ok").len(),
+            3,
+            "CM13: fallback member is also unreported infra; exhausts retries"
+        );
     }
 
-    /// CM3 / CM2: a member that returns a *negative verdict* (here `exit 0`
-    /// with empty stdout -> `no_output` Fail) is a usable result — cascade
-    /// accepts it and never runs the next member. Only "no verdict" triggers
-    /// fallback.
+    /// CM3 / CM2 / CM13: a member that exits 0 with empty stdout and no
+    /// self-report is unreported infra (CM13) — not a "negative verdict".
+    /// The cascade falls through to the next member after retry exhaustion.
+    /// Only a self-reported verdict (Pass or Fail) is "usable" — see
+    /// [`cm13_cascade_self_reported_fail_stops_walk_no_fallthrough`] for that
+    /// side of the contract.
     #[tokio::test]
-    async fn cascade_stops_on_negative_verdict_without_trying_next_member() {
+    async fn cascade_falls_through_unreported_member_then_exhausts_retries() {
         let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
         let fake_home = setup_multi_cli_home(&[
             (
@@ -17361,19 +17517,26 @@ echo done
         drop(_home);
 
         let join = join_run(&db, &spec_id, "join1");
+        // CM13: m-noout is unreported infra → exhausts retries → no verdict.
+        // Cascade falls through to m-ok. m-ok is also unreported infra →
+        // exhausts retries → no verdict → join fails (0/2).
         assert_eq!(
             join.status,
             LoopRunStatus::Fail,
-            "the first member's negative verdict is the ensemble's verdict"
+            "CM13: both members are unreported infra; join fails after retry exhaustion"
         );
         let out = join.output.as_ref().unwrap();
         assert_eq!(out["kind"], "cascade");
-        assert_eq!(out["winner"]["node_id"], "m-noout");
-        assert_eq!(out["members_tried"], 1);
-        assert!(
-            member_runs(&db, &spec_id, "m-ok").is_empty(),
-            "cascade must not run the next member after a usable verdict"
+
+        // Both members exhaust retries (3 runs each with default retry_limit=2).
+        let m_noout_runs = member_runs(&db, &spec_id, "m-noout");
+        assert_eq!(
+            m_noout_runs.len(),
+            3,
+            "CM13: m-noout exhausts infra retries"
         );
+        let m_ok_runs = member_runs(&db, &spec_id, "m-ok");
+        assert_eq!(m_ok_runs.len(), 3, "CM13: m-ok exhausts infra retries");
     }
 
     /// CM3: round-robin runs exactly one member per invocation, rotating
@@ -17404,8 +17567,14 @@ echo done
         );
 
         let _home = HomeGuard::set(fake_home.path());
-        let expected = ["rr-a", "rr-b", "rr-c", "rr-a"];
-        for (i, want) in expected.iter().enumerate() {
+        // CM13: script-backed members never call loop_complete_node, so every
+        // member in the rotation is verdict-less. Each invocation walks all
+        // three members (each exhausting its infra retries) and the join
+        // fails — but the persisted rotation index must still advance by
+        // exactly one per invocation, proving load spreading is independent
+        // of member verdicts.
+        let expected = [0, 1, 2, 0];
+        for (i, want_start) in expected.iter().enumerate() {
             db.update_loop_spec_status(&spec_id, LoopSpecStatus::Pending, None, None)
                 .unwrap();
             db.update_loop_status(&loop_id, LoopStatus::Draft, None, None)
@@ -17419,19 +17588,24 @@ echo done
             let out = join.output.as_ref().unwrap();
             assert_eq!(out["kind"], "round_robin");
             assert_eq!(
-                out["member"]["node_id"], *want,
-                "invocation {i} must run member {want}"
+                join.status,
+                LoopRunStatus::Fail,
+                "CM13: all members are unreported infra, so every invocation fails"
+            );
+            assert_eq!(
+                out["members_tried"], 3,
+                "invocation {i} must walk all three verdict-less members"
             );
             let ens = db.get_ensemble("ens1").unwrap().unwrap();
             assert_eq!(
                 ens.round_robin_index,
-                Some(((i as i64) + 1) % 3),
-                "the persisted index advances after invocation {i}"
+                Some(((want_start + 1) % 3) as i64),
+                "the persisted index advances by one after invocation {i} (started at {want_start})"
             );
-            for other in ["rr-a", "rr-b", "rr-c"].iter().filter(|m| *m != want) {
+            for other in ["rr-a", "rr-b", "rr-c"] {
                 assert!(
-                    member_runs(&db, &spec_id, other).len() <= i,
-                    "invocation {i} must not also run {other}"
+                    !member_runs(&db, &spec_id, other).is_empty(),
+                    "CM13: invocation {i} walks every member, so {other} must have run"
                 );
             }
         }
@@ -17440,8 +17614,9 @@ echo done
 
     /// CM3: round-robin keeps its load-spreading start point but now survives a
     /// dead harness — when the first-in-rotation member produces no verdict (a
-    /// retry-exhausted `exit 1`), it falls through to the next member and that
-    /// member's pass becomes the ensemble's verdict. Both members ran.
+    /// retry-exhausted `exit 1`), it falls through to the next member.
+    /// CM13: the fallthrough member is itself script-backed and unreported,
+    /// so it too is verdict-less and the join fails after trying both.
     #[tokio::test]
     async fn round_robin_falls_through_to_next_member_when_first_has_no_verdict() {
         let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
@@ -17470,14 +17645,15 @@ echo done
         drop(_home);
 
         let join = join_run(&db, &spec_id, "join1");
+        // CM13: rr-ok never self-reports either, so both members are
+        // verdict-less and the join fails after the fallthrough.
         assert_eq!(
             join.status,
-            LoopRunStatus::Pass,
-            "fallthrough member passed -> round-robin passes"
+            LoopRunStatus::Fail,
+            "CM13: both members are unreported infra; join fails after fallthrough"
         );
         let out = join.output.as_ref().unwrap();
         assert_eq!(out["kind"], "round_robin");
-        assert_eq!(out["winner"]["node_id"], "rr-ok");
         assert_eq!(out["members_tried"], 2);
         assert_eq!(out["members_total"], 2);
 
@@ -17492,9 +17668,10 @@ echo done
         );
     }
 
-    /// CM3: a round-robin member that returns a real verdict — here `exit 0`
-    /// with empty stdout -> `no_output` Fail — is a usable result. The ensemble
-    /// fails on it and never falls through to a later member.
+    /// CM3: a round-robin member that returns a real verdict stops the walk.
+    /// CM13: an exit-0 bare script is NOT a real verdict (it never called
+    /// `loop_complete_node`), so the `no_output` member is verdict-less and
+    /// the walk falls through to the next member instead of stopping.
     #[tokio::test]
     async fn round_robin_stops_on_negative_verdict_without_trying_next_member() {
         let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
@@ -17523,18 +17700,19 @@ echo done
         drop(_home);
 
         let join = join_run(&db, &spec_id, "join1");
+        // CM13: rr-noout never filed a verdict, so it is verdict-less and the
+        // walk falls through to rr-ok — which is also unreported infra.
         assert_eq!(
             join.status,
             LoopRunStatus::Fail,
-            "the first member's negative verdict is the ensemble's verdict"
+            "CM13: both members are verdict-less; the ensemble fails after fallthrough"
         );
         let out = join.output.as_ref().unwrap();
         assert_eq!(out["kind"], "round_robin");
-        assert_eq!(out["winner"]["node_id"], "rr-noout");
-        assert_eq!(out["members_tried"], 1);
+        assert_eq!(out["members_tried"], 2);
         assert!(
-            member_runs(&db, &spec_id, "rr-ok").is_empty(),
-            "round-robin must not fall through after a usable verdict"
+            !member_runs(&db, &spec_id, "rr-ok").is_empty(),
+            "CM13: round-robin must fall through past a verdict-less member"
         );
     }
 
@@ -17608,9 +17786,11 @@ echo done
         drop(_home);
 
         let join = join_run(&db, &spec_id, "join1");
-        assert_eq!(join.status, LoopRunStatus::Pass);
+        // CM13: rr-ok never self-reports, so all three members are
+        // verdict-less and the join fails — but the walk still tried all
+        // three in order before giving up.
+        assert_eq!(join.status, LoopRunStatus::Fail);
         let out = join.output.as_ref().unwrap();
-        assert_eq!(out["winner"]["node_id"], "rr-ok");
         assert_eq!(
             out["members_tried"], 3,
             "the walk had to try all three members"
@@ -17665,13 +17845,12 @@ echo done
         drop(_home);
 
         let join = join_run(&db, &spec_id, "join1");
-        assert_eq!(join.status, LoopRunStatus::Pass);
+        // CM13: every member is script-backed and unreported, so the walk
+        // tries all three starting from the last and the join fails — but the
+        // wrap itself still happened (rr-ok at index 0 ran).
+        assert_eq!(join.status, LoopRunStatus::Fail);
         let out = join.output.as_ref().unwrap();
-        assert_eq!(
-            out["winner"]["node_id"], "rr-ok",
-            "no verdict at the last member wraps to index 0"
-        );
-        assert_eq!(out["members_tried"], 2);
+        assert_eq!(out["members_tried"], 3);
 
         assert!(
             !member_runs(&db, &spec_id, "rr-crash").is_empty(),
@@ -17682,8 +17861,8 @@ echo done
             "the walk wrapped to the first member"
         );
         assert!(
-            member_runs(&db, &spec_id, "rr-mid").is_empty(),
-            "index 1 is never reached this invocation"
+            !member_runs(&db, &spec_id, "rr-mid").is_empty(),
+            "CM13: every member is verdict-less, so the walk continues past index 0 to index 1"
         );
 
         let ens = db.get_ensemble("ens1").unwrap().unwrap();
@@ -17718,13 +17897,15 @@ echo done
         drop(_home);
 
         let join = join_run(&db, &spec_id, "join1");
-        assert_eq!(join.status, LoopRunStatus::Pass);
+        // CM13: script-backed members never self-report, so both are
+        // unreported infra and the join fails with 0 passed.
+        assert_eq!(join.status, LoopRunStatus::Fail);
         let out = join.output.as_ref().unwrap();
         assert_eq!(
             out["kind"], "quorum",
             "parallel keeps the quorum join shape"
         );
-        assert_eq!(out["passed"], 2);
+        assert_eq!(out["passed"], 0);
         assert!(!member_runs(&db, &spec_id, "p-a").is_empty());
         assert!(!member_runs(&db, &spec_id, "p-b").is_empty());
     }
@@ -17770,23 +17951,33 @@ echo done
         drop(_home);
 
         let join = join_run(&db, &spec_id, "join1");
+        // CM13: neither member self-reports, so both exhaust retries and fail.
         assert_eq!(
             join.status,
-            LoopRunStatus::Pass,
-            "flaky member passed on retry, healthy member passed -> 2/2 -> join passes"
+            LoopRunStatus::Fail,
+            "CM13: unreported runs are infra; both members exhaust retries"
         );
-        assert_eq!(join.output.as_ref().unwrap()["passed"], 2);
+        assert_eq!(join.output.as_ref().unwrap()["passed"], 0);
 
         let runs = member_runs(&db, &spec_id, "m-flap");
-        assert_eq!(runs.len(), 2, "one crash + one successful retry = two rows");
-        assert_eq!(runs[0].status, LoopRunStatus::Fail);
-        assert_eq!(
-            runs[0].output.as_ref().unwrap()["infra_crash"],
-            serde_json::Value::Bool(true),
-            "the crashed attempt carries the B19 infra_crash marker"
+        // CM13: initial + 2 retries = 3 runs, all infra (none self-report).
+        assert_eq!(runs.len(), 3, "CM13: initial + 2 retries = 3 run rows");
+        for run in &runs {
+            assert_eq!(run.status, LoopRunStatus::Fail);
+        }
+        assert!(
+            runs.iter()
+                .filter(|r| {
+                    r.output
+                        .as_ref()
+                        .and_then(|o| o.get("infra_crash"))
+                        .and_then(|v| v.as_bool())
+                        == Some(true)
+                })
+                .count()
+                >= 2,
+            "retried runs must carry infra_crash marker"
         );
-        assert_eq!(runs[0].output.as_ref().unwrap()["infra_attempt"], 0);
-        assert_eq!(runs[1].status, LoopRunStatus::Pass);
     }
 
     /// A member that keeps crashing exhausts its retry budget (default 2 → 3
@@ -17825,9 +18016,9 @@ echo done
         assert_eq!(
             join.status,
             LoopRunStatus::Fail,
-            "one member permanently down -> 1/2 -> join fails"
+            "CM13: both members are unreported infra -> 0/2 -> join fails"
         );
-        assert_eq!(join.output.as_ref().unwrap()["passed"], 1);
+        assert_eq!(join.output.as_ref().unwrap()["passed"], 0);
 
         // retry_limit default 2 -> attempts 0,1,2 -> three distinct run rows,
         // the first two carrying infra_crash markers.
@@ -17895,15 +18086,17 @@ echo done
         assert_eq!(
             join.status,
             LoopRunStatus::Fail,
-            "an empty-output member exiting 0 must not count toward the pass quorum -> 1/2 -> join fails"
+            "CM13: both members are unreported infra -> 0/2 -> join fails"
         );
-        assert_eq!(join.output.as_ref().unwrap()["passed"], 1);
+        assert_eq!(join.output.as_ref().unwrap()["passed"], 0);
 
         let runs = member_runs(&db, &spec_id, "m-no-output");
+        // CM13: the no-output member never filed a verdict, so it is infra
+        // and exhausts retries like any other unreported run.
         assert_eq!(
             runs.len(),
-            1,
-            "an exit-0 no-output member must resolve on the first attempt, never infra-retried"
+            3,
+            "CM13: unreported infra runs are retried; initial + 2 retries = 3 rows"
         );
         assert_eq!(runs[0].status, LoopRunStatus::Fail);
         assert_eq!(
@@ -17968,19 +18161,32 @@ echo done
         assert_eq!(join.output.as_ref().unwrap()["passed"], 0);
 
         let runs = member_runs(&db, &spec_id, "m-silent-1");
+        // CM13: unreported runs are infra, so require_report members get retried.
+        // retry_limit=2 (default) → initial + 2 retries = 3 runs.
         assert_eq!(
             runs.len(),
-            1,
-            "a require_report no-report member must resolve on the first attempt, never infra-retried"
+            3,
+            "CM13: unreported infra runs are retried; initial + 2 retries = 3 rows"
         );
-        assert_eq!(runs[0].status, LoopRunStatus::Fail);
-        assert_eq!(
-            runs[0].output.as_ref().unwrap()["unreported"],
-            serde_json::Value::Bool(true)
-        );
-        assert_eq!(
-            runs[0].output.as_ref().unwrap()["failure_kind"],
-            serde_json::Value::String("no_report".to_string())
+        for run in &runs {
+            assert_eq!(run.status, LoopRunStatus::Fail);
+            assert_eq!(
+                run.output.as_ref().unwrap()["unreported"],
+                serde_json::Value::Bool(true)
+            );
+        }
+        assert!(
+            runs.iter()
+                .filter(|r| {
+                    r.output
+                        .as_ref()
+                        .and_then(|o| o.get("infra_crash"))
+                        .and_then(|v| v.as_bool())
+                        == Some(true)
+                })
+                .count()
+                >= 2,
+            "retried runs must carry infra_crash marker"
         );
     }
 
@@ -18130,7 +18336,9 @@ echo done
         drop(_home);
 
         let lp = db.get_loop(&lp.id).unwrap().unwrap();
-        assert_eq!(lp.status, LoopStatus::Completed);
+        // CM13: script-backed members never self-report, so the ensemble
+        // join fails and the spec fails with it.
+        assert_eq!(lp.status, LoopStatus::Failed);
         assert_eq!(
             db.queue_next_pending_spec_id("queue-1").unwrap(),
             None,
@@ -18707,36 +18915,51 @@ echo done
         result.unwrap();
 
         let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        // CM13: the second run (exit 0, stdout "ok") never self-reported,
+        // so it is also infra. Retries exhaust and the spec fails.
         assert_eq!(
             spec.status,
-            LoopSpecStatus::Completed,
-            "spec should complete after the in-place retry succeeds"
+            LoopSpecStatus::Failed,
+            "CM13: all runs are unreported infra; retries exhaust and spec fails"
         );
 
         let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
         let flaky_runs: Vec<_> = runs.iter().filter(|r| r.node_id == "node-flaky").collect();
         assert_eq!(
             flaky_runs.len(),
-            2,
-            "crash + successful retry should leave two run rows"
+            3,
+            "CM13: initial + 2 retries = 3 run rows (all unreported infra)"
         );
 
-        let crash_run = flaky_runs
-            .iter()
-            .find(|r| r.status == LoopRunStatus::Fail)
-            .expect("one run should be the classified crash");
-        let crash_output = crash_run.output.as_ref().unwrap();
-        assert_eq!(
-            crash_output.get("infra_crash").and_then(|v| v.as_bool()),
-            Some(true)
-        );
-        assert_eq!(
-            crash_output.get("infra_attempt").and_then(|v| v.as_u64()),
-            Some(0)
+        // Every run is infra — none pass because none self-report.
+        // The first 2 carry infra_crash (retried by begin_infra_retry).
+        // The last one settled after retry exhaustion — carries unreported.
+        for run in &flaky_runs {
+            assert_eq!(run.status, LoopRunStatus::Fail);
+        }
+        assert!(
+            flaky_runs
+                .iter()
+                .filter(|r| {
+                    r.output
+                        .as_ref()
+                        .and_then(|o| o.get("infra_crash"))
+                        .and_then(|v| v.as_bool())
+                        == Some(true)
+                })
+                .count()
+                >= 2,
+            "retried runs must carry infra_crash marker"
         );
         assert!(
-            flaky_runs.iter().any(|r| r.status == LoopRunStatus::Pass),
-            "the retry should pass"
+            flaky_runs.iter().any(|r| {
+                r.output
+                    .as_ref()
+                    .and_then(|o| o.get("unreported"))
+                    .and_then(|v| v.as_bool())
+                    == Some(true)
+            }),
+            "at least one run must carry unreported marker"
         );
     }
 
@@ -18872,22 +19095,22 @@ echo done
 
         assert_eq!(
             flaky_runs.len(),
-            2,
-            "crash + successful retry should leave two run rows"
+            3,
+            "CM13: initial + 2 retries = 3 run rows (all unreported infra)"
         );
-        assert!(
-            flaky_runs.iter().any(|r| r.status == LoopRunStatus::Pass),
-            "the retry should pass"
-        );
+        // CM13: all runs are infra, none pass (none self-report).
+        for run in &flaky_runs {
+            assert_eq!(run.status, LoopRunStatus::Fail);
+        }
         assert_eq!(
             after_runs.len(),
-            1,
-            "recovered node must follow its Pass edge to `after`"
+            0,
+            "CM13: pass edge must NOT fire when all runs are unreported infra"
         );
         assert_eq!(
             infra_runs.len(),
-            0,
-            "Break edge must NOT fire when the node recovered on retry"
+            1,
+            "CM13: break edge fires when retries exhaust (all runs unreported)"
         );
     }
 
@@ -21155,6 +21378,11 @@ COUNTER=$((COUNTER + 1))
 echo $COUNTER > "$COUNTER_FILE"
 cat > "${CAPTURE_DIR}/prompt_${COUNTER}"
 echo "NODE_OUTPUT_DATA_${COUNTER}"
+# CM13 test support: linger so the test-side verdict filer can file a Pass
+# verdict on this run's row before the process exits (see VerdictFiler).
+if [ -n "$LINGER_SECONDS" ]; then
+  sleep "$LINGER_SECONDS"
+fi
 exit 0
 "#,
         )
@@ -21265,12 +21493,35 @@ exit 0
 
         let _home = HomeGuard::set(fake_home.path());
         std::env::set_var("CAPTURE_DIR", capture_dir.to_str().unwrap());
+        std::env::set_var("LINGER_SECONDS", "1");
+
+        // CM13: the capture script never calls loop_complete_node, so file
+        // Pass verdicts carrying each node's canned stdout (see VerdictFiler)
+        // — the “happy path” the multi-hop retention below is about.
+        let _filer = VerdictFiler::spawn(
+            &db,
+            vec![
+                (
+                    "node-architect".to_string(),
+                    Some("NODE_OUTPUT_DATA_1".to_string()),
+                ),
+                (
+                    "node-tester".to_string(),
+                    Some("NODE_OUTPUT_DATA_2".to_string()),
+                ),
+                (
+                    "node-implementer".to_string(),
+                    Some("NODE_OUTPUT_DATA_3".to_string()),
+                ),
+            ],
+        );
 
         let result = engine
             .run_loop(loop_id.clone(), None, None, None, None)
             .await;
         drop(_home);
         std::env::remove_var("CAPTURE_DIR");
+        std::env::remove_var("LINGER_SECONDS");
 
         result.unwrap();
 
@@ -21307,6 +21558,9 @@ exit 0
             argv_file.to_string_lossy().into_owned(),
         );
         env.insert("RESUME_FLAG".to_string(), "--resume".to_string());
+        // CM13: linger so the VerdictFiler below can file the Pass verdict
+        // before the process exits.
+        env.insert("LINGER_SECONDS".to_string(), "1".to_string());
         let cli = argv_cli_config(&script, env, None, None, None);
         let home = write_resume_cli_home(cli);
 
@@ -21346,6 +21600,10 @@ exit 0
         .unwrap();
 
         let guard = HomeGuard::set(home.path());
+        // CM13: the echo script never calls loop_complete_node, so the filer
+        // files the Pass verdict instead (see VerdictFiler). The filer is
+        // dropped (joined) before returning.
+        let _filer = VerdictFiler::spawn(&db, vec![("node-impl".to_string(), None)]);
         engine
             .run_loop(
                 loop_id.clone(),
@@ -22132,5 +22390,595 @@ exit 0
             .await;
         eprintln!("run_loop result: {:?}", result);
         assert!(result.is_ok(), "source loop should complete: {result:?}");
+    }
+
+    // ── CM13: classify infrastructure by verdict, not heuristics ────────
+
+    /// CM13 measurement 1: a run that exits non-zero after 90 seconds
+    /// without reporting is classified as infrastructure and takes the
+    /// `break` edge — the case that failed at 75 seconds with a rate limit.
+    #[test]
+    fn cm13_slow_unreported_run_is_infra_crash() {
+        let node = sample_agent_node();
+        let execution = NodeExecution {
+            status: LoopRunStatus::Fail,
+            output: serde_json::json!({
+                "kind": "agent",
+                "exit_code": 1,
+                "stderr": "Error from provider (Console): Rate limit exceeded",
+                "unreported": true,
+            }),
+            summary: "agent exited with code 1".to_string(),
+        };
+        let run = LoopNodeRun {
+            id: "run-slow".to_string(),
+            loop_id: "loop1".to_string(),
+            spec_id: "spec1".to_string(),
+            node_id: node.id.clone(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            // Started 90 seconds ago — well past the old 60-second window.
+            started_at: chrono::Utc::now() - chrono::Duration::seconds(90),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        };
+        assert!(
+            is_infra_crash(&node, &execution, &run, 0, 3, 60),
+            "CM13: a slow unreported run must be infra regardless of duration"
+        );
+    }
+
+    /// CM13 measurement 2: a run that exits 0 with empty stdout and no
+    /// report is classified as infrastructure — the case that failed with
+    /// `no_output: true` after 15 minutes of backend timeout.
+    #[test]
+    fn cm13_silent_unreported_run_is_infra_crash() {
+        let node = sample_agent_node();
+        let execution = NodeExecution {
+            status: LoopRunStatus::Fail,
+            output: serde_json::json!({
+                "kind": "agent",
+                "exit_code": 0,
+                "no_output": true,
+                "unreported": true,
+            }),
+            summary: "agent produced no output (exit code 0).".to_string(),
+        };
+        let run = LoopNodeRun {
+            id: "run-silent".to_string(),
+            loop_id: "loop1".to_string(),
+            spec_id: "spec1".to_string(),
+            node_id: node.id.clone(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            // Started 15 minutes ago — the exact backend timeout case.
+            started_at: chrono::Utc::now() - chrono::Duration::minutes(15),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        };
+        assert!(
+            is_infra_crash(&node, &execution, &run, 0, 3, 60),
+            "CM13: a silent unreported run must be infra regardless of no_output"
+        );
+    }
+
+    /// CM13 measurement 3: a run that exits 0 without reporting is not
+    /// recorded as pass — the case that failed with a designer exiting 0 at
+    /// 100 seconds having written nothing.
+    #[test]
+    fn cm13_exit_zero_unreported_is_not_pass() {
+        let cli = Cli::new("test-cli");
+        let node = sample_agent_node();
+        let execution = agent_finished_execution(&node, &cli, None, 0, "some output", "", false);
+
+        assert_eq!(
+            execution.status,
+            LoopRunStatus::Fail,
+            "CM13: an exit-0 unreported run must never be recorded as pass"
+        );
+        assert_eq!(
+            execution.output.get("failure_kind").and_then(Value::as_str),
+            Some("unreported"),
+            "CM13: the outcome must say 'unreported'"
+        );
+    }
+
+    /// CM13: an ensemble member that exits without reporting causes
+    /// round-robin to try the next member, and the ensemble passes when
+    /// that one succeeds. Verified via `is_infra_crash_shape` which is
+    /// the sole source of `member_had_no_verdict`.
+    #[test]
+    fn cm13_ensemble_fallthrough_on_unreported_member() {
+        let node_a = sample_agent_node();
+        let node_b = {
+            let mut n = sample_agent_node();
+            n.id = "cm13-member-b".to_string();
+            n
+        };
+
+        // Member A: unreported (still Running), exit 0, no output.
+        let exec_a = NodeExecution {
+            status: LoopRunStatus::Fail,
+            output: serde_json::json!({
+                "kind": "agent",
+                "exit_code": 0,
+                "no_output": true,
+                "unreported": true,
+            }),
+            summary: "agent exited with code 0".to_string(),
+        };
+        let run_a = LoopNodeRun {
+            id: "run-member-a".to_string(),
+            loop_id: "loop1".to_string(),
+            spec_id: "spec1".to_string(),
+            node_id: node_a.id.clone(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        };
+
+        // member_had_no_verdict must be true for the unreported member.
+        let no_verdict_a = is_infra_crash_shape(&node_a, &exec_a, &run_a, 60);
+        assert!(
+            no_verdict_a,
+            "CM13: an unreported ensemble member must be 'no verdict'"
+        );
+
+        // Member B: self-reported pass.
+        let exec_b = NodeExecution {
+            status: LoopRunStatus::Pass,
+            output: serde_json::json!({
+                "kind": "agent",
+                "exit_code": 0,
+            }),
+            summary: "agent reported pass".to_string(),
+        };
+        let run_b = LoopNodeRun {
+            id: "run-member-b".to_string(),
+            loop_id: "loop1".to_string(),
+            spec_id: "spec1".to_string(),
+            node_id: node_b.id.clone(),
+            status: LoopRunStatus::Pass,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        };
+
+        let no_verdict_b = is_infra_crash_shape(&node_b, &exec_b, &run_b, 60);
+        assert!(
+            !no_verdict_b,
+            "CM13: a self-reported member must NOT be 'no verdict'"
+        );
+    }
+
+    /// CM13: a run that called `loop_complete_node` with a `fail` status
+    /// still routes on `fail`, never on `break`, and never causes a
+    /// fallthrough.
+    #[tokio::test]
+    async fn cm13_self_reported_fail_routes_on_fail_not_break() {
+        let (_dir, db, _engine, loop_id) = bare_loop_fixture().unwrap();
+        let node = seed_agent_run(&db, &loop_id, "run-selfreport-fail");
+        db.update_loop_run_result(
+            "run-selfreport-fail",
+            LoopRunStatus::Fail,
+            Some(&serde_json::json!({ "summary": "agent reported it failed" })),
+            Some(chrono::Utc::now()),
+        )
+        .unwrap();
+
+        let run = db.get_loop_run("run-selfreport-fail").unwrap();
+        let reported = self_reported_execution(run.as_ref(), &node)
+            .expect("a completed run row must be read as self-reported");
+        assert_eq!(reported.status, LoopRunStatus::Fail);
+
+        assert!(
+            !is_infra_crash(&node, &reported, &run.unwrap(), 0, 3, 60),
+            "CM13: a self-reported fail must never be infra crash"
+        );
+    }
+
+    /// CM13: a run that declared a blocker still blocks.
+    #[test]
+    fn cm13_blocker_still_blocks() {
+        let cli = Cli::new("test-cli");
+        let node = sample_agent_node();
+        // A self-reported blocker: the run called loop_report_blocker,
+        // so self_reported = true.
+        let execution = agent_finished_execution(&node, &cli, None, 0, "", "", true);
+
+        assert_eq!(
+            execution.status,
+            LoopRunStatus::Fail,
+            "a blocker must be recorded as fail"
+        );
+        assert!(
+            !is_infra_crash_shape(
+                &node,
+                &execution,
+                &LoopNodeRun {
+                    id: "run-blocker".to_string(),
+                    loop_id: "loop1".to_string(),
+                    spec_id: "spec1".to_string(),
+                    node_id: node.id.clone(),
+                    status: LoopRunStatus::Fail, // self_reported
+                    input: None,
+                    output: None,
+                    started_at: chrono::Utc::now(),
+                    completed_at: None,
+                    iteration: 1,
+                    pid: None,
+                    boot_id: None,
+                    session_id: None,
+                },
+                60
+            ),
+            "CM13: a self-reported blocker must not be infra crash"
+        );
+    }
+
+    /// CM13: the recorded outcome distinguishes "never reported" from
+    /// "failed" and from "process crashed".
+    #[test]
+    fn cm13_recorded_outcome_distinguishes_cases() {
+        let cli = Cli::new("test-cli");
+        let node = sample_agent_node();
+
+        // Case 1: unreported → failure_kind: "unreported"
+        let unreported = agent_finished_execution(&node, &cli, None, 0, "output", "", false);
+        assert_eq!(unreported.status, LoopRunStatus::Fail);
+        assert_eq!(
+            unreported
+                .output
+                .get("failure_kind")
+                .and_then(Value::as_str),
+            Some("unreported"),
+            "unreported must carry failure_kind: unreported"
+        );
+
+        // Case 2: self-reported fail → no failure_kind from CM13
+        let self_reported = agent_finished_execution(&node, &cli, None, 1, "", "", true);
+        assert_eq!(self_reported.status, LoopRunStatus::Fail);
+        assert!(
+            self_reported.output.get("failure_kind").is_none(),
+            "self-reported fail must not carry failure_kind"
+        );
+
+        // Case 3: infra crash marker → infra_crash: true
+        let infra = NodeExecution {
+            status: LoopRunStatus::Fail,
+            output: serde_json::json!({
+                "infra_crash": true,
+                "infra_attempt": 0,
+            }),
+            summary: "crashed".to_string(),
+        };
+        assert!(execution_is_infra_failure(&infra.output));
+    }
+
+    // ── §C: missing behavioural tests (spec GUIDELINES) ───────────────
+
+    /// C1: a run that exits 0 without reporting takes the `break` edge and
+    /// is never recorded as pass — the exact case of measurement (2) and (3)
+    /// (designer exits 0 at 100 seconds having written nothing).
+    #[tokio::test]
+    async fn cm13_unreported_exit_zero_routes_to_break_edge_and_is_not_pass() {
+        let fake_home = setup_test_cli_home();
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-implement".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "implement".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({
+                "platform": "test-cli",
+                "prompt_template": "exit 0",
+                "infra_retry_limit": 1,
+                "infra_crash_max_seconds": 60,
+                "infra_backoff_seconds": 0,
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        db.insert_loop_node(&LoopNode {
+            id: "node-resilience".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "resilience".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf RESILIENCE",
+                "success_condition": "exit_code_0"
+            }),
+            position: 2,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        // Break edge to resilience node (should be taken on infra crash).
+        db.insert_loop_edge(&LoopEdge {
+            id: "edge-break".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "node-implement".to_string(),
+            to_node: "node-resilience".to_string(),
+            condition: LoopEdgeCondition::Break,
+        })
+        .unwrap();
+
+        let _home = HomeGuard::set(fake_home.path());
+        let result = engine
+            .run_loop(loop_id.clone(), None, None, None, None)
+            .await;
+        drop(_home);
+        result.unwrap();
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+
+        let implement_runs: Vec<_> = runs
+            .iter()
+            .filter(|r| r.node_id == "node-implement")
+            .collect();
+        let resilience_runs: Vec<_> = runs
+            .iter()
+            .filter(|r| r.node_id == "node-resilience")
+            .collect();
+
+        // Break edge was taken even though the run exited 0.
+        assert_eq!(
+            resilience_runs.len(),
+            1,
+            "resilience node should run (Break edge taken)"
+        );
+        // Every implement run must be Fail, never Pass.
+        assert!(
+            implement_runs
+                .iter()
+                .all(|r| r.status == LoopRunStatus::Fail),
+            "all implement runs must be Fail, never Pass"
+        );
+        // The settled run carries failure_kind: unreported.
+        let settled = implement_runs.last().unwrap();
+        assert_eq!(
+            settled
+                .output
+                .as_ref()
+                .and_then(|o| o.get("failure_kind"))
+                .and_then(Value::as_str),
+            Some("unreported"),
+            "settled run must carry failure_kind: unreported"
+        );
+    }
+
+    /// C2: an ensemble member that exits without reporting causes
+    /// round-robin to try the next member, and the ensemble passes when
+    /// that one succeeds.
+    #[tokio::test]
+    async fn cm13_round_robin_falls_through_unreported_member_then_passes_on_next() {
+        let (dir, db, engine, _loop_id, spec_id) = loop_fixture().unwrap();
+
+        let silent_path = write_member_script(dir.path(), "silent.sh", "exit 0");
+        let ok_path = write_member_script(dir.path(), "ok.sh", "sleep 1");
+
+        let fake_home = setup_multi_cli_home(&[
+            ("rr-silent", silent_path.as_str()),
+            ("rr-ok", ok_path.as_str()),
+        ]);
+        insert_kind_ensemble(
+            &db,
+            &spec_id,
+            crate::domain::loops::EnsembleKind::RoundRobin,
+            &[("rr-silent", "rr-silent"), ("rr-ok", "rr-ok")],
+        );
+
+        let _filer = VerdictFiler::spawn(&db, vec![("rr-ok".to_string(), None)]);
+
+        let _home = HomeGuard::set(fake_home.path());
+        let result = engine
+            .run_loop(_loop_id.clone(), None, None, None, None)
+            .await;
+        drop(_home);
+        drop(_filer);
+
+        result.unwrap();
+
+        let join = join_run(&db, &spec_id, "join1");
+        assert_eq!(
+            join.status,
+            LoopRunStatus::Pass,
+            "ensemble must pass when the second member succeeds"
+        );
+        let out = join.output.as_ref().unwrap();
+        assert_eq!(out["kind"], "round_robin");
+        assert!(
+            out["members_tried"].as_u64().unwrap() >= 2,
+            "must have tried at least 2 members"
+        );
+        // rr-silent ran its infra retries (initial + 1 since infra_retry_limit=1 from insert_kind_ensemble → 2 runs),
+        // then rr-ok ran and passed.
+        assert!(
+            !member_runs(&db, &spec_id, "rr-silent").is_empty(),
+            "rr-silent must have run"
+        );
+        let ok_runs = member_runs(&db, &spec_id, "rr-ok");
+        assert!(
+            ok_runs.iter().any(|r| r.status == LoopRunStatus::Pass),
+            "rr-ok must have a Pass run"
+        );
+        // The passing join must route onward on its Pass edge (to the
+        // `done-pass` node `insert_kind_ensemble` wires as on_pass_to) — a
+        // fallthrough that reaches a healthy member is only useful if the
+        // ensemble then advances like any other pass.
+        assert!(
+            member_runs(&db, &spec_id, "done-pass")
+                .iter()
+                .any(|r| r.status == LoopRunStatus::Pass),
+            "a passing ensemble join must route on its Pass edge to on_pass_to"
+        );
+    }
+
+    /// C3: a self-reported fail stops the walk — no fallthrough to the next
+    /// member. A reported fail is not infra and not retried.
+    #[tokio::test]
+    async fn cm13_round_robin_self_reported_fail_stops_walk_no_fallthrough() {
+        let (dir, db, engine, _loop_id, spec_id) = loop_fixture().unwrap();
+
+        let saysno_path = write_member_script(dir.path(), "saysno.sh", "sleep 1");
+        let second_path = write_member_script(dir.path(), "second.sh", "printf ok");
+
+        let fake_home = setup_multi_cli_home(&[
+            ("rr-saysno", saysno_path.as_str()),
+            ("rr-second", second_path.as_str()),
+        ]);
+        insert_kind_ensemble(
+            &db,
+            &spec_id,
+            crate::domain::loops::EnsembleKind::RoundRobin,
+            &[("rr-saysno", "rr-saysno"), ("rr-second", "rr-second")],
+        );
+
+        let _filer = VerdictFiler::spawn_with_status(
+            &db,
+            vec![("rr-saysno".into(), None)],
+            LoopRunStatus::Fail,
+        );
+
+        let _home = HomeGuard::set(fake_home.path());
+        let _result = engine
+            .run_loop(_loop_id.clone(), None, None, None, None)
+            .await;
+        drop(_home);
+        drop(_filer);
+
+        let join = join_run(&db, &spec_id, "join1");
+        assert_eq!(
+            join.status,
+            LoopRunStatus::Fail,
+            "ensemble must fail on the self-reported fail"
+        );
+        let out = join.output.as_ref().unwrap();
+        assert_eq!(
+            out["members_tried"].as_u64().unwrap(),
+            1,
+            "walk must stop at the first member (reported fail)"
+        );
+        assert!(
+            member_runs(&db, &spec_id, "rr-second").is_empty(),
+            "second member must never run (no fallthrough)"
+        );
+        assert_eq!(
+            member_runs(&db, &spec_id, "rr-saysno").len(),
+            1,
+            "reported fail must not be retried as infra"
+        );
+    }
+
+    /// C3 (cascade): the same contract as
+    /// [`cm13_round_robin_self_reported_fail_stops_walk_no_fallthrough`] but
+    /// for a cascade ensemble — a member that self-reports a `fail` is a
+    /// usable verdict, so the cascade stops on it and never falls through to
+    /// the next member. Requirement 5 names cascade and round-robin together;
+    /// this pins the cascade half.
+    #[tokio::test]
+    async fn cm13_cascade_self_reported_fail_stops_walk_no_fallthrough() {
+        let (dir, db, engine, _loop_id, spec_id) = loop_fixture().unwrap();
+
+        let saysno_path = write_member_script(dir.path(), "saysno.sh", "sleep 1");
+        let second_path = write_member_script(dir.path(), "second.sh", "printf ok");
+
+        let fake_home = setup_multi_cli_home(&[
+            ("c-saysno", saysno_path.as_str()),
+            ("c-second", second_path.as_str()),
+        ]);
+        insert_kind_ensemble(
+            &db,
+            &spec_id,
+            crate::domain::loops::EnsembleKind::Cascade,
+            &[("c-saysno", "c-saysno"), ("c-second", "c-second")],
+        );
+
+        let _filer = VerdictFiler::spawn_with_status(
+            &db,
+            vec![("c-saysno".into(), None)],
+            LoopRunStatus::Fail,
+        );
+
+        let _home = HomeGuard::set(fake_home.path());
+        let _result = engine
+            .run_loop(_loop_id.clone(), None, None, None, None)
+            .await;
+        drop(_home);
+        drop(_filer);
+
+        let join = join_run(&db, &spec_id, "join1");
+        assert_eq!(
+            join.status,
+            LoopRunStatus::Fail,
+            "cascade must fail on the self-reported fail"
+        );
+        let out = join.output.as_ref().unwrap();
+        assert_eq!(out["kind"], "cascade");
+        assert_eq!(
+            out["members_tried"].as_u64().unwrap(),
+            1,
+            "cascade must stop at the first member (reported fail)"
+        );
+        assert!(
+            member_runs(&db, &spec_id, "c-second").is_empty(),
+            "the next member must never run (no fallthrough)"
+        );
+        assert_eq!(
+            member_runs(&db, &spec_id, "c-saysno").len(),
+            1,
+            "a reported fail must not be retried as infra"
+        );
+    }
+
+    /// C4: `run_self_reported` is the single source of truth for
+    /// "did this run file a verdict?" — pins the shared helper in place.
+    #[test]
+    fn run_self_reported_is_the_only_report_check() {
+        let mut run = LoopNodeRun {
+            id: "run-test".to_string(),
+            loop_id: "loop1".to_string(),
+            spec_id: "spec1".to_string(),
+            node_id: "node1".to_string(),
+            status: LoopRunStatus::Running,
+            input: None,
+            output: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            iteration: 1,
+            pid: None,
+            boot_id: None,
+            session_id: None,
+        };
+        assert!(!run_self_reported(&run));
+        run.status = LoopRunStatus::Pass;
+        assert!(run_self_reported(&run));
+        run.status = LoopRunStatus::Fail;
+        assert!(run_self_reported(&run));
     }
 }
