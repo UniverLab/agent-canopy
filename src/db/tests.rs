@@ -6352,6 +6352,10 @@ mod hooks_tests {
             command: None,
             target_session_id: None,
             timeout_minutes: Some(5),
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         }
     }
 

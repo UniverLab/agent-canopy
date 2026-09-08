@@ -452,6 +452,18 @@ pub struct LoopCompletionHookParams {
     /// Timeout in minutes for the hook's process (default: 30, same default
     /// as an agent node).
     pub timeout_minutes: Option<u64>,
+    /// Target loop id to launch (loop hooks only). Mutually exclusive with
+    /// platform/command/target_session_id. When set, this hook launches
+    /// another loop in-process instead of spawning a CLI process.
+    pub target_loop_id: Option<String>,
+    /// Optional queue id for the launched loop (loop hooks only).
+    pub queue_id: Option<String>,
+    /// Optional workdir override for the launched loop (loop hooks only).
+    pub workdir_override: Option<String>,
+    /// Optional idea text for the launched loop (loop hooks only). Mutually
+    /// exclusive with queue_id. Supports the same `{{...}}` placeholders as
+    /// the hook's event.
+    pub idea: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

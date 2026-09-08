@@ -1836,6 +1836,73 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Mark a loop as having been launched by a hook (CH4). This is a
+    /// transient flag that lives only for the duration of the run — it is
+    /// cleared when the run completes (via [`Self::clear_loop_hook_launched`]).
+    pub fn mark_loop_as_hook_launched(&self, loop_id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE loops SET hook_launched = 1 WHERE id = ?1",
+            params![loop_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Clear the hook-launched flag for a loop. Called when the run completes.
+    pub fn clear_loop_hook_launched(&self, loop_id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let rows = conn.execute(
+            "UPDATE loops SET hook_launched = 0 WHERE id = ?1",
+            params![loop_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Whether the loop was launched by a hook (depth = 1).
+    pub fn is_loop_hook_launched(&self, loop_id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare("SELECT hook_launched FROM loops WHERE id = ?1")?;
+        let result: Option<bool> = stmt
+            .query_row(params![loop_id], |row| row.get(0))
+            .ok()
+            .map(|v: i64| v != 0);
+        Ok(result.unwrap_or(false))
+    }
+
+    /// Record provenance: which loop and event launched this loop (CH4).
+    /// Stored in `loop_hook_launches` for traceability.
+    pub fn record_hook_launch_provenance(
+        &self,
+        target_loop_id: &str,
+        source_loop_id: &str,
+        event: &str,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        conn.execute(
+            "INSERT INTO loop_hook_launches (target_loop_id, source_loop_id, event, launched_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                target_loop_id,
+                source_loop_id,
+                event,
+                chrono::Utc::now().timestamp(),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Node runs still `running` for a loop.
     pub fn list_running_loop_runs(&self, loop_id: &str) -> Result<Vec<LoopNodeRun>> {
         let conn = self

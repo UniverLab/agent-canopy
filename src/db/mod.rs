@@ -1478,6 +1478,36 @@ impl Database {
             }
         }
 
+        // CH4: hook-launched depth tracking and provenance.
+        // `hook_launched` on `loops`: whether this loop was launched by a hook
+        // (depth cap enforcement). Defaults to 0 so existing loops are unaffected.
+        let has_hook_launched: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('loops') WHERE name = 'hook_launched'",
+                [],
+                |row| Ok(row.get::<_, i32>(0)? > 0),
+            )
+            .unwrap_or(false);
+        if !has_hook_launched {
+            conn.execute(
+                "ALTER TABLE loops ADD COLUMN hook_launched INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
+        // Provenance for hook-launched loops: which source loop and event
+        // triggered this launch. Append-only, for traceability.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS loop_hook_launches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                target_loop_id TEXT NOT NULL REFERENCES loops(id) ON DELETE CASCADE,
+                source_loop_id TEXT NOT NULL REFERENCES loops(id) ON DELETE CASCADE,
+                event TEXT NOT NULL,
+                launched_at INTEGER NOT NULL
+            );",
+        )
+        .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+
         Self::set_schema_version(&conn)?;
 
         Ok(())

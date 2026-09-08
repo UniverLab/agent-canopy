@@ -1042,6 +1042,10 @@ mod tests {
             command: None,
             target_session_id: None,
             timeout_minutes: None,
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         let details = LoopDetails {
             lp: sample_loop(Some(hook)),
@@ -1072,6 +1076,10 @@ mod tests {
                 command: None,
                 target_session_id: None,
                 timeout_minutes: None,
+                target_loop_id: None,
+                queue_id: None,
+                workdir_override: None,
+                idea: None,
             }],
         );
         hooks.insert(
@@ -1084,6 +1092,10 @@ mod tests {
                 command: None,
                 target_session_id: None,
                 timeout_minutes: None,
+                target_loop_id: None,
+                queue_id: None,
+                workdir_override: None,
+                idea: None,
             }],
         );
         hooks.insert(
@@ -1096,6 +1108,10 @@ mod tests {
                 command: None,
                 target_session_id: None,
                 timeout_minutes: None,
+                target_loop_id: None,
+                queue_id: None,
+                workdir_override: None,
+                idea: None,
             }],
         );
         let mut lp = sample_loop(None);

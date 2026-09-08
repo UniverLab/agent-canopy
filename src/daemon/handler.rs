@@ -205,9 +205,10 @@ pub(crate) fn build_loop_trigger(
 }
 
 /// Build a validated [`crate::domain::loops::LoopCompletionHook`] from MCP
-/// params — an agent payload (platform + prompt), a command, or an
-/// interactive message (prompt + target_session_id). Exactly one mode must
-/// be configured; any other combination is rejected.
+/// params — an agent payload (platform + prompt), a command, an
+/// interactive message (prompt + target_session_id), or a loop launch
+/// (target_loop_id). Exactly one mode must be configured; any other
+/// combination is rejected.
 fn build_loop_completion_hook(
     params: &LoopCompletionHookParams,
 ) -> Result<crate::domain::loops::LoopCompletionHook, String> {
@@ -235,6 +236,54 @@ fn build_loop_completion_hook(
         .prompt
         .as_deref()
         .is_some_and(|s| !s.trim().is_empty());
+    let has_target_loop = params
+        .target_loop_id
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty());
+
+    if has_target_loop {
+        if has_platform || has_command || has_target || has_model || has_effort {
+            return Err(
+                "Loop hook ('target_loop_id') must not set 'platform', 'command', \
+                 'target_session_id', 'model', or 'effort'. Configure exactly one hook mode."
+                    .to_string(),
+            );
+        }
+        let queue_id = params
+            .queue_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let idea = params
+            .idea
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if queue_id.is_some() && idea.is_some() {
+            return Err("Loop hook: 'queue_id' and 'idea' are mutually exclusive.".to_string());
+        }
+        let target_loop_id = params.target_loop_id.as_deref().unwrap().trim().to_string();
+        return Ok(crate::domain::loops::LoopCompletionHook {
+            platform: None,
+            model: None,
+            effort: None,
+            prompt: None,
+            command: None,
+            target_session_id: None,
+            timeout_minutes: None,
+            target_loop_id: Some(target_loop_id),
+            queue_id,
+            workdir_override: params
+                .workdir_override
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            idea,
+        });
+    }
 
     if has_target {
         if has_platform || has_command || has_model || has_effort {
@@ -262,6 +311,10 @@ fn build_loop_completion_hook(
             command: None,
             target_session_id: Some(target_session_id),
             timeout_minutes: params.timeout_minutes,
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         });
     }
 
@@ -272,8 +325,9 @@ fn build_loop_completion_hook(
     }
     if !has_platform && !has_command {
         return Err("Hook must have either a 'command', an agent payload \
-             ('platform' + 'prompt'), or an interactive payload \
-             ('target_session_id' + 'prompt'). Configure exactly one."
+             ('platform' + 'prompt'), an interactive payload \
+             ('target_session_id' + 'prompt'), or a loop payload \
+             ('target_loop_id'). Configure exactly one."
             .to_string());
     }
 
@@ -307,6 +361,10 @@ fn build_loop_completion_hook(
             command: None,
             target_session_id: None,
             timeout_minutes: params.timeout_minutes,
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         });
     }
 
@@ -320,6 +378,10 @@ fn build_loop_completion_hook(
         command: Some(command),
         target_session_id: None,
         timeout_minutes: params.timeout_minutes,
+        target_loop_id: None,
+        queue_id: None,
+        workdir_override: None,
+        idea: None,
     })
 }
 
@@ -8977,6 +9039,10 @@ fn loop_completion_hook_json(hook: &crate::domain::loops::LoopCompletionHook) ->
         "command": hook.command,
         "target_session_id": hook.target_session_id,
         "timeout_minutes": hook.timeout_minutes,
+        "target_loop_id": hook.target_loop_id,
+        "queue_id": hook.queue_id,
+        "workdir_override": hook.workdir_override,
+        "idea": hook.idea,
     })
 }
 
@@ -12552,6 +12618,10 @@ mod tests {
             command: None,
             target_session_id: None,
             timeout_minutes: None,
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         let err = build_loop_completion_hook(&params).unwrap_err();
         assert!(err.contains("must have either"), "{err}");
@@ -12567,6 +12637,10 @@ mod tests {
             command: None,
             target_session_id: None,
             timeout_minutes: None,
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         let err = build_loop_completion_hook(&params).unwrap_err();
         assert!(err.contains("must have either"), "{err}");
@@ -12582,6 +12656,10 @@ mod tests {
             command: None,
             target_session_id: None,
             timeout_minutes: None,
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         let err = build_loop_completion_hook(&params).unwrap_err();
         assert!(err.contains("prompt"), "{err}");
@@ -12597,6 +12675,10 @@ mod tests {
             command: None,
             target_session_id: None,
             timeout_minutes: None,
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         let err = build_loop_completion_hook(&params).unwrap_err();
         assert!(err.contains("prompt"), "{err}");
@@ -12612,6 +12694,10 @@ mod tests {
             command: None,
             target_session_id: None,
             timeout_minutes: Some(10),
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         let hook = build_loop_completion_hook(&params).unwrap();
         assert_eq!(hook.platform.as_deref(), Some("claude"));
@@ -12630,6 +12716,10 @@ mod tests {
             command: None,
             target_session_id: None,
             timeout_minutes: None,
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         let hook = build_loop_completion_hook(&params).unwrap();
         assert_eq!(hook.platform.as_deref(), Some("claude"));
@@ -12647,6 +12737,10 @@ mod tests {
             command: None,
             target_session_id: None,
             timeout_minutes: None,
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         let hook = build_loop_completion_hook(&params).unwrap();
         assert!(hook.model.is_none());
@@ -12664,6 +12758,10 @@ mod tests {
             command: Some("echo hi".to_string()),
             target_session_id: None,
             timeout_minutes: None,
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         let err = build_loop_completion_hook(&params).unwrap_err();
         assert!(err.contains("command"), "{err}");
@@ -12680,6 +12778,10 @@ mod tests {
             command: None,
             target_session_id: None,
             timeout_minutes: None,
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         let err = build_loop_completion_hook(&params).unwrap_err();
         assert!(err.contains("either"), "{err}");
@@ -12695,6 +12797,10 @@ mod tests {
             command: Some("echo hello".to_string()),
             target_session_id: None,
             timeout_minutes: Some(5),
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         let hook = build_loop_completion_hook(&params).unwrap();
         assert_eq!(hook.command.as_deref(), Some("echo hello"));
@@ -12713,6 +12819,10 @@ mod tests {
             command: Some("  echo hello  ".to_string()),
             target_session_id: None,
             timeout_minutes: None,
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         let hook = build_loop_completion_hook(&params).unwrap();
         assert_eq!(hook.command.as_deref(), Some("echo hello"));
@@ -12728,6 +12838,10 @@ mod tests {
             command: None,
             target_session_id: Some("  session-7  ".to_string()),
             timeout_minutes: None,
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         let hook = build_loop_completion_hook(&params).unwrap();
         assert!(hook.is_interactive());
@@ -12748,6 +12862,10 @@ mod tests {
             command: None,
             target_session_id: Some("session-1".to_string()),
             timeout_minutes: None,
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         assert!(build_loop_completion_hook(&params).is_err());
 
@@ -12760,6 +12878,10 @@ mod tests {
             command: Some("echo hi".to_string()),
             target_session_id: Some("session-1".to_string()),
             timeout_minutes: None,
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         assert!(build_loop_completion_hook(&params).is_err());
 
@@ -12772,6 +12894,10 @@ mod tests {
             command: None,
             target_session_id: Some("session-1".to_string()),
             timeout_minutes: None,
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         assert!(build_loop_completion_hook(&params).is_err());
 
@@ -12784,6 +12910,10 @@ mod tests {
             command: None,
             target_session_id: Some("session-1".to_string()),
             timeout_minutes: None,
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         assert!(build_loop_completion_hook(&params).is_err());
 
@@ -12796,6 +12926,10 @@ mod tests {
             command: None,
             target_session_id: Some("session-1".to_string()),
             timeout_minutes: None,
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         let err = build_loop_completion_hook(&params).unwrap_err();
         assert!(err.contains("prompt"), "{err}");
@@ -14140,6 +14274,10 @@ mod additional_tests {
             command: None,
             target_session_id: None,
             timeout_minutes: None,
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         let hook = build_loop_completion_hook(&params).unwrap();
         assert!(hook.model.is_none());
@@ -14155,6 +14293,10 @@ mod additional_tests {
             command: None,
             target_session_id: None,
             timeout_minutes: Some(45),
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         let hook = build_loop_completion_hook(&params).unwrap();
         assert_eq!(hook.timeout_minutes, Some(45));
@@ -15621,6 +15763,10 @@ mod coverage_tests {
             command: None,
             target_session_id: None,
             timeout_minutes: Some(10),
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         let json = super::loop_completion_hook_json(&hook);
         assert_eq!(json["platform"], "claude");
@@ -15638,6 +15784,10 @@ mod coverage_tests {
             command: None,
             target_session_id: None,
             timeout_minutes: None,
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         let json = super::loop_completion_hook_json(&hook);
         assert!(json["model"].is_null());

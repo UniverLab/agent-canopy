@@ -506,15 +506,20 @@ pub struct Loop {
 }
 
 /// Config for a loop completion hook — an agent payload
-/// (`platform`/`model`/`prompt`), a direct shell command (`command`), or an
-/// interactive message into a live session (`prompt` + `target_session_id`).
-/// Exactly one mode must be configured; the engine validates this at
-/// creation time.
+/// (`platform`/`model`/`prompt`), a direct shell command (`command`), an
+/// interactive message into a live session (`prompt` + `target_session_id`),
+/// or a loop launch (`target_loop_id`). Exactly one mode must be configured;
+/// the engine validates this at creation time.
 ///
 /// An interactive hook is fire-and-forget: firing it enqueues one due-now
 /// row in `scheduled_sends` for the exact configured session id, delivered
 /// asynchronously by the TUI (which stays queued, not lost, while no TUI is
 /// running). It never reads or waits for a reply.
+///
+/// A loop hook is fire-and-forget: firing it launches another loop in-process
+/// without waiting for it (CH4). The launched loop's outcome never changes the
+/// launching loop's status. Depth is capped at one: a loop launched by a hook
+/// cannot itself launch another loop via hooks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopCompletionHook {
     /// CLI platform for agent hooks (e.g. "mimo", "claude"). `None` for
@@ -542,6 +547,20 @@ pub struct LoopCompletionHook {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_session_id: Option<String>,
     pub timeout_minutes: Option<u64>,
+    /// Target loop id to launch (loop hooks only). Mutually exclusive with
+    /// platform/command/target_session_id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_loop_id: Option<String>,
+    /// Optional queue id for the launched loop (loop hooks only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_id: Option<String>,
+    /// Optional workdir override for the launched loop (loop hooks only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir_override: Option<String>,
+    /// Optional idea text for the launched loop (loop hooks only). Mutually
+    /// exclusive with queue_id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idea: Option<String>,
 }
 
 impl LoopCompletionHook {
@@ -566,6 +585,13 @@ impl LoopCompletionHook {
             && self.prompt.as_deref().is_some_and(|s| !s.trim().is_empty())
             && self.platform.as_deref().is_none_or(|s| s.trim().is_empty())
             && self.command.as_deref().is_none_or(|s| s.trim().is_empty())
+    }
+
+    /// Whether this is a loop hook (launches another loop in-process).
+    pub fn is_loop(&self) -> bool {
+        self.target_loop_id
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
     }
 }
 

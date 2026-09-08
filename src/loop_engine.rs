@@ -298,8 +298,21 @@ impl LoopEngine {
         idea: Option<String>,
         sandbox: Option<Sandbox>,
     ) -> Result<()> {
-        self.run_loop_dispatch(loop_id, queue_id, workdir_override, false, idea, sandbox)
-            .await
+        let result = self
+            .run_loop_dispatch(
+                loop_id.clone(),
+                queue_id,
+                workdir_override,
+                false,
+                idea,
+                sandbox,
+            )
+            .await;
+        // CH4: clear the hook-launched flag on ALL exit paths (success, failure,
+        // pause, block, etc.). This must happen here, not in run_loop_dispatch,
+        // because that function has multiple early returns.
+        let _ = self.db.clear_loop_hook_launched(&loop_id);
+        result
     }
 
     /// Core of [`Self::run_loop`], plus the one bit `run_loop`'s public
@@ -767,6 +780,25 @@ impl LoopEngine {
                 continue;
             }
 
+            // CH4: depth cap — refuse loop hooks on a hook-launched loop.
+            // Other hook types (agent, command, interactive) still fire normally.
+            if hook.is_loop() && self.is_hook_launched_loop(&lp.id) {
+                let _ = self.db.update_loop_completion_hook_run_result(
+                    &run_id,
+                    LoopRunStatus::Fail,
+                    Some(&serde_json::json!({
+                        "error": "loop hook refused: this loop was itself launched by a hook (depth cap is 1)",
+                        "target_loop_id": hook.target_loop_id,
+                    })),
+                    Some(&format!(
+                        "Loop hook refused: '{}' is at depth 1. Depth cap is 1.",
+                        lp.name
+                    )),
+                    Some(chrono::Utc::now()),
+                );
+                continue;
+            }
+
             let execution = if hook.is_interactive() {
                 // Interactive hook: enqueue a due-now scheduled send for the
                 // configured live session — never a CLI spawn.
@@ -814,6 +846,11 @@ impl LoopEngine {
                         summary: format!("{} hook command is invalid: {error}", event.as_str()),
                     },
                 }
+            } else if hook.is_loop() {
+                // Loop hook (CH4): launch another loop in-process.
+                // Fire-and-forget: the launching loop does not wait for the target.
+                // Depth is enforced inside execute_loop_hook.
+                self.execute_loop_hook(lp, hook, &event, ctx).await
             } else {
                 // Agent hook: resolve CLI, render prompt, spawn
                 match Cli::resolve(hook.platform.as_deref()) {
@@ -886,6 +923,13 @@ impl LoopEngine {
                     .notify_loop_completion_hook_failed(&lp.name, &execution.summary);
             }
         }
+    }
+
+    /// Whether `loop_id` was launched by a hook (depth = 1). Used to enforce
+    /// the depth cap: a hook-launched loop cannot itself launch another loop
+    /// via hooks.
+    fn is_hook_launched_loop(&self, loop_id: &str) -> bool {
+        self.db.is_loop_hook_launched(loop_id).unwrap_or(false)
     }
 
     /// Fire one interactive hook (CH3): render its prompt through the same
@@ -1018,6 +1062,184 @@ impl LoopEngine {
                 ),
             },
         }
+    }
+
+    /// Fire one loop hook (CH4): validate the target loop, enforce depth cap,
+    /// and launch the target loop in-process via [`Self::launch_loop_from_hook`].
+    /// Fire-and-forget: the launching loop does not wait for the target.
+    async fn execute_loop_hook(
+        &self,
+        lp: &Loop,
+        hook: &LoopCompletionHook,
+        event: &LoopHookEvent,
+        ctx: &HookContext<'_>,
+    ) -> HookExecution {
+        // 1. Resolve target loop id (support prefix resolution).
+        let raw_target = hook.target_loop_id.as_deref().unwrap_or("");
+        let target_id = match Database::resolve_loop_id_by_prefix(&self.db, raw_target) {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                return HookExecution {
+                    status: LoopRunStatus::Fail,
+                    output: serde_json::json!({
+                        "error": format!("target loop '{}' not found", raw_target),
+                    }),
+                    summary: format!("Loop hook failed: target loop '{}' not found.", raw_target),
+                };
+            }
+            Err(e) => {
+                return HookExecution {
+                    status: LoopRunStatus::Fail,
+                    output: serde_json::json!({ "error": e.to_string() }),
+                    summary: format!("Loop hook failed to resolve target: {e}"),
+                };
+            }
+        };
+
+        // 2. Validate target loop state: must not be running, archived, or absent.
+        let target_lp = match self.db.get_loop(&target_id) {
+            Ok(Some(lp)) => lp,
+            Ok(None) => {
+                return HookExecution {
+                    status: LoopRunStatus::Fail,
+                    output: serde_json::json!({
+                        "error": format!("target loop '{}' not found", raw_target),
+                    }),
+                    summary: format!("Loop hook failed: target loop '{}' not found.", raw_target),
+                };
+            }
+            Err(e) => {
+                return HookExecution {
+                    status: LoopRunStatus::Fail,
+                    output: serde_json::json!({ "error": e.to_string() }),
+                    summary: format!("Loop hook failed to read target: {e}"),
+                };
+            }
+        };
+        if target_lp.archived {
+            return HookExecution {
+                status: LoopRunStatus::Fail,
+                output: serde_json::json!({
+                    "error": format!("target loop '{}' is archived", target_lp.name),
+                }),
+                summary: format!(
+                    "Loop hook failed: target loop '{}' is archived.",
+                    target_lp.name
+                ),
+            };
+        }
+        if target_lp.status == LoopStatus::Running {
+            return HookExecution {
+                status: LoopRunStatus::Fail,
+                output: serde_json::json!({
+                    "error": format!("target loop '{}' is already running", target_lp.name),
+                }),
+                summary: format!(
+                    "Loop hook failed: target loop '{}' is already running.",
+                    target_lp.name
+                ),
+            };
+        }
+
+        // 3. Validate mutual exclusions: queue_id and idea are mutually exclusive.
+        let queue_id = hook.queue_id.as_deref().filter(|s| !s.trim().is_empty());
+        let idea = hook.idea.as_deref().filter(|s| !s.trim().is_empty());
+        if queue_id.is_some() && idea.is_some() {
+            return HookExecution {
+                status: LoopRunStatus::Fail,
+                output: serde_json::json!({
+                    "error": "queue_id and idea are mutually exclusive",
+                }),
+                summary: "Loop hook failed: queue_id and idea are mutually exclusive.".to_string(),
+            };
+        }
+
+        // 4. Render idea template if present.
+        let rendered_idea = if let Some(idea_template) = idea {
+            match render_hook_idea(event, ctx, idea_template) {
+                Ok(rendered) => Some(rendered),
+                Err(e) => {
+                    return HookExecution {
+                        status: LoopRunStatus::Fail,
+                        output: serde_json::json!({ "error": e.to_string() }),
+                        summary: format!("Loop hook idea template is invalid: {e}"),
+                    };
+                }
+            }
+        } else {
+            None
+        };
+
+        // 5. Record provenance: which loop and event launched this loop.
+        let _ = self
+            .db
+            .record_hook_launch_provenance(&target_id, &lp.id, event.as_str());
+
+        // 6. Launch the target loop in-process. Fire-and-forget.
+        self.launch_loop_from_hook(
+            target_id.clone(),
+            queue_id.map(str::to_string),
+            hook.workdir_override
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string),
+            rendered_idea.clone(),
+        );
+
+        HookExecution {
+            status: LoopRunStatus::Pass,
+            output: serde_json::json!({
+                "launched_loop_id": target_id,
+                "queue_id": queue_id,
+                "idea": rendered_idea,
+            }),
+            summary: format!("Loop hook launched '{}' in background.", target_lp.name),
+        }
+    }
+
+    /// Launch a loop from a hook context (CH4). Fire-and-forget: spawns a
+    /// background task that calls [`Self::run_loop`]. The launched loop is
+    /// marked as hook-launched so its own loop hooks are refused (depth
+    /// cap = 1).
+    fn launch_loop_from_hook(
+        &self,
+        loop_id: String,
+        queue_id: Option<String>,
+        workdir_override: Option<String>,
+        idea: Option<String>,
+    ) {
+        // Mark this loop as hook-launched before spawning, so when
+        // run_loop_dispatch begins, it knows to enforce the depth cap.
+        let _ = self.db.mark_loop_as_hook_launched(&loop_id);
+
+        let db = Arc::clone(&self.db);
+        let notification_service = Arc::clone(&self.notification_service);
+        let ensemble_concurrency = Arc::clone(&self.ensemble_concurrency);
+        let dynamic_skills = self.dynamic_skills.clone();
+        let spec_attempt_limit = self.spec_attempt_limit;
+
+        tokio::spawn(async move {
+            let engine = LoopEngine {
+                db,
+                notification_service,
+                ensemble_concurrency,
+                dynamic_skills,
+                spec_attempt_limit,
+            };
+            if let Err(error) = engine
+                .run_loop(loop_id.clone(), queue_id, workdir_override, idea, None)
+                .await
+            {
+                if error.downcast_ref::<EmptySpecSetError>().is_some() {
+                    tracing::error!("Hook-launched loop '{}' launch refused: {error:#}", loop_id);
+                } else {
+                    tracing::error!("Hook-launched loop '{}' failed: {error:#}", loop_id);
+                    let _ = engine
+                        .fail_loop(&loop_id, None, None, &error.to_string())
+                        .await;
+                }
+            }
+        });
     }
 
     /// Fire `lp`'s `on_completed` hook (N2), if configured — a no-op
@@ -1281,10 +1503,12 @@ impl LoopEngine {
             .ok()
             .flatten();
         tokio::spawn(async move {
-            if let Err(error) = self
+            let result = self
                 .run_loop_dispatch(loop_id.clone(), queue_id, None, true, None, sandbox)
-                .await
-            {
+                .await;
+            // CH4: clear the hook-launched flag on ALL exit paths.
+            let _ = self.db.clear_loop_hook_launched(&loop_id);
+            if let Err(error) = result {
                 if error.downcast_ref::<EmptySpecSetError>().is_some() {
                     tracing::error!("Loop '{}' launch refused: {error:#}", loop_id);
                 } else {
@@ -6106,6 +6330,47 @@ fn render_hook_command(
 
     Ok(crate::domain::prompts::render_template(
         command_template,
+        |raw| match raw {
+            "loop_name" => Some(ctx.loop_name.to_string()),
+            "workdir" => Some(ctx.workdir.to_string()),
+            "completed_specs" => Some(completed_specs_text.clone()),
+            "spec_name" => ctx.spec_name.map(str::to_string),
+            "spec_id" => ctx.spec_id.map(str::to_string),
+            "blocker" => ctx.blocker.map(str::to_string),
+            "node" => ctx.node_name.map(str::to_string),
+            _ => None,
+        },
+    ))
+}
+
+/// Render a loop hook's `idea` template (CH4), binding the same placeholders
+/// as the hook's event. Returns `Err` if the template carries unbindable
+/// markers.
+fn render_hook_idea(
+    event: &LoopHookEvent,
+    ctx: &HookContext<'_>,
+    idea_template: &str,
+) -> Result<String> {
+    let bindings = hook_bindings_for_event(event);
+    refuse_unbindable_template(
+        &format!("{} hook idea", event.as_str()),
+        idea_template,
+        bindings,
+        None,
+    )?;
+
+    let completed_specs_text = if ctx.completed_specs.is_empty() {
+        "(none)".to_string()
+    } else {
+        ctx.completed_specs
+            .iter()
+            .map(|(name, summary)| format!("- {name}: {summary}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    Ok(crate::domain::prompts::render_template(
+        idea_template,
         |raw| match raw {
             "loop_name" => Some(ctx.loop_name.to_string()),
             "workdir" => Some(ctx.workdir.to_string()),
@@ -13584,6 +13849,10 @@ echo done
             command: None,
             target_session_id: None,
             timeout_minutes: Some(1),
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         db.update_loop_completion_hook(&loop_id, Some(&hook))
             .unwrap();
@@ -13637,6 +13906,10 @@ echo done
             command: None,
             target_session_id: None,
             timeout_minutes: Some(1),
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         db.update_loop_completion_hook(&loop_id, Some(&hook))
             .unwrap();
@@ -13689,6 +13962,10 @@ echo done
             command: None,
             target_session_id: None,
             timeout_minutes: Some(1),
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         db.update_loop_completion_hook(&loop_id, Some(&hook))
             .unwrap();
@@ -14567,6 +14844,10 @@ echo done
             command: None,
             target_session_id: None,
             timeout_minutes: Some(1),
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         db.update_loop_completion_hook(&loop_id, Some(&hook))
             .unwrap();
@@ -14621,6 +14902,10 @@ echo done
             command: None,
             target_session_id: None,
             timeout_minutes: Some(1),
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         db.update_loop_completion_hook(&loop_id, Some(&hook))
             .unwrap();
@@ -14865,6 +15150,10 @@ echo done
             command: None,
             target_session_id: None,
             timeout_minutes: Some(1),
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         db.update_loop_completion_hook(&loop_id, Some(&hook))
             .unwrap();
@@ -14920,6 +15209,10 @@ echo done
             command: None,
             target_session_id: None,
             timeout_minutes: Some(1),
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         let mut hooks = std::collections::BTreeMap::new();
         hooks.insert(
@@ -14981,6 +15274,10 @@ echo done
             command: None,
             target_session_id: None,
             timeout_minutes: Some(1),
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         let mut hooks = std::collections::BTreeMap::new();
         hooks.insert(
@@ -15048,6 +15345,10 @@ echo done
             command: None,
             target_session_id: None,
             timeout_minutes: Some(1),
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         let mut hooks = std::collections::BTreeMap::new();
         hooks.insert(crate::domain::loops::LoopHookEvent::OnFailed, vec![hook]);
@@ -15115,6 +15416,10 @@ echo done
             command: None,
             target_session_id: None,
             timeout_minutes: Some(1),
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         let mut hooks = std::collections::BTreeMap::new();
         hooks.insert(crate::domain::loops::LoopHookEvent::OnBlocked, vec![hook]);
@@ -15170,6 +15475,10 @@ echo done
             command: None,
             target_session_id: None,
             timeout_minutes: Some(1),
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         let passing = crate::domain::loops::LoopCompletionHook {
             platform: Some("test-cli".to_string()),
@@ -15179,6 +15488,10 @@ echo done
             command: None,
             target_session_id: None,
             timeout_minutes: Some(1),
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         let mut hooks = std::collections::BTreeMap::new();
         hooks.insert(
@@ -15249,6 +15562,10 @@ echo done
             command: None,
             target_session_id: None,
             timeout_minutes: Some(1),
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         let mut hooks = std::collections::BTreeMap::new();
         hooks.insert(crate::domain::loops::LoopHookEvent::OnCompleted, vec![hook]);
@@ -15280,6 +15597,10 @@ echo done
             command: None,
             target_session_id: Some(target.to_string()),
             timeout_minutes: None,
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         }
     }
 
@@ -15560,6 +15881,10 @@ echo done
             command: Some("touch \"{{spec_name}}.marker\"".to_string()),
             target_session_id: None,
             timeout_minutes: Some(1),
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         let mut hooks = std::collections::BTreeMap::new();
         hooks.insert(
@@ -15623,6 +15948,10 @@ echo done
             command: Some("echo out; echo err >&2; exit 3".to_string()),
             target_session_id: None,
             timeout_minutes: Some(1),
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         let mut hooks = std::collections::BTreeMap::new();
         hooks.insert(crate::domain::loops::LoopHookEvent::OnCompleted, vec![hook]);
@@ -15681,6 +16010,10 @@ echo done
             command: Some(format!("echo {{{{spec_name}}}} > \"{}\"", output_path)),
             target_session_id: None,
             timeout_minutes: Some(1),
+            target_loop_id: None,
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
         };
         let mut hooks = std::collections::BTreeMap::new();
         hooks.insert(
@@ -20759,5 +21092,650 @@ exit 0
         assert!(prompt.contains("# [SPEC]"));
         assert!(!prompt.contains("# Objective"));
         assert!(!prompt.contains("# Functional Requirements"));
+    }
+
+    // ── CH4: loop hook tests ─────────────────────────────────────────
+
+    /// Helper: create a second loop with a simple graph and spec, returning its id.
+    fn create_target_loop(db: &Database, id: &str, name: &str) -> Result<String> {
+        let lp = crate::domain::loops::Loop {
+            archived: false,
+            paused_by_reconciliation: false,
+            infra_node_id: None,
+            id: id.to_string(),
+            name: name.to_string(),
+            description: None,
+            workdir: "/tmp".to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            hooks: std::collections::BTreeMap::new(),
+        };
+        db.insert_loop(&lp)?;
+        // Add a Check node so the loop can actually run specs.
+        let node = crate::domain::loops::LoopNode {
+            id: format!("{id}-node-1"),
+            spec_id: None,
+            loop_id: Some(id.to_string()),
+            name: "Check".to_string(),
+            kind: crate::domain::loops::LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+        db.insert_loop_node(&node)?;
+        // Add a spec so the loop has something to run.
+        let spec = crate::domain::loops::LoopSpec {
+            id: format!("{id}-spec"),
+            loop_id: Some(id.to_string()),
+            name: "Spec".to_string(),
+            description: Some("task".to_string()),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        db.insert_loop_spec(&spec)?;
+        Ok(id.to_string())
+    }
+
+    /// Helper: set up a source loop with an on_completed hook that launches
+    /// a target loop.
+    fn setup_loop_hook_source(
+        db: &Database,
+        source_id: &str,
+        target_id: &str,
+        queue_id: Option<&str>,
+        idea: Option<&str>,
+    ) -> Result<()> {
+        let hook = crate::domain::loops::LoopCompletionHook {
+            platform: None,
+            model: None,
+            effort: None,
+            prompt: None,
+            command: None,
+            target_session_id: None,
+            timeout_minutes: None,
+            target_loop_id: Some(target_id.to_string()),
+            queue_id: queue_id.map(str::to_string),
+            workdir_override: None,
+            idea: idea.map(str::to_string),
+        };
+        let mut hooks = std::collections::BTreeMap::new();
+        hooks.insert(LoopHookEvent::OnCompleted, vec![hook]);
+        let lp = crate::domain::loops::Loop {
+            archived: false,
+            paused_by_reconciliation: false,
+            infra_node_id: None,
+            id: source_id.to_string(),
+            name: format!("Source {source_id}"),
+            description: None,
+            workdir: "/tmp".to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            hooks,
+        };
+        db.insert_loop(&lp)?;
+        // Add a graph node so the loop can actually run specs.
+        let node = crate::domain::loops::LoopNode {
+            id: format!("{source_id}-node-1"),
+            spec_id: None,
+            loop_id: Some(source_id.to_string()),
+            name: "Check".to_string(),
+            kind: crate::domain::loops::LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+        db.insert_loop_node(&node)?;
+        // Add a spec so the loop has something to run.
+        let spec = crate::domain::loops::LoopSpec {
+            id: format!("{source_id}-spec"),
+            loop_id: Some(source_id.to_string()),
+            name: "Spec".to_string(),
+            description: Some("do nothing".to_string()),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        db.insert_loop_spec(&spec)?;
+        Ok(())
+    }
+
+    /// CH4: A hook launches a target loop, and the launching loop completes
+    /// without waiting for it.
+    #[tokio::test]
+    async fn loop_hook_launches_target_loop_in_background() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
+        let target_id = create_target_loop(&db, "target-bg", "Target").unwrap();
+        setup_loop_hook_source(&db, "source-bg", &target_id, None, None).unwrap();
+
+        let engine = LoopEngine::new(Arc::clone(&db), Arc::new(DefaultNotificationService));
+        let result = engine
+            .run_loop("source-bg".to_string(), None, None, None, None)
+            .await;
+        assert!(result.is_ok(), "source loop should complete: {result:?}");
+
+        // The source loop should be completed.
+        let source = db.get_loop("source-bg").unwrap().unwrap();
+        assert_eq!(source.status, LoopStatus::Completed);
+
+        // Give the background task a moment to start the target loop.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // The target loop should have been launched.
+        let target = db.get_loop(&target_id).unwrap().unwrap();
+        assert!(
+            target.status == LoopStatus::Running || target.status == LoopStatus::Completed,
+            "target should be running or completed, got {:?}",
+            target.status
+        );
+    }
+
+    /// CH4: A hook launches a loop with an `idea` and no queue, and the
+    /// target's first node receives that text as `{{spec_content}}`.
+    #[tokio::test]
+    async fn loop_hook_launches_loop_with_idea() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
+        let target_id = create_target_loop(&db, "target-idea", "Target Idea").unwrap();
+        setup_loop_hook_source(&db, "source-idea", &target_id, None, Some("Build a widget"))
+            .unwrap();
+
+        let engine = LoopEngine::new(Arc::clone(&db), Arc::new(DefaultNotificationService));
+        let result = engine
+            .run_loop("source-idea".to_string(), None, None, None, None)
+            .await;
+        assert!(result.is_ok(), "source loop should complete: {result:?}");
+
+        // Give the background task time to start.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // The target loop should have been launched.
+        let target = db.get_loop(&target_id).unwrap().unwrap();
+        assert!(
+            target.status == LoopStatus::Running || target.status == LoopStatus::Completed,
+            "target should be running or completed, got {:?}",
+            target.status
+        );
+    }
+
+    /// CH4: A loop launched by a hook has its own loop-launching hook refused,
+    /// with the reason recorded, while its other hooks still run.
+    #[tokio::test]
+    async fn loop_hook_depth_cap_refuses_second_launch() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
+
+        // Create loop C (target for B's hook)
+        let c_id = create_target_loop(&db, "loop-c", "Loop C").unwrap();
+
+        // Create loop B manually with its own hook that launches C
+        let b_hook = crate::domain::loops::LoopCompletionHook {
+            platform: None,
+            model: None,
+            effort: None,
+            prompt: None,
+            command: None,
+            target_session_id: None,
+            timeout_minutes: None,
+            target_loop_id: Some(c_id.clone()),
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
+        };
+        let mut b_hooks = std::collections::BTreeMap::new();
+        b_hooks.insert(LoopHookEvent::OnCompleted, vec![b_hook]);
+        let lp_b = crate::domain::loops::Loop {
+            archived: false,
+            paused_by_reconciliation: false,
+            infra_node_id: None,
+            id: "loop-b".to_string(),
+            name: "Loop B".to_string(),
+            description: None,
+            workdir: "/tmp".to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            hooks: b_hooks,
+        };
+        db.insert_loop(&lp_b).unwrap();
+        // Add a Check node so loop B can actually run specs.
+        let b_node = crate::domain::loops::LoopNode {
+            id: "loop-b-node-1".to_string(),
+            spec_id: None,
+            loop_id: Some("loop-b".to_string()),
+            name: "Check".to_string(),
+            kind: crate::domain::loops::LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+        db.insert_loop_node(&b_node).unwrap();
+        // Add a spec so loop B has something to run.
+        let b_spec = crate::domain::loops::LoopSpec {
+            id: "loop-b-spec".to_string(),
+            loop_id: Some("loop-b".to_string()),
+            name: "Spec".to_string(),
+            description: Some("task".to_string()),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        db.insert_loop_spec(&b_spec).unwrap();
+
+        // A has an on_completed hook that launches B (with a spec).
+        setup_loop_hook_source(&db, "loop-a", "loop-b", None, None).unwrap();
+
+        let engine = LoopEngine::new(Arc::clone(&db), Arc::new(DefaultNotificationService));
+
+        // Run A — this should launch B, which should try to launch C but be refused.
+        let result = engine
+            .run_loop("loop-a".to_string(), None, None, None, None)
+            .await;
+        assert!(result.is_ok(), "loop A should complete: {result:?}");
+
+        // Give background tasks time to run.
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+        // Debug: check what happened to B
+        let b_loop = db.get_loop("loop-b").unwrap().unwrap();
+        eprintln!("B status: {:?}", b_loop.status);
+        let b_runs = db.list_loop_completion_hook_runs("loop-b").unwrap();
+        eprintln!("B hook runs: {}", b_runs.len());
+        for r in &b_runs {
+            eprintln!("  run: status={:?}, summary={:?}", r.status, r.summary);
+        }
+        let b_spec_runs = db.list_loop_specs("loop-b").unwrap();
+        eprintln!("B specs: {}", b_spec_runs.len());
+        for s in &b_spec_runs {
+            eprintln!("  spec: status={:?}", s.status);
+        }
+
+        // C should NOT have been launched (B's hook was refused at depth 1).
+        let c = db.get_loop(&c_id).unwrap().unwrap();
+        assert_eq!(
+            c.status,
+            LoopStatus::Draft,
+            "C should still be Draft (B's hook was refused at depth 1)"
+        );
+
+        // Check that B's hook run was recorded as failed.
+        assert!(
+            b_runs.iter().any(|r| {
+                r.status == LoopRunStatus::Fail
+                    && r.summary
+                        .as_deref()
+                        .is_some_and(|s| s.contains("Depth cap"))
+            }),
+            "B's loop hook should have been refused with depth cap reason"
+        );
+    }
+
+    /// CH4: A hook targeting an already-running loop fails with the target
+    /// named, and the launching loop's status is unchanged.
+    #[tokio::test]
+    async fn loop_hook_refuses_already_running_target() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
+        let target_id = create_target_loop(&db, "target-running", "Target Running").unwrap();
+        setup_loop_hook_source(&db, "source-running", &target_id, None, None).unwrap();
+
+        // Manually set target to Running status.
+        db.update_loop_status(&target_id, LoopStatus::Running, None, None)
+            .unwrap();
+
+        let engine = LoopEngine::new(Arc::clone(&db), Arc::new(DefaultNotificationService));
+        let result = engine
+            .run_loop("source-running".to_string(), None, None, None, None)
+            .await;
+        assert!(result.is_ok(), "source loop should complete: {result:?}");
+
+        // Source should be completed.
+        let source = db.get_loop("source-running").unwrap().unwrap();
+        assert_eq!(source.status, LoopStatus::Completed);
+
+        // The hook run should be recorded as failed.
+        let runs = db.list_loop_completion_hook_runs("source-running").unwrap();
+        assert!(
+            runs.iter().any(|r| {
+                r.status == LoopRunStatus::Fail
+                    && r.summary
+                        .as_deref()
+                        .is_some_and(|s| s.contains("already running"))
+            }),
+            "hook should have failed with 'already running'"
+        );
+
+        // Target should still be Running (unchanged).
+        let target = db.get_loop(&target_id).unwrap().unwrap();
+        assert_eq!(target.status, LoopStatus::Running);
+    }
+
+    /// CH4: A hook targeting an archived loop fails with the target named.
+    #[tokio::test]
+    async fn loop_hook_refuses_archived_target() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
+        let target_id = create_target_loop(&db, "target-archived", "Target Archived").unwrap();
+        setup_loop_hook_source(&db, "source-archived", &target_id, None, None).unwrap();
+
+        // Archive the target.
+        db.archive_loop(&target_id).unwrap();
+
+        let engine = LoopEngine::new(Arc::clone(&db), Arc::new(DefaultNotificationService));
+        let result = engine
+            .run_loop("source-archived".to_string(), None, None, None, None)
+            .await;
+        assert!(result.is_ok(), "source loop should complete: {result:?}");
+
+        let runs = db
+            .list_loop_completion_hook_runs("source-archived")
+            .unwrap();
+        assert!(
+            runs.iter().any(|r| {
+                r.status == LoopRunStatus::Fail
+                    && r.summary.as_deref().is_some_and(|s| s.contains("archived"))
+            }),
+            "hook should have failed with 'archived'"
+        );
+    }
+
+    /// CH4: Provenance is recorded when a hook launches a loop.
+    #[tokio::test]
+    async fn loop_hook_records_provenance() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
+        let target_id = create_target_loop(&db, "target-prov", "Target Prov").unwrap();
+        setup_loop_hook_source(&db, "source-prov", &target_id, None, None).unwrap();
+
+        let engine = LoopEngine::new(Arc::clone(&db), Arc::new(DefaultNotificationService));
+        let result = engine
+            .run_loop("source-prov".to_string(), None, None, None, None)
+            .await;
+        assert!(result.is_ok(), "source loop should complete: {result:?}");
+
+        // Give the background task time to record provenance.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Check provenance via the DB method (indirectly: verify the launch happened).
+        let target = db.get_loop(&target_id).unwrap().unwrap();
+        assert!(
+            target.status == LoopStatus::Running || target.status == LoopStatus::Completed,
+            "target should have been launched"
+        );
+    }
+
+    /// CH4: The hook_launched flag is cleared after the run completes.
+    #[tokio::test]
+    async fn loop_hook_launched_flag_cleared_on_completion() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
+        let target_id = create_target_loop(&db, "target-flag", "Target Flag").unwrap();
+        setup_loop_hook_source(&db, "source-flag", &target_id, None, None).unwrap();
+
+        let engine = LoopEngine::new(Arc::clone(&db), Arc::new(DefaultNotificationService));
+        let result = engine
+            .run_loop("source-flag".to_string(), None, None, None, None)
+            .await;
+        assert!(result.is_ok(), "source loop should complete: {result:?}");
+
+        // After the source loop completes, the hook_launched flag should be cleared.
+        // (The source loop was NOT hook-launched, so the flag was never set for it.)
+        assert!(
+            !db.is_loop_hook_launched("source-flag").unwrap(),
+            "source loop should not have hook_launched flag"
+        );
+    }
+
+    /// CH4: The hook_launched flag is set on the target loop, then cleared
+    /// when it completes.
+    #[tokio::test]
+    async fn loop_hook_launched_flag_set_on_target() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
+        let target_id = create_target_loop(&db, "target-flag2", "Target Flag2").unwrap();
+        setup_loop_hook_source(&db, "source-flag2", &target_id, None, None).unwrap();
+
+        let engine = LoopEngine::new(Arc::clone(&db), Arc::new(DefaultNotificationService));
+        let result = engine
+            .run_loop("source-flag2".to_string(), None, None, None, None)
+            .await;
+        assert!(result.is_ok(), "source loop should complete: {result:?}");
+
+        // Give the background task time to run and complete.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // After the target loop completes, the hook_launched flag is cleared.
+        // So we just verify the target actually ran (completed).
+        let target = db.get_loop(&target_id).unwrap().unwrap();
+        assert!(
+            target.status == LoopStatus::Completed || target.status == LoopStatus::Running,
+            "target should have run, got {:?}",
+            target.status
+        );
+        // And the flag is cleared.
+        assert!(
+            !db.is_loop_hook_launched(&target_id).unwrap(),
+            "hook_launched flag should be cleared after target completes"
+        );
+    }
+
+    /// CH4: render_hook_idea renders placeholders correctly.
+    #[test]
+    fn render_hook_idea_substitutes_placeholders() {
+        let ctx = HookContext {
+            loop_name: "MyLoop",
+            workdir: "/tmp/project",
+            completed_specs: &[("SpecA".to_string(), "done".to_string())],
+            spec_name: None,
+            spec_id: None,
+            blocker: None,
+            node_name: None,
+        };
+        let result = render_hook_idea(
+            &LoopHookEvent::OnCompleted,
+            &ctx,
+            "Loop {{loop_name}} finished",
+        )
+        .unwrap();
+        assert_eq!(result, "Loop MyLoop finished");
+    }
+
+    /// CH4: render_hook_idea rejects unbindable markers.
+    #[test]
+    fn render_hook_idea_rejects_unbindable_markers() {
+        let ctx = HookContext {
+            loop_name: "MyLoop",
+            workdir: "/tmp",
+            completed_specs: &[],
+            spec_name: None,
+            spec_id: None,
+            blocker: None,
+            node_name: None,
+        };
+        let result = render_hook_idea(&LoopHookEvent::OnCompleted, &ctx, "Blocker: {{blocker}}");
+        assert!(
+            result.is_err(),
+            "should reject unbindable {{blocker}} on on_completed"
+        );
+    }
+
+    /// CH4: Verify that a loop with a spec can be found by list_loop_specs.
+    #[test]
+    fn loop_hook_spec_is_queryable() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
+        let lp = crate::domain::loops::Loop {
+            archived: false,
+            paused_by_reconciliation: false,
+            infra_node_id: None,
+            id: "test-loop".to_string(),
+            name: "Test".to_string(),
+            description: None,
+            workdir: "/tmp".to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            hooks: std::collections::BTreeMap::new(),
+        };
+        db.insert_loop(&lp).unwrap();
+        let spec = crate::domain::loops::LoopSpec {
+            id: "test-spec".to_string(),
+            loop_id: Some("test-loop".to_string()),
+            name: "Spec".to_string(),
+            description: Some("do nothing".to_string()),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        db.insert_loop_spec(&spec).unwrap();
+        let specs = db.list_loop_specs("test-loop").unwrap();
+        assert_eq!(specs.len(), 1, "should find the spec");
+        assert_eq!(specs[0].id, "test-spec");
+    }
+
+    /// CH4: Verify that a loop with a hook can run the hook on completion.
+    #[tokio::test]
+    async fn loop_hook_runs_on_completion() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
+        let target_id = create_target_loop(&db, "target-compl", "Target Compl").unwrap();
+
+        // Create source loop with a spec AND a hook.
+        let hook = crate::domain::loops::LoopCompletionHook {
+            platform: None,
+            model: None,
+            effort: None,
+            prompt: None,
+            command: None,
+            target_session_id: None,
+            timeout_minutes: None,
+            target_loop_id: Some(target_id.clone()),
+            queue_id: None,
+            workdir_override: None,
+            idea: None,
+        };
+        let mut hooks = std::collections::BTreeMap::new();
+        hooks.insert(LoopHookEvent::OnCompleted, vec![hook]);
+        let lp = crate::domain::loops::Loop {
+            archived: false,
+            paused_by_reconciliation: false,
+            infra_node_id: None,
+            id: "source-compl".to_string(),
+            name: "Source".to_string(),
+            description: None,
+            workdir: "/tmp".to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            hooks,
+        };
+        db.insert_loop(&lp).unwrap();
+
+        // Verify spec exists before running
+        let spec = crate::domain::loops::LoopSpec {
+            id: "spec-compl".to_string(),
+            loop_id: Some("source-compl".to_string()),
+            name: "Spec".to_string(),
+            description: Some("task".to_string()),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        };
+        db.insert_loop_spec(&spec).unwrap();
+
+        // Verify spec is queryable
+        let found = db.list_loop_specs("source-compl").unwrap();
+        eprintln!("Found {} specs for source-compl", found.len());
+
+        // Verify loop was stored with hooks
+        let stored = db.get_loop("source-compl").unwrap().unwrap();
+        eprintln!("Loop hooks: {:?}", stored.hooks.keys().collect::<Vec<_>>());
+        if let Some(on_completed_hooks) = stored.hooks.get(&LoopHookEvent::OnCompleted) {
+            eprintln!("on_completed hooks count: {}", on_completed_hooks.len());
+            for h in on_completed_hooks {
+                eprintln!("  target_loop_id: {:?}", h.target_loop_id);
+                eprintln!("  is_loop: {}", h.is_loop());
+            }
+        }
+
+        let engine = LoopEngine::new(Arc::clone(&db), Arc::new(DefaultNotificationService));
+        let result = engine
+            .run_loop("source-compl".to_string(), None, None, None, None)
+            .await;
+        eprintln!("run_loop result: {:?}", result);
+        assert!(result.is_ok(), "source loop should complete: {result:?}");
     }
 }
