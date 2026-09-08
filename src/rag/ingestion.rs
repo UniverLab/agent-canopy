@@ -580,12 +580,47 @@ impl IngestionManager {
         }
     }
 
+    /// Items enqueued directly into the DB (e.g. by `canopy rag backfill`
+    /// while the daemon is already running) bypass the in-memory queue, so
+    /// poll the DB periodically and reload anything pending. Idempotent:
+    /// [`Queue::push`] skips paths already held in memory.
+    async fn reload_queue_from_db(&self) {
+        let failed = self.db.permanently_failed_rag_files().unwrap_or_default();
+        let pending = match self.db_pending_queue() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("rag_backfill: failed to read pending DB queue: {e:#}");
+                return;
+            }
+        };
+        let mut reloaded = 0usize;
+        for path in &pending {
+            if failed.contains(path) {
+                continue;
+            }
+            if self.enqueue(path).await {
+                reloaded += 1;
+            }
+        }
+        if reloaded > 0 {
+            tracing::info!("rag_backfill: reloaded {reloaded} pending queue item(s) from DB");
+            self.notify.notify_one();
+        }
+    }
+
     async fn run(&self, ct: tokio_util::sync::CancellationToken) {
+        let mut db_poll = tokio::time::interval(std::time::Duration::from_secs(60));
+        db_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = ct.cancelled() => break,
                 _ = self.notify.notified() => {
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    self.drain_queue(&ct).await;
+                }
+                _ = db_poll.tick() => {
+                    // Pick up items added by `canopy rag backfill` or other CLI commands
+                    self.reload_queue_from_db().await;
                     self.drain_queue(&ct).await;
                 }
             }

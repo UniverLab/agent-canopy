@@ -16,6 +16,8 @@ pub(crate) enum RagAction {
     },
     /// Show a detailed per-file RAG indexing report.
     Report,
+    /// Index all configured files not yet in the vector store.
+    Backfill,
     /// Delete the entire vector store and reset all RAG state.
     Purge {
         /// Skip the interactive confirmation prompt.
@@ -64,6 +66,7 @@ pub(crate) async fn handle_rag_action(action: RagAction) -> Result<()> {
             println!("     Run \x1b[1mcanopy rag auto-index start\x1b[0m to resume.");
         }
         RagAction::Report => handle_rag_report(&data_dir, &db).await?,
+        RagAction::Backfill => handle_rag_backfill(&data_dir, &db).await?,
         RagAction::Purge { yes } => {
             if !yes {
                 eprintln!(
@@ -141,6 +144,160 @@ fn handle_model_retry(data_dir: &std::path::Path, db: &Database) -> Result<()> {
     Ok(())
 }
 
+/// Outcome of a backfill scan: what was found on disk, what was already
+/// stored, and what was newly enqueued. Pure data — see [`run_backfill`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackfillOutcome {
+    /// Indexable (supported, non-ignored, under the size limit) files on disk.
+    pub indexable_on_disk: usize,
+    /// Supported, non-ignored files over the size limit (skipped, with reason).
+    pub oversize_on_disk: usize,
+    /// Indexable files already present in the vector store.
+    pub already_indexed: usize,
+    /// Files newly enqueued for indexing by this run.
+    pub enqueued: usize,
+}
+
+/// Pure core of `canopy rag backfill`: diff the authoritative filesystem
+/// scan against the set of already-indexed paths and enqueue exactly the
+/// remainder. Takes the indexed set as a plain value so tests can exercise
+/// the remainder/idempotency logic without opening a real vector store.
+///
+/// `enqueue_rag_item` is an idempotent upsert, so re-running (or
+/// interrupting and resuming) never loses finished work and never re-embeds
+/// what is already stored — the second run finds nothing left to enqueue.
+pub(crate) fn run_backfill(
+    db: &Database,
+    indexable_files: &[std::path::PathBuf],
+    indexed_paths: &std::collections::HashSet<String>,
+    now: i64,
+) -> BackfillOutcome {
+    let to_index: Vec<&std::path::PathBuf> = indexable_files
+        .iter()
+        .filter(|p| !indexed_paths.contains(&p.to_string_lossy().to_string()))
+        .collect();
+    let already_indexed = indexable_files.len().saturating_sub(to_index.len());
+    let mut enqueued = 0usize;
+    for path in &to_index {
+        if db.enqueue_rag_item(&path.to_string_lossy(), now).is_ok() {
+            enqueued += 1;
+        }
+    }
+    BackfillOutcome {
+        indexable_on_disk: indexable_files.len(),
+        oversize_on_disk: 0,
+        already_indexed,
+        enqueued,
+    }
+}
+
+async fn handle_rag_backfill(data_dir: &std::path::Path, db: &Database) -> Result<()> {
+    let config = crate::domain::canopy_config::CanopyConfig::load(data_dir);
+
+    if config.rag_personal_dirs.is_empty() {
+        println!("\x1b[33m⚠\x1b[0m  No personal RAG directories configured.");
+        return Ok(());
+    }
+
+    let max_bytes = config.rag_max_file_bytes();
+    let cap_mb = max_bytes as f64 / (1024.0 * 1024.0);
+
+    // 1. Authoritative filesystem scan of the configured roots.
+    let scan = crate::rag::size_report::scan(data_dir, &config.rag_personal_dirs, max_bytes)?;
+    let oversize_on_disk = scan.oversize_files.len();
+
+    // 2. Already-indexed paths from the vector store (single source of truth).
+    let indexed_paths: std::collections::HashSet<String> =
+        if !config.embeddings_model.trim().is_empty() {
+            let dims =
+                crate::rag::embedding_client::model_dimensions(config.embeddings_model.trim())
+                    .unwrap_or(384);
+            match crate::rag::vector_store::VectorStore::open_at(
+                &crate::rag::vector_store::VectorStore::default_lancedb_path()?,
+                dims,
+                Some(config.rag_vector_cache_entries),
+            )
+            .await
+            {
+                Ok(store) => store
+                    .list_unique_paths()
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+                Err(_) => std::collections::HashSet::new(),
+            }
+        } else {
+            std::collections::HashSet::new()
+        };
+
+    // 3-4. Diff and enqueue (resumable, incremental — see `run_backfill`).
+    let now = chrono::Utc::now().timestamp();
+    let mut outcome = run_backfill(db, &scan.indexable_files, &indexed_paths, now);
+    outcome.oversize_on_disk = oversize_on_disk;
+
+    // 5. Report: found / indexed / skipped-with-reason.
+    println!("\n\x1b[1m── RAG Backfill ─────────────────────────────────────────────\x1b[0m");
+    println!(
+        " Found on disk:     {} indexable file(s), {} oversize (skipped: exceed the {:.0} MB limit)",
+        outcome.indexable_on_disk, outcome.oversize_on_disk, cap_mb
+    );
+    println!(" Already indexed:   {}", outcome.already_indexed);
+    println!(" Enqueued to index: {}", outcome.enqueued);
+    println!();
+    if outcome.enqueued > 0 {
+        println!(" The daemon picks these up automatically; nothing else to run.");
+    } else {
+        println!(" \x1b[32m✓\x1b[0m Everything is already indexed.");
+    }
+
+    Ok(())
+}
+
+/// Every configured file in exactly one state, derived from a single
+/// authoritative query each (the vector store's chunk map, the fresh
+/// metadata scan, the DB queue). Priority is indexed > oversize > queued >
+/// not-yet-indexed, so no file is double-counted and none is lost.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RagFileCategories {
+    /// Has chunks in the vector store.
+    pub indexed: std::collections::BTreeSet<String>,
+    /// Over the size limit and not indexed (skipped-for-size).
+    pub oversize: std::collections::BTreeSet<String>,
+    /// In the DB queue and not indexed/oversize (awaiting indexing).
+    pub queued: std::collections::BTreeSet<String>,
+    /// Indexable on disk but in none of the above (never indexed).
+    pub not_yet_indexed: std::collections::BTreeSet<String>,
+}
+
+pub(crate) fn categorize_rag_files(
+    chunk_paths: impl IntoIterator<Item = String>,
+    oversize_files: &[std::path::PathBuf],
+    queued_paths: &[String],
+    indexable_files: &[std::path::PathBuf],
+) -> RagFileCategories {
+    let mut cats = RagFileCategories::default();
+    cats.indexed.extend(chunk_paths);
+    for p in oversize_files {
+        let s = p.to_string_lossy().to_string();
+        if !cats.indexed.contains(&s) {
+            cats.oversize.insert(s);
+        }
+    }
+    for p in queued_paths {
+        if !cats.indexed.contains(p) && !cats.oversize.contains(p) {
+            cats.queued.insert(p.clone());
+        }
+    }
+    for p in indexable_files {
+        let s = p.to_string_lossy().to_string();
+        if !cats.indexed.contains(&s) && !cats.oversize.contains(&s) && !cats.queued.contains(&s) {
+            cats.not_yet_indexed.insert(s);
+        }
+    }
+    cats
+}
+
 async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<()> {
     let config = crate::domain::canopy_config::CanopyConfig::load(data_dir);
 
@@ -164,8 +321,6 @@ async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<
 
     // ── RAG queue ─────────────────────────────────────────────────────
     let queue_items = db.list_rag_queue(10_000).unwrap_or_default();
-    let queued_paths: std::collections::HashSet<&str> =
-        queue_items.iter().map(|q| q.source_path.as_str()).collect();
 
     // ── Events ────────────────────────────────────────────────────────
     let all_events = db.list_rag_events(10_000).unwrap_or_default();
@@ -189,21 +344,43 @@ async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<
     // is the authoritative *current* count for the report.
     let max_bytes = config.rag_max_file_bytes();
     let size_scan = crate::rag::size_report::scan(data_dir, &config.rag_personal_dirs, max_bytes)?;
-    let scan_oversize: std::collections::HashSet<String> = size_scan
-        .oversize_files
-        .iter()
-        .map(|p| p.to_string_lossy().to_string())
-        .collect();
 
-    // Build a unified set of all known files
+    // A file's *current* oversize status: the fresh metadata scan is
+    // authoritative, and a stale "skipped_oversize" event still flags a file
+    // the scan could not see (e.g. a root later unconfigured). If it shrank
+    // and got re-indexed, it has chunks and the indexed state wins, so it is
+    // not flagged.
+    let mut oversize_paths: Vec<std::path::PathBuf> = size_scan.oversize_files.clone();
+    for (file, events) in &events_by_file {
+        if events
+            .first()
+            .is_some_and(|e| e.event_type == "skipped_oversize")
+            && !chunk_counts.contains_key(file)
+            && !oversize_paths.iter().any(|p| p.to_string_lossy() == *file)
+        {
+            oversize_paths.push(std::path::PathBuf::from(file));
+        }
+    }
+
+    // Every configured file in exactly one state, derived from one query
+    // each — the vector store's chunk map is the authoritative "indexed"
+    // count, so the header below cannot disagree with the listing.
+    let queued_list: Vec<String> = queue_items.iter().map(|q| q.source_path.clone()).collect();
+    let cats = categorize_rag_files(
+        chunk_counts.keys().cloned(),
+        &oversize_paths,
+        &queued_list,
+        &size_scan.indexable_files,
+    );
+    let total_on_disk = size_scan.indexable_files.len() + size_scan.oversize_files.len();
+
+    // The listing below is exactly the union of the four states, so its
+    // entry count always reconciles with the header.
     let mut all_files: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    all_files.extend(chunk_counts.keys().cloned());
-    all_files.extend(events_by_file.keys().cloned());
-    all_files.extend(queued_paths.iter().map(|s| s.to_string()));
-    // A configured-but-never-indexed oversize file has no chunk, event, or
-    // queue row — without this it would be invisible in the report, which is
-    // the whole failure CB20 addresses.
-    all_files.extend(scan_oversize.iter().cloned());
+    all_files.extend(cats.indexed.iter().cloned());
+    all_files.extend(cats.oversize.iter().cloned());
+    all_files.extend(cats.queued.iter().cloned());
+    all_files.extend(cats.not_yet_indexed.iter().cloned());
 
     if all_files.is_empty() {
         println!("\n\x1b[1m── Canopy RAG Report ──────────────────────────────────────────\x1b[0m");
@@ -233,19 +410,7 @@ async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<
         crate::rag::status::read_acquisition_state(db, config.embeddings_model.trim()),
     );
 
-    // A file's *current* oversize status: the fresh metadata scan is
-    // authoritative, and a stale "skipped_oversize" event still flags a file
-    // the scan could not see (e.g. a root later unconfigured). If it shrank
-    // and got re-indexed, the scan omits it and the newer "indexed" event
-    // wins, so it is not flagged.
-    let is_oversize = |file: &str| -> bool {
-        scan_oversize.contains(file)
-            || events_by_file
-                .get(file)
-                .and_then(|events| events.first())
-                .is_some_and(|e| e.event_type == "skipped_oversize")
-    };
-    let oversize_count = size_scan.oversize_files.len();
+    let oversize_count = cats.oversize.len();
 
     println!("\n\x1b[1m── Canopy RAG Report ──────────────────────────────────────────\x1b[0m");
     println!(
@@ -286,10 +451,22 @@ async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<
     }
     println!(
         " Total:  {} indexed file(s), {} chunk(s)",
-        chunk_counts.len(),
+        cats.indexed.len(),
         total_chunks
     );
     let cap_mb = max_bytes as f64 / (1024.0 * 1024.0);
+    println!(
+        " On disk: {} file(s) ({} indexable, {} oversize)",
+        total_on_disk,
+        size_scan.indexable_files.len(),
+        size_scan.oversize_files.len()
+    );
+    if !cats.not_yet_indexed.is_empty() {
+        println!(
+            " Not yet indexed: {} file(s) — run 'canopy rag backfill'",
+            cats.not_yet_indexed.len()
+        );
+    }
     println!(" Limit:  {cap_mb:.0} MB per file (config.toml: rag_max_file_mb)");
     // Adjacent to the limit and always printed, even at zero: an excluded
     // file is a visible fact, not an absence nobody notices (CB20).
@@ -311,16 +488,15 @@ async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<
 
     for file in &all_files {
         let chunks = chunk_counts.get(file).copied().unwrap_or(0);
-        let in_queue = queued_paths.contains(file.as_str());
+        let in_queue = cats.queued.contains(file);
         let events = events_by_file
             .get(file)
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
 
-        let indexed_count = events.iter().filter(|e| e.event_type == "indexed").count();
         let deleted_count = events.iter().filter(|e| e.event_type == "deleted").count();
         let last_error = events.iter().find(|e| e.event_type == "error");
-        let file_is_oversize = is_oversize(file);
+        let file_is_oversize = cats.oversize.contains(file);
 
         // Status icon
         let status = if file_is_oversize {
@@ -338,21 +514,29 @@ async fn handle_rag_report(data_dir: &std::path::Path, db: &Database) -> Result<
         let short = short_path(file);
         println!("\n  {} {}", status, short);
         if file_is_oversize {
-            if let Some(size_bytes) = events.first().and_then(|e| e.detail.as_deref()) {
-                if let Ok(bytes) = size_bytes.parse::<u64>() {
-                    println!(
-                        "     \x1b[35moversize\x1b[0m: {:.1} MB (exceeds {:.0} MB limit — skipped)",
-                        bytes as f64 / (1024.0 * 1024.0),
-                        cap_mb
-                    );
-                }
+            let size_bytes: Option<u64> = events
+                .first()
+                .and_then(|e| e.detail.as_deref())
+                .and_then(|d| d.parse().ok())
+                .or_else(|| std::fs::metadata(file).ok().map(|m| m.len()));
+            if let Some(bytes) = size_bytes {
+                println!(
+                    "     \x1b[35moversize\x1b[0m: {:.1} MB (exceeds {:.0} MB limit — skipped)",
+                    bytes as f64 / (1024.0 * 1024.0),
+                    cap_mb
+                );
+            } else {
+                println!(
+                    "     \x1b[35moversize\x1b[0m: exceeds {:.0} MB limit — skipped",
+                    cap_mb
+                );
             }
         }
         if chunks > 0 {
             println!("     chunks: {}", chunks);
         }
-        if indexed_count > 0 {
-            println!("     indexed: {} time(s)", indexed_count);
+        if cats.not_yet_indexed.contains(file) {
+            println!("     not yet indexed — run 'canopy rag backfill'");
         }
         if deleted_count > 0 {
             println!("     purged:  {} time(s)", deleted_count);
@@ -627,5 +811,222 @@ mod tests {
     fn format_ts_has_time() {
         let result = format_ts(1700000000);
         assert!(result.contains(":"));
+    }
+
+    // ── CB35: backfill + unified counting ──────────────────────────
+
+    fn cb35_fixture_dirs() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        Vec<std::path::PathBuf>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let rag_dir = dir.path().join("docs");
+        std::fs::create_dir_all(&rag_dir).unwrap();
+        let mut files = Vec::new();
+        for i in 0..5 {
+            let p = rag_dir.join(format!("file{i}.md"));
+            std::fs::write(&p, format!("# File {i}\n")).unwrap();
+            files.push(p);
+        }
+        (dir, rag_dir, files)
+    }
+
+    /// Given a store holding a subset of the configured files, the backfill
+    /// indexes exactly the remainder and reports those numbers.
+    #[test]
+    fn backfill_indexes_exactly_the_remainder() {
+        let (dir, _rag_dir, files) = cb35_fixture_dirs();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        // 2 of the 5 files are already in the store.
+        let indexed: std::collections::HashSet<String> = files[..2]
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+
+        let outcome = run_backfill(&db, &files, &indexed, now);
+
+        assert_eq!(outcome.indexable_on_disk, 5);
+        assert_eq!(outcome.already_indexed, 2);
+        assert_eq!(outcome.enqueued, 3);
+        // Exactly the 3 missing files hit the queue — no more, no fewer.
+        let pending = db.list_rag_queue(100).unwrap();
+        assert_eq!(pending.len(), 3);
+        let queued: std::collections::HashSet<String> =
+            pending.into_iter().map(|q| q.source_path).collect();
+        for p in &files[2..] {
+            assert!(
+                queued.contains(&p.to_string_lossy().to_string()),
+                "missing file should be queued: {}",
+                p.display()
+            );
+        }
+        for p in &files[..2] {
+            assert!(
+                !queued.contains(&p.to_string_lossy().to_string()),
+                "already-indexed file must not be re-enqueued: {}",
+                p.display()
+            );
+        }
+    }
+
+    /// Running the backfill twice embeds nothing the second time: re-running
+    /// against unchanged progress does not duplicate queue rows (upsert), and
+    /// once the remainder is indexed the second run enqueues zero files.
+    #[test]
+    fn backfill_second_run_embeds_nothing() {
+        let (dir, _rag_dir, files) = cb35_fixture_dirs();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        let indexed: std::collections::HashSet<String> = files[..2]
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        let first = run_backfill(&db, &files, &indexed, now);
+        assert_eq!(first.enqueued, 3);
+
+        // Same progress, immediate re-run: upsert keeps 3 rows, not 6.
+        let retry = run_backfill(&db, &files, &indexed, now + 1);
+        assert_eq!(retry.enqueued, 3);
+        assert_eq!(db.list_rag_queue(100).unwrap().len(), 3);
+
+        // Daemon indexed the remainder (queue drained, store now complete).
+        for q in db.list_rag_queue(100).unwrap() {
+            db.remove_rag_item(&q.source_path).unwrap();
+        }
+        let all_indexed: std::collections::HashSet<String> = files
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        let second = run_backfill(&db, &files, &all_indexed, now + 2);
+        assert_eq!(second.enqueued, 0);
+        assert_eq!(second.already_indexed, 5);
+        assert!(db.list_rag_queue(100).unwrap().is_empty());
+    }
+
+    /// The report's claimed file count equals the number of entries it lists:
+    /// the header is derived from the same categorized set as the listing, so
+    /// they cannot diverge, and no per-file line can outnumber the files.
+    #[test]
+    fn report_claimed_count_equals_entries_listed() {
+        let indexed_paths = vec!["/docs/a.md".to_string(), "/docs/b.md".to_string()];
+        let oversize = vec![std::path::PathBuf::from("/docs/big.md")];
+        let queued = vec!["/docs/c.md".to_string()];
+        let indexable = vec![
+            std::path::PathBuf::from("/docs/a.md"),
+            std::path::PathBuf::from("/docs/b.md"),
+            std::path::PathBuf::from("/docs/c.md"),
+            std::path::PathBuf::from("/docs/d.md"),
+        ];
+        let cats = categorize_rag_files(indexed_paths, &oversize, &queued, &indexable);
+
+        // Header count ...
+        let claimed = cats.indexed.len();
+        // ... equals the number of entries listed as indexed.
+        assert_eq!(claimed, 2);
+        let mut listed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        listed.extend(cats.indexed.iter().cloned());
+        listed.extend(cats.oversize.iter().cloned());
+        listed.extend(cats.queued.iter().cloned());
+        listed.extend(cats.not_yet_indexed.iter().cloned());
+        let listed_indexed = listed.intersection(&cats.indexed).count();
+        assert_eq!(listed_indexed, claimed);
+        // States are disjoint: the union holds each file exactly once.
+        assert_eq!(
+            listed.len(),
+            cats.indexed.len()
+                + cats.oversize.len()
+                + cats.queued.len()
+                + cats.not_yet_indexed.len()
+        );
+    }
+
+    /// Indexed plus skipped-for-size plus queued plus not-yet-indexed equals
+    /// the files found on the configured roots (real filesystem scan).
+    #[test]
+    fn indexed_plus_skipped_plus_queued_plus_not_yet_equals_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("docs");
+        std::fs::create_dir_all(&root).unwrap();
+        // 4 small indexable files + 2 big ones (over a 100-byte limit).
+        for i in 0..4 {
+            std::fs::write(root.join(format!("small{i}.md")), b"tiny").unwrap();
+        }
+        for i in 0..2 {
+            std::fs::write(root.join(format!("big{i}.md")), vec![b'x'; 200]).unwrap();
+        }
+        let data_dir = dir.path().join(".canopy");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let scan =
+            crate::rag::size_report::scan(&data_dir, &[root.to_string_lossy().to_string()], 100)
+                .unwrap();
+        assert_eq!(scan.indexable_files.len(), 4);
+        assert_eq!(scan.oversize_files.len(), 2);
+
+        // 1 file already indexed, 1 file queued.
+        let indexed_paths = vec![scan.indexable_files[0].to_string_lossy().to_string()];
+        let queued = vec![scan.indexable_files[1].to_string_lossy().to_string()];
+        let cats = categorize_rag_files(
+            indexed_paths,
+            &scan.oversize_files,
+            &queued,
+            &scan.indexable_files,
+        );
+
+        let total_on_disk = scan.indexable_files.len() + scan.oversize_files.len();
+        assert_eq!(
+            cats.indexed.len()
+                + cats.oversize.len()
+                + cats.queued.len()
+                + cats.not_yet_indexed.len(),
+            total_on_disk,
+            "every configured file must sit in exactly one state"
+        );
+        assert_eq!(cats.indexed.len(), 1);
+        assert_eq!(cats.oversize.len(), 2);
+        assert_eq!(cats.queued.len(), 1);
+        assert_eq!(cats.not_yet_indexed.len(), 2);
+    }
+
+    /// A file over the size limit is reported as skipped-for-size, not as missing.
+    #[test]
+    fn oversize_file_reported_as_skipped_not_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("docs");
+        std::fs::create_dir_all(&root).unwrap();
+        let big = root.join("huge.md");
+        std::fs::write(&big, vec![b'x'; 500]).unwrap();
+        let small = root.join("ok.md");
+        std::fs::write(&small, b"fine").unwrap();
+
+        let data_dir = dir.path().join(".canopy");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let scan =
+            crate::rag::size_report::scan(&data_dir, &[root.to_string_lossy().to_string()], 100)
+                .unwrap();
+
+        let cats =
+            categorize_rag_files(Vec::new(), &scan.oversize_files, &[], &scan.indexable_files);
+        let big_str = big.to_string_lossy().to_string();
+        assert!(
+            cats.oversize.contains(&big_str),
+            "oversize file must be skipped-for-size"
+        );
+        assert!(
+            !cats.not_yet_indexed.contains(&big_str),
+            "oversize file must not read as missing/never-indexed"
+        );
+        assert_eq!(cats.not_yet_indexed.len(), 1);
+    }
+
+    /// `canopy rag backfill` is a real subcommand (not just a helper): the
+    /// watcher (`auto-index start`) must stay a separate operation.
+    #[test]
+    fn backfill_parses_as_canopy_rag_backfill() {
+        let cli = TestCli::try_parse_from(["test", "backfill"]).expect("'backfill' should parse");
+        assert!(matches!(cli.action, RagAction::Backfill));
     }
 }

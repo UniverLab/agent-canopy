@@ -684,14 +684,14 @@ pub(crate) async fn run_doctor() -> Result<()> {
                                 .count();
 
                             if disk_files > 0 && (unique as usize) < disk_files {
+                                let unindexed = disk_files - unique as usize;
                                 println!(
                                     " \x1b[33m⚠\x1b[0m {disk_files} indexable file(s) on disk but only {unique} indexed — \
-                                     check daemon logs for embedding errors"
+                                     {unindexed} not yet indexed"
                                 );
-                                issues.push(
-                                    "Some files may not be indexed — verify API key and daemon logs"
-                                        .to_string(),
-                                );
+                                issues.push(format!(
+                                    "{unindexed} file(s) are not yet indexed — run 'canopy rag backfill' to index them"
+                                ));
                             }
                         }
                     } else {
