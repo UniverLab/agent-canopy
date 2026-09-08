@@ -59,6 +59,10 @@ pub enum LoopResetOutcome {
     InvalidSpec(String),
     Reset {
         spec_count: usize,
+        /// Number of administratively skipped specs preserved by a blanket
+        /// reset. Explicit resets report zero because they intentionally
+        /// reopen every named target.
+        skipped_count: usize,
     },
 }
 
@@ -1549,9 +1553,15 @@ mod tests {
 
     #[test]
     fn loop_reset_outcome_reset_carries_count() {
-        let outcome = LoopResetOutcome::Reset { spec_count: 5 };
+        let outcome = LoopResetOutcome::Reset {
+            spec_count: 5,
+            skipped_count: 0,
+        };
         match outcome {
-            LoopResetOutcome::Reset { spec_count } => assert_eq!(spec_count, 5),
+            LoopResetOutcome::Reset {
+                spec_count,
+                skipped_count: _,
+            } => assert_eq!(spec_count, 5),
             _ => panic!("expected Reset"),
         }
     }
@@ -1565,7 +1575,10 @@ mod tests {
             started_at: chrono::Utc::now(),
         };
         let invalid = LoopResetOutcome::InvalidSpec("x".to_string());
-        let reset = LoopResetOutcome::Reset { spec_count: 0 };
+        let reset = LoopResetOutcome::Reset {
+            spec_count: 0,
+            skipped_count: 0,
+        };
         assert_ne!(format!("{not_found:?}"), format!("{in_flight:?}"));
         assert_ne!(format!("{invalid:?}"), format!("{reset:?}"));
     }
@@ -2177,7 +2190,10 @@ mod tests {
                 started_at: chrono::Utc::now(),
             },
             LoopResetOutcome::InvalidSpec("x".to_string()),
-            LoopResetOutcome::Reset { spec_count: 3 },
+            LoopResetOutcome::Reset {
+                spec_count: 3,
+                skipped_count: 0,
+            },
         ];
         for o in outcomes {
             let cloned = o.clone();

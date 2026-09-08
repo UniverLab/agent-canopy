@@ -2526,7 +2526,10 @@ fn active_run_queue_id_migration_is_idempotent_and_a_pre_b8_database_opens_clean
     let outcome = db.reset_loop("legacy-loop", None).unwrap();
     assert_eq!(
         outcome,
-        crate::domain::loops::LoopResetOutcome::Reset { spec_count: 1 }
+        crate::domain::loops::LoopResetOutcome::Reset {
+            spec_count: 1,
+            skipped_count: 0
+        }
     );
     drop(db);
 

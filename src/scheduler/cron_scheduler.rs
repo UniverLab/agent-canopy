@@ -436,12 +436,16 @@ impl CronScheduler {
 
             if lp.status == LoopStatus::Failed {
                 match self.db.reset_loop(&lp.id, None)? {
-                    LoopResetOutcome::Reset { spec_count } => {
+                    LoopResetOutcome::Reset {
+                        spec_count,
+                        skipped_count,
+                    } => {
                         tracing::info!(
-                            "Loop '{}' was failed; auto-reset by its schedule ({} spec(s) reset) \
+                            "Loop '{}' was failed; auto-reset by its schedule ({} spec(s) reset, {} skipped preserved) \
                              and resuming",
                             lp.id,
-                            spec_count
+                            spec_count,
+                            skipped_count
                         );
                     }
                     other => {
@@ -1187,7 +1191,142 @@ mod tests {
         );
     }
 
-    /// C1's regression test — the real sequence: a loop is genuinely
+    /// CB27: the unattended quota autorun must preserve administratively
+    /// skipped specs the same way a manual blanket reset does.
+    #[tokio::test]
+    async fn fire_due_autorun_loops_preserves_admin_skipped_specs() {
+        use crate::domain::loops::{
+            Loop, LoopNode, LoopNodeKind, LoopSpec, LoopSpecStatus, LoopStatus,
+        };
+
+        let (db, scheduler) = test_scheduler_with_loops();
+        let workdir = tempfile::tempdir().unwrap();
+        let loop_id = "failed-autorun-admin-skip".to_string();
+        db.insert_loop(&Loop {
+            archived: false,
+            paused_by_reconciliation: false,
+            infra_node_id: None,
+            id: loop_id.clone(),
+            name: "Autorun admin-skip test".to_string(),
+            description: None,
+            workdir: workdir.path().to_string_lossy().to_string(),
+            status: LoopStatus::Failed,
+            trigger: None,
+            created_at: Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            on_completed: None,
+        })
+        .unwrap();
+        // One failed spec — will be reset and resumed.
+        db.insert_loop_spec(&LoopSpec {
+            id: "spec-failed".to_string(),
+            loop_id: Some(loop_id.clone()),
+            name: "Failed spec".to_string(),
+            description: Some(
+                "Functional Requirements:\n- A\n\nNon-Functional Requirements:\n- B\n\nObjective:\n- C\n\nConstraints:\n- D\n\nGuidelines:\n- E\n\nIn Scope:\n- F\n\nOut of Scope:\n- G".to_string(),
+            ),
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Failed,
+            started_at: None,
+            completed_at: None,
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: None,
+            completed_via_reason: None,
+            completed_via_at: None,
+        })
+        .unwrap();
+        // One admin-skipped spec — must survive the autorun reset.
+        db.insert_loop_spec(&LoopSpec {
+            id: "spec-admin-skipped".to_string(),
+            loop_id: Some(loop_id.clone()),
+            name: "Admin skipped spec".to_string(),
+            description: None,
+            position: 2,
+            parallelizable: false,
+            status: LoopSpecStatus::Skipped,
+            started_at: None,
+            completed_at: Some(Utc::now()),
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: Some("admin".to_string()),
+            completed_via_reason: Some("premise false".to_string()),
+            completed_via_at: Some(Utc::now()),
+        })
+        .unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-check".to_string(),
+            spec_id: None,
+            loop_id: Some(loop_id.clone()),
+            name: "check".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: Utc::now(),
+        })
+        .unwrap();
+        db.schedule_loop_autorun(&loop_id, Utc::now() - chrono::Duration::minutes(1))
+            .unwrap();
+
+        scheduler.fire_due_autorun_loops(Utc::now()).unwrap();
+
+        // Synchronous assertions — before the background resume can finish.
+        let lp = db.get_loop(&loop_id).unwrap().unwrap();
+        assert!(lp.autorun_at.is_none(), "firing must clear autorun_at");
+
+        let admin_skip = db.get_loop_spec("spec-admin-skipped").unwrap().unwrap();
+        assert_eq!(
+            admin_skip.status,
+            LoopSpecStatus::Skipped,
+            "admin-skipped spec must survive the autorun reset"
+        );
+        assert_eq!(
+            admin_skip.completed_via.as_deref(),
+            Some("admin"),
+            "admin provenance must be preserved"
+        );
+
+        let failed_spec = db.get_loop_spec("spec-failed").unwrap().unwrap();
+        assert_ne!(
+            failed_spec.status,
+            LoopSpecStatus::Failed,
+            "the failed spec must be reset off Failed"
+        );
+
+        // Wait for the resumed run to complete.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let lp = db.get_loop(&loop_id).unwrap().unwrap();
+            if lp.status == LoopStatus::Completed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "resumed run did not complete in time; loop status is {:?}",
+                lp.status
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Final assertion — the admin skip must still be skipped after the run.
+        let admin_skip = db.get_loop_spec("spec-admin-skipped").unwrap().unwrap();
+        assert_eq!(
+            admin_skip.status,
+            LoopSpecStatus::Skipped,
+            "admin-skipped spec must remain skipped after the resumed run"
+        );
+    }
     /// `Running` when the daemon dies uncleanly; `reconcile_orphaned_loops`
     /// (as it would run at the next boot) pauses it and marks its dangling
     /// run interrupted; the resilience node's `loop_schedule_autorun` is

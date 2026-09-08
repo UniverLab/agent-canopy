@@ -11910,7 +11910,10 @@ echo done
             .unwrap();
         assert!(matches!(
             outcome,
-            crate::domain::loops::LoopResetOutcome::Reset { spec_count: 1 }
+            crate::domain::loops::LoopResetOutcome::Reset {
+                spec_count: 1,
+                skipped_count: 0
+            }
         ));
         assert_eq!(
             db.get_loop_spec_cross_run_attempts(&spec_id).unwrap(),

@@ -1503,31 +1503,35 @@ fn perform_loop_reset(
     loop_id: &str,
     specs: Option<&[String]>,
 ) -> Result<CallToolResult, McpError> {
-    let spec_count = match db.reset_loop(loop_id, specs).map_err(internal_error)? {
-        LoopResetOutcome::NotFound => {
-            return Ok(error_result(&format!("Loop '{loop_id}' not found.")));
-        }
+    match db.reset_loop(loop_id, specs).map_err(internal_error)? {
+        LoopResetOutcome::NotFound => Ok(error_result(&format!("Loop '{loop_id}' not found."))),
         LoopResetOutcome::InFlight {
             run_id,
             node_id,
             started_at,
         } => {
             let node_name = node_name_for_error(db, &node_id).map_err(internal_error)?;
-            return Ok(error_result(&in_flight_run_error(
+            Ok(error_result(&in_flight_run_error(
                 loop_id, &run_id, &node_name, started_at,
-            )));
+            )))
         }
-        LoopResetOutcome::InvalidSpec(id) => {
-            return Ok(error_result(&format!(
-                "Spec '{id}' does not belong to loop '{loop_id}'."
-            )));
+        LoopResetOutcome::InvalidSpec(id) => Ok(error_result(&format!(
+            "Spec '{id}' does not belong to loop '{loop_id}'."
+        ))),
+        LoopResetOutcome::Reset {
+            spec_count,
+            skipped_count,
+        } => {
+            let skipped_note = if skipped_count > 0 {
+                format!(" {skipped_count} skipped spec(s) preserved.")
+            } else {
+                String::new()
+            };
+            Ok(success_result(&format!(
+                "Loop '{loop_id}' reset to pending; {spec_count} spec(s) reset.{skipped_note}"
+            )))
         }
-        LoopResetOutcome::Reset { spec_count } => spec_count,
-    };
-
-    Ok(success_result(&format!(
-        "Loop '{loop_id}' reset to pending; {spec_count} spec(s) reset."
-    )))
+    }
 }
 
 /// Resolve the exact node run a `loop_complete_node`/`loop_report_blocker`
@@ -9689,6 +9693,150 @@ mod tests {
         let spec = db.get_loop_spec("spec-done").unwrap().unwrap();
         assert_eq!(spec.status, LoopSpecStatus::Pending);
         assert!(spec.completed_at.is_none());
+    }
+
+    #[test]
+    fn loop_reset_blanket_preserves_admin_skipped_specs() {
+        let (_dir, db, loop_id) = loop_reset_fixture(LoopStatus::Failed);
+        // Administrative skip — must survive blanket reset.
+        db.insert_loop_spec(&LoopSpec {
+            id: "spec-admin-skipped".to_string(),
+            loop_id: Some(loop_id.clone()),
+            name: "admin-skipped".to_string(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Skipped,
+            started_at: None,
+            completed_at: Some(chrono::Utc::now()),
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: Some("admin".to_string()),
+            completed_via_reason: Some("premise false".to_string()),
+            completed_via_at: Some(chrono::Utc::now()),
+        })
+        .unwrap();
+        db.insert_loop_spec(&spec_with_status(
+            &loop_id,
+            "spec-failed",
+            2,
+            LoopSpecStatus::Failed,
+        ))
+        .unwrap();
+
+        let result = perform_loop_reset(&db, &loop_id, None).unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+
+        let specs = db.list_loop_specs(&loop_id).unwrap();
+        let skipped = specs.iter().find(|s| s.id == "spec-admin-skipped").unwrap();
+        let failed = specs.iter().find(|s| s.id == "spec-failed").unwrap();
+        assert_eq!(
+            skipped.status,
+            LoopSpecStatus::Skipped,
+            "admin-skipped spec must survive a blanket reset"
+        );
+        assert_eq!(failed.status, LoopSpecStatus::Pending);
+
+        let text = format!("{:?}", result.content);
+        assert!(text.contains("1 spec(s) reset"), "{text}");
+        assert!(text.contains("1 skipped spec(s) preserved"), "{text}");
+    }
+
+    #[test]
+    fn loop_reset_blanket_resets_engine_skipped_spec() {
+        let (_dir, db, loop_id) = loop_reset_fixture(LoopStatus::Failed);
+        // Engine-produced skip (no admin provenance) — must be reset.
+        db.insert_loop_spec(&spec_with_status(
+            &loop_id,
+            "spec-engine-skipped",
+            1,
+            LoopSpecStatus::Skipped,
+        ))
+        .unwrap();
+
+        let result = perform_loop_reset(&db, &loop_id, None).unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+
+        let spec = db.get_loop_spec("spec-engine-skipped").unwrap().unwrap();
+        assert_eq!(
+            spec.status,
+            LoopSpecStatus::Pending,
+            "engine-skipped spec must be reset by blanket reset"
+        );
+
+        let text = format!("{:?}", result.content);
+        assert!(text.contains("1 spec(s) reset"), "{text}");
+        assert!(
+            !text.contains("skipped"),
+            "engine-skipped spec must not be counted as preserved: {text}"
+        );
+    }
+
+    #[test]
+    fn loop_reset_explicit_specs_resets_skipped_spec_and_clears_provenance() {
+        let (_dir, db, loop_id) = loop_reset_fixture(LoopStatus::Failed);
+        db.insert_loop_spec(&LoopSpec {
+            id: "spec-admin-skipped".to_string(),
+            loop_id: Some(loop_id.clone()),
+            name: "admin-skipped".to_string(),
+            description: None,
+            position: 1,
+            parallelizable: false,
+            status: LoopSpecStatus::Skipped,
+            started_at: None,
+            completed_at: Some(chrono::Utc::now()),
+            spec_start_head: None,
+            spec_committed_head: None,
+            workdir: None,
+            completed_via: Some("admin".to_string()),
+            completed_via_reason: Some("premise false".to_string()),
+            completed_via_at: Some(chrono::Utc::now()),
+        })
+        .unwrap();
+
+        let result =
+            perform_loop_reset(&db, &loop_id, Some(&["spec-admin-skipped".to_string()])).unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+
+        let spec = db.get_loop_spec("spec-admin-skipped").unwrap().unwrap();
+        assert_eq!(
+            spec.status,
+            LoopSpecStatus::Pending,
+            "explicitly naming a skipped spec must reset it"
+        );
+        assert!(
+            spec.completed_via.is_none(),
+            "explicit reset must clear completed_via"
+        );
+        assert!(
+            spec.completed_via_reason.is_none(),
+            "explicit reset must clear completed_via_reason"
+        );
+        assert!(
+            spec.completed_via_at.is_none(),
+            "explicit reset must clear completed_via_at"
+        );
+    }
+
+    #[test]
+    fn loop_reset_no_skipped_specs_omits_preserved_note() {
+        let (_dir, db, loop_id) = loop_reset_fixture(LoopStatus::Failed);
+        db.insert_loop_spec(&spec_with_status(
+            &loop_id,
+            "spec-failed",
+            1,
+            LoopSpecStatus::Failed,
+        ))
+        .unwrap();
+
+        let result = perform_loop_reset(&db, &loop_id, None).unwrap();
+        let text = format!("{:?}", result.content);
+        assert!(text.contains("1 spec(s) reset"), "{text}");
+        assert!(
+            !text.contains("skipped"),
+            "no skipped note when no specs were skipped: {text}"
+        );
     }
 
     /// A loop whose last run was against a queue has empty (or irrelevant)

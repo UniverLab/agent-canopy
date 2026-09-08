@@ -502,6 +502,9 @@ impl Database {
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         let rows = conn.execute(
             "UPDATE loop_specs SET status = ?1, started_at = NULL, completed_at = NULL, spec_start_head = NULL, spec_committed_head = NULL,
+                 completed_via = CASE WHEN ?3 THEN NULL ELSE completed_via END,
+                 completed_via_reason = CASE WHEN ?3 THEN NULL ELSE completed_via_reason END,
+                 completed_via_at = CASE WHEN ?3 THEN NULL ELSE completed_via_at END,
                  cross_run_attempts = CASE WHEN ?3 THEN 0 ELSE cross_run_attempts END
              WHERE id = ?2",
             params![
@@ -614,10 +617,13 @@ impl Database {
     }
 
     /// The single state-transition path behind `loop_reset` — resets a loop
-    /// (and, without `specs`, every non-completed spec) back to `pending` so
-    /// it can be relaunched. Shared by the `loop_reset` MCP tool and the
-    /// scheduler's auto-reset-and-resume of a `failed` loop on autorun, so
-    /// there is exactly one place that knows how to unstick a loop.
+    /// (and, without `specs`, every non-completed spec except an
+    /// administratively skipped spec) back to `pending` so it can be
+    /// relaunched. Shared by the `loop_reset` MCP tool and the scheduler's
+    /// auto-reset-and-resume of a `failed` loop on autorun, so there is exactly
+    /// one place that knows how to unstick a loop. The returned
+    /// `skipped_count` reports administratively skipped specs preserved by a
+    /// blanket reset.
     ///
     /// When the loop's last run was against a queue (`active_run_queue_id` is
     /// set), the queue's *members* are what actually need resetting — the
@@ -675,7 +681,11 @@ impl Database {
             }
             None => eligible_specs
                 .iter()
-                .filter(|spec| spec.status != LoopSpecStatus::Completed)
+                .filter(|spec| {
+                    spec.status != LoopSpecStatus::Completed
+                        && !(spec.status == LoopSpecStatus::Skipped
+                            && spec.completed_via.as_deref() == Some("admin"))
+                })
                 .map(|spec| spec.id.clone())
                 .collect(),
         };
@@ -698,8 +708,21 @@ impl Database {
         }
         self.reset_loop_status(loop_id)?;
 
+        let skipped_count = if specs.is_none() {
+            eligible_specs
+                .iter()
+                .filter(|spec| {
+                    spec.status == LoopSpecStatus::Skipped
+                        && spec.completed_via.as_deref() == Some("admin")
+                })
+                .count()
+        } else {
+            0
+        };
+
         Ok(LoopResetOutcome::Reset {
             spec_count: target_ids.len(),
+            skipped_count,
         })
     }
 
@@ -709,8 +732,8 @@ impl Database {
             .lock()
             .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
         conn.execute(
-            "INSERT INTO loop_specs (id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir, spec_committed_head)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO loop_specs (id, loop_id, name, description, position, parallelizable, status, started_at, completed_at, spec_start_head, workdir, spec_committed_head, completed_via, completed_via_reason, completed_via_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 &spec.id,
                 &spec.loop_id,
@@ -724,6 +747,9 @@ impl Database {
                 &spec.spec_start_head,
                 &spec.workdir,
                 &spec.spec_committed_head,
+                &spec.completed_via,
+                &spec.completed_via_reason,
+                spec.completed_via_at.map(|value| value.timestamp()),
             ],
         )?;
         Ok(())
