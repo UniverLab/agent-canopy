@@ -6647,7 +6647,7 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "loop_preflight",
-        description = "Probe every distinct platform+model pair a loop's agent nodes, ensemble members, and on_completed hook reference — before spending a real loop_run on a harness that's installed and configured but can't actually produce a response. A platform used by several nodes is probed once, not once per node; the result names every node/hook that references a failing pair. Verdict is based on response content, not exit code (see agent_probe): a pair the harness silently answers with a substituted model, or one whose CLI has no way to select a model explicitly, is never reported reachable — `would_fail` counts confirmed failures and `unknown` counts pairs that couldn't be validated, kept separate so an unvalidated pair is never mistaken for a passing one. Spends real tokens/quota per distinct pair — call this explicitly before loop_run, never automatically."
+        description = "Probe every distinct platform+model pair a loop's agent nodes, ensemble members, and on_completed hook reference — before spending a real loop_run on a harness that's installed and configured but can't actually produce a response. A platform used by several nodes is probed once, not once per node; the result names every node/hook that references a failing pair. Verdict is based on response content, not exit code (see agent_probe): a pair the harness silently answers with a substituted model, or one whose CLI has no way to select a model explicitly, is never reported reachable — `would_fail` counts confirmed failures and `unknown` counts pairs that couldn't be validated, kept separate so an unvalidated pair is never mistaken for a passing one. Spends real tokens/quota per distinct pair — call this explicitly before loop_run, never automatically. When 'reviewer' names a platform+model pair, additionally spawns a background design-review agent (see 'review' in the output); collect it with subagent_collect. The review never blocks or fails the probe results."
     )]
     async fn loop_preflight(
         &self,
@@ -6777,6 +6777,25 @@ impl TaskTriggerHandler {
             .collect();
 
         let loop_targets = crate::daemon::probe::distinct_targets_for_loop(&details);
+        // (CB25) Spawn the design reviewer BEFORE the no-target early return
+        // so a review is available on both success shapes. `spawn_subagent`
+        // returns an id immediately and never blocks, so the reviewer works
+        // while the probes run below. Failures degrade to `not_spawned` and
+        // never fail the preflight itself.
+        let reviewer_out: Option<serde_json::Value> = match &params.reviewer {
+            None => None,
+            Some(r) => Some(
+                spawn_preflight_reviewer(
+                    self,
+                    &details.lp.id,
+                    details.lp.active_run_queue_id.as_deref(),
+                    &details.lp.workdir,
+                    &r.platform,
+                    r.model.as_deref(),
+                )
+                .await,
+            ),
+        };
         if loop_targets.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -6786,6 +6805,7 @@ impl TaskTriggerHandler {
                         params.loop_id
                     ),
                     "spec_warnings": spec_warnings,
+                    "review": reviewer_out,
                 }))
                 .unwrap_or_default(),
             )]));
@@ -6863,6 +6883,7 @@ impl TaskTriggerHandler {
                 "probes": probes,
                 "effort_warnings": effort_warnings,
                 "spec_warnings": spec_warnings,
+                "review": reviewer_out,
             }))
             .unwrap_or_default(),
         )]))
@@ -7897,6 +7918,147 @@ impl TaskTriggerHandler {
             ))),
             Err(e) => Ok(error_result(&e.to_string())),
         }
+    }
+}
+
+/// (CB25) Build the design-review prompt for a `loop_preflight` reviewer.
+/// The full audit checklist lives in the `loop-reviewer` skill — never
+/// duplicated here. The fallback checklist below is used ONLY when the
+/// skill cannot be resolved, and names the areas, not the checks.
+fn build_preflight_reviewer_prompt(
+    loop_id: &str,
+    queue_id: Option<&str>,
+    skill_section: &str,
+) -> String {
+    let mut prompt = String::from(
+        "You are auditing a canopy loop's DESIGN, not its reachability. Audit ONLY: do not modify the graph, the specs, or any file (no loop_* mutation tools, no file writes).",
+    );
+    prompt.push_str(&format!(" Target: loop_id='{loop_id}'"));
+    if let Some(qid) = queue_id {
+        prompt.push_str(&format!(" queue_id='{qid}'."));
+    } else {
+        prompt.push('.');
+    }
+    prompt.push_str(
+        " Read the loop with loop_get (and queue_list for the queue) through the MCP surface.",
+    );
+    prompt.push_str(
+        " Load the 'loop-reviewer' skill with skill_get; if the skill text is appended below under '## Skill: loop-reviewer', that IS its content — do not fetch again.",
+    );
+    prompt.push_str(skill_section);
+    prompt.push_str(
+        " Fallback areas (only if the skill is missing): graph (single entry, no unreachable node, pass+fail on every agent node, paired ops balanced); specs (decided, one repo each, seven sections, one language, no unsourced factual claims); model economy (expensive model placement, cost of one rejection, resume, commit rights, context groups, pinned skills); prompts (finish the turn, continue from work on disk).",
+    );
+    prompt.push_str(
+        " Order findings by severity, name the SINGLE item to fix first, and close with an advisory verdict. Your verdict does not block the run — the caller decides.",
+    );
+    prompt
+}
+
+/// (CB25) Resolve the `loop-reviewer` skill for the preflight reviewer
+/// prompt. Success inlines the instructions under the pinned-skill
+/// delimiter; anything else degrades to the unresolved note and the
+/// reviewer still spawns. Blocking (git/network), so the caller runs it
+/// via `spawn_blocking`.
+fn resolve_reviewer_skill_section(store: &crate::dynamic_skills::SkillStore) -> String {
+    match store.get("loop-reviewer") {
+        Ok(content) => format!("\n\n## Skill: loop-reviewer\n{}", content.instructions),
+        Err(_) => "\n\n## Skill: loop-reviewer\n_Could not resolve pinned skill 'loop-reviewer' — continuing without it._"
+            .to_string(),
+    }
+}
+
+/// (CB25) Spawn the `loop_preflight` design reviewer. NEVER returns Err:
+/// every failure degrades to a `not_spawned` note so the reviewer can
+/// never fail the preflight itself.
+async fn spawn_preflight_reviewer(
+    handler: &TaskTriggerHandler,
+    loop_id: &str,
+    queue_id: Option<&str>,
+    workdir: &str,
+    platform: &str,
+    model: Option<&str>,
+) -> serde_json::Value {
+    let pair = format!("{platform}/{}", model.unwrap_or("default"));
+    // `Cli::strategy()` panics for a platform missing from the canopy
+    // config (and `find_platform` errors for names outside the registry),
+    // so pre-validate here: an unconfigured reviewer platform degrades to
+    // `not_spawned` instead of panicking the preflight itself. Mirrors
+    // `Cli::strategy`'s home resolution (`CANOPY_HOME_OVERRIDE` first).
+    let home = std::env::var_os("CANOPY_HOME_OVERRIDE")
+        .map(std::path::PathBuf::from)
+        .or_else(dirs::home_dir);
+    let configured =
+        home.map(|h| crate::domain::canopy_config::CanopyConfig::load(&h.join(".canopy")));
+    if configured
+        .as_ref()
+        .and_then(|c| c.get_cli(platform))
+        .is_none()
+    {
+        return serde_json::json!({
+            "status": "not_spawned",
+            "platform": platform,
+            "model": model,
+            "pair": pair,
+            "note": format!("Reviewer platform '{platform}' is not configured in canopy; probes above are unaffected."),
+        });
+    }
+    let store = Arc::clone(&handler.dynamic_skills);
+    let skill_section =
+        match tokio::task::spawn_blocking(move || resolve_reviewer_skill_section(&store)).await {
+            Ok(section) => section,
+            Err(_) => resolve_reviewer_skill_section(&handler.dynamic_skills),
+        };
+    let prompt = build_preflight_reviewer_prompt(loop_id, queue_id, &skill_section);
+    // Run the spawn in its own task so a panic inside `spawn_subagent`
+    // (e.g. `fetch_registry`'s `reqwest::blocking` client, which cannot
+    // drop its runtime in an async context under `debug_assertions`)
+    // is captured as a `JoinError` and degrades to `not_spawned`
+    // instead of taking down the preflight. Owned clones keep the
+    // future `'static`; the monitor task it leaves behind still joins
+    // the shared runtime, so a successful spawn is unaffected.
+    let db = Arc::clone(&handler.db);
+    let platform_owned = platform.to_string();
+    let model_owned = model.map(str::to_string);
+    let workdir_owned = workdir.to_string();
+    let spawned = tokio::spawn(async move {
+        crate::daemon::subagent::spawn_subagent(
+            &db,
+            &platform_owned,
+            &prompt,
+            model_owned.as_deref(),
+            &workdir_owned,
+            &["canopy".to_string()],
+            15,
+            60,
+        )
+        .await
+    })
+    .await;
+    match spawned {
+        Ok(Ok(id)) => serde_json::json!({
+            "status": "running",
+            "id": id,
+            "platform": platform,
+            "model": model,
+            "pair": pair,
+            "collect_with": "subagent_collect",
+            "note": format!("Cost: ran on '{pair}'. Advisory only — does not affect probe results."),
+        }),
+        Ok(Err(e)) => serde_json::json!({
+            "status": "not_spawned",
+            "platform": platform,
+            "model": model,
+            "pair": pair,
+            "note": format!("Reviewer could not start ({e}); probes above are unaffected."),
+        }),
+        Err(join_err) => serde_json::json!({
+            "status": "not_spawned",
+            "platform": platform,
+            "model": model,
+            "pair": pair,
+            "note": format!("Reviewer could not start ({join_err}); probes above are unaffected."),
+        }),
     }
 }
 
@@ -17176,6 +17338,7 @@ mod endpoint_tests {
             .loop_preflight(Parameters(LoopPreflightParams {
                 loop_id: loop_id.clone(),
                 timeout_seconds: None,
+                reviewer: None,
             }))
             .await
             .unwrap();
@@ -17237,6 +17400,7 @@ mod endpoint_tests {
             .loop_preflight(Parameters(LoopPreflightParams {
                 loop_id: loop_id.clone(),
                 timeout_seconds: None,
+                reviewer: None,
             }))
             .await
             .unwrap();
@@ -22203,6 +22367,7 @@ mod endpoint_tests {
             .loop_preflight(Parameters(LoopPreflightParams {
                 loop_id: lp.id.clone(),
                 timeout_seconds: None,
+                reviewer: None,
             }))
             .await
             .unwrap();
@@ -22269,6 +22434,7 @@ mod endpoint_tests {
             .loop_preflight(Parameters(LoopPreflightParams {
                 loop_id: lp.id.clone(),
                 timeout_seconds: Some(5),
+                reviewer: None,
             }))
             .await
             .unwrap();
@@ -22289,5 +22455,274 @@ mod endpoint_tests {
             .unwrap_or_else(|| panic!("preflight must include spec_warnings: {body}"));
         assert_eq!(warnings.len(), 1, "expected one warning: {body}");
         assert_eq!(warnings[0]["spec_id"], blank_id);
+    }
+
+    /// (CB25) Without a `reviewer`, preflight returns `"review": null` and
+    /// leaves the existing probe output untouched — the reviewer must never
+    /// run implicitly. Covers both the main path and the no-target early
+    /// return.
+    #[tokio::test]
+    async fn loop_preflight_without_reviewer_has_null_review() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        db.insert_loop_node(&LoopNode {
+            id: uuid::Uuid::new_v4().to_string(),
+            spec_id: None,
+            loop_id: Some(lp.id.clone()),
+            name: "impl".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "cb25-unconfigured-platform"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let result = handler
+            .loop_preflight(Parameters(LoopPreflightParams {
+                loop_id: lp.id.clone(),
+                timeout_seconds: Some(5),
+                reviewer: None,
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !is_err(&result),
+            "preflight without reviewer must succeed: {}",
+            text(&result)
+        );
+        let body: serde_json::Value = serde_json::from_str(&raw_text(&result)).unwrap();
+        assert!(
+            body.get("review").is_some_and(|v| v.is_null()),
+            "review must be null when no reviewer is requested: {body}"
+        );
+        assert!(
+            body["probes"].as_array().is_some_and(|p| !p.is_empty()),
+            "existing probe results must be unchanged: {body}"
+        );
+        assert!(
+            body["spec_warnings"].as_array().is_some(),
+            "existing spec_warnings must be unchanged: {body}"
+        );
+
+        // No-target early return carries the same null review.
+        let bare = insert_test_loop(&db, dir.path());
+        let early = handler
+            .loop_preflight(Parameters(LoopPreflightParams {
+                loop_id: bare.id.clone(),
+                timeout_seconds: None,
+                reviewer: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&early), "{}", text(&early));
+        let early_body: serde_json::Value = serde_json::from_str(&raw_text(&early)).unwrap();
+        assert!(
+            early_body.get("review").is_some_and(|v| v.is_null()),
+            "early-return review must be null when no reviewer is requested: {early_body}"
+        );
+    }
+
+    /// (CB25) With `reviewer`, preflight reports a `review` object without
+    /// blocking the probe results. The spawn is real (`spawn_subagent`
+    /// returns an id immediately), but its outcome is environment-dependent:
+    /// `running` with a collectible row when the platform spawns, or
+    /// `not_spawned` with a note when it cannot start (notably, under
+    /// `debug_assertions` the platform registry's `reqwest::blocking`
+    /// client cannot run in async context, so debug test runs always take
+    /// the `not_spawned` branch while release builds spawn for real).
+    /// Either branch keeps the probes intact and never errors.
+    #[tokio::test]
+    async fn loop_preflight_with_reviewer_spawns_background_run() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        db.insert_loop_node(&LoopNode {
+            id: uuid::Uuid::new_v4().to_string(),
+            spec_id: None,
+            loop_id: Some(lp.id.clone()),
+            name: "impl".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "cb25-unconfigured-platform"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let result = handler
+            .loop_preflight(Parameters(LoopPreflightParams {
+                loop_id: lp.id.clone(),
+                timeout_seconds: Some(5),
+                reviewer: Some(LoopPreflightReviewer {
+                    platform: "opencode".to_string(),
+                    model: None,
+                }),
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !is_err(&result),
+            "preflight with reviewer must succeed: {}",
+            text(&result)
+        );
+        let body: serde_json::Value = serde_json::from_str(&raw_text(&result)).unwrap();
+        assert!(
+            body["probes"].as_array().is_some_and(|p| !p.is_empty()),
+            "probe results must still be returned: {body}"
+        );
+        let review = &body["review"];
+        assert_eq!(review["pair"], "opencode/default", "{body}");
+        match review["status"].as_str().unwrap_or_default() {
+            "running" => {
+                assert_eq!(review["collect_with"], "subagent_collect", "{body}");
+                let id = review["id"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("running review must carry an id: {body}"));
+                let record = db
+                    .get_subagent_run(id)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("spawned reviewer row '{id}' must exist"));
+                assert!(
+                    !record.prompt.is_empty(),
+                    "spawned reviewer row must carry the audit prompt"
+                );
+            }
+            "not_spawned" => {
+                assert!(
+                    review["note"].as_str().is_some_and(|n| !n.is_empty()),
+                    "a reviewer that cannot start must say why: {body}"
+                );
+            }
+            other => panic!("review status must be running or not_spawned, got: {body} ({other})"),
+        }
+    }
+
+    /// (CB25) A reviewer that cannot start degrades to a `not_spawned` note;
+    /// it never fails the preflight and the probes are still returned.
+    #[tokio::test]
+    async fn loop_preflight_reviewer_failure_never_fails_preflight() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        db.insert_loop_node(&LoopNode {
+            id: uuid::Uuid::new_v4().to_string(),
+            spec_id: None,
+            loop_id: Some(lp.id.clone()),
+            name: "impl".to_string(),
+            kind: LoopNodeKind::Agent,
+            config: serde_json::json!({"platform": "cb25-unconfigured-platform"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let result = handler
+            .loop_preflight(Parameters(LoopPreflightParams {
+                loop_id: lp.id.clone(),
+                timeout_seconds: Some(5),
+                reviewer: Some(LoopPreflightReviewer {
+                    platform: "no-such-platform-xyz".to_string(),
+                    model: None,
+                }),
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !is_err(&result),
+            "a reviewer that cannot start must not fail preflight: {}",
+            text(&result)
+        );
+        let body: serde_json::Value = serde_json::from_str(&raw_text(&result)).unwrap();
+        assert!(
+            body["probes"].as_array().is_some_and(|p| !p.is_empty()),
+            "probe results must still be returned: {body}"
+        );
+        assert_eq!(body["review"]["status"], "not_spawned", "{body}");
+        assert!(
+            body["review"]["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unaffected"),
+            "the note must say the probes are unaffected: {body}"
+        );
+    }
+
+    /// (CB25) The reviewer prompt carries the loop id and, when the run
+    /// targets one, the loop's active run queue id (read from the persisted
+    /// loop row — no new preflight param), plus the audit-only instruction.
+    /// Unit-tested directly: spawning a real reviewer is not possible under
+    /// `debug_assertions` (see the `spawns_background_run` test), but the
+    /// prompt construction is what carries the ids.
+    #[test]
+    fn loop_preflight_reviewer_prompt_carries_loop_and_queue_ids() {
+        let prompt = build_preflight_reviewer_prompt("loop-1", Some("q-1"), "");
+        assert!(
+            prompt.contains("loop_id='loop-1'"),
+            "reviewer prompt must carry the loop id: {prompt}"
+        );
+        assert!(
+            prompt.contains("queue_id='q-1'"),
+            "reviewer prompt must carry the queue id: {prompt}"
+        );
+        assert!(
+            prompt.contains("Audit ONLY"),
+            "reviewer prompt must carry the audit-only instruction: {prompt}"
+        );
+
+        let no_queue = build_preflight_reviewer_prompt("loop-1", None, "");
+        assert!(
+            no_queue.contains("loop_id='loop-1'"),
+            "reviewer prompt must carry the loop id without a queue: {no_queue}"
+        );
+        assert!(
+            !no_queue.contains("queue_id="),
+            "reviewer prompt must not name a queue when there is none: {no_queue}"
+        );
+    }
+
+    /// (CB25) When the `loop-reviewer` skill resolves in the store, its
+    /// instructions are inlined under the pinned-skill delimiter; otherwise
+    /// the prompt carries the unresolved note and the review still
+    /// proceeds. Unit-tested directly for the same spawn reason as above.
+    #[test]
+    fn loop_preflight_reviewer_inlines_skill_when_store_has_it() {
+        // Seeded store (empty sources): a present, fresh skill dir is
+        // served without any network fetch.
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            crate::dynamic_skills::SkillStore::new(dir.path().to_path_buf(), Vec::new(), 15);
+        let skill_dir = dir.path().join("loop-reviewer");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "# loop-reviewer\nCB25 seeded reviewer body.\n",
+        )
+        .unwrap();
+        let checked = chrono::Utc::now().to_rfc3339();
+        std::fs::write(
+            skill_dir.join(".canopy-skill.toml"),
+            format!(
+                "source_url = \"test\"\ncommit_hash = \"test\"\nlast_checked = \"{checked}\"\n"
+            ),
+        )
+        .unwrap();
+
+        let section = resolve_reviewer_skill_section(&store);
+        assert!(
+            section.contains("## Skill: loop-reviewer"),
+            "resolved skill must use the pinned-skill delimiter: {section}"
+        );
+        assert!(
+            section.contains("CB25 seeded reviewer body."),
+            "resolved skill must inline the skill instructions: {section}"
+        );
+
+        // Unseeded store degrades to the unresolved note, never an error.
+        let bare_dir = tempfile::tempdir().unwrap();
+        let bare =
+            crate::dynamic_skills::SkillStore::new(bare_dir.path().to_path_buf(), Vec::new(), 15);
+        let note = resolve_reviewer_skill_section(&bare);
+        assert!(
+            note.contains("## Skill: loop-reviewer")
+                && note.contains("Could not resolve pinned skill"),
+            "missing skill must degrade to the unresolved note: {note}"
+        );
     }
 }

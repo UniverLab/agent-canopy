@@ -931,6 +931,15 @@ pub struct AgentProbeParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopPreflightReviewer {
+    /// CLI platform to run the reviewer with (e.g. "opencode", "claude").
+    pub platform: String,
+    /// Optional model for that platform. Omitted = platform default.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LoopPreflightParams {
     /// Loop ID to preflight.
     pub loop_id: String,
@@ -938,6 +947,11 @@ pub struct LoopPreflightParams {
     /// timeout. Defaults to 30, clamped to [5, 120].
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
+    /// Optional background design-review agent: when set, names the
+    /// platform+model pair that audits the loop's design. The review runs
+    /// in the background and never blocks or fails the probe results.
+    #[serde(default)]
+    pub reviewer: Option<LoopPreflightReviewer>,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
@@ -1269,6 +1283,36 @@ mod tests {
         assert!(
             error.to_string().contains("invalid type"),
             "expected a type error, got: {error}"
+        );
+    }
+
+    /// (CB25) `LoopPreflightParams` deserializes identically with and
+    /// without the optional `reviewer` field — omitting it must leave
+    /// `reviewer` as `None` (probe behaviour unchanged, never an
+    /// implicit review), and a platform-only reviewer defaults its
+    /// model to `None` (platform default).
+    #[test]
+    fn loop_preflight_params_deserializes_without_reviewer() {
+        let bare: LoopPreflightParams = serde_json::from_value(serde_json::json!({
+            "loop_id": "x",
+        }))
+        .expect("should deserialize without reviewer");
+        assert_eq!(bare.loop_id, "x");
+        assert!(
+            bare.reviewer.is_none(),
+            "omitted reviewer must deserialize to None"
+        );
+
+        let with_reviewer: LoopPreflightParams = serde_json::from_value(serde_json::json!({
+            "loop_id": "x",
+            "reviewer": { "platform": "claude" },
+        }))
+        .expect("should deserialize with reviewer");
+        let reviewer = with_reviewer.reviewer.expect("reviewer must be present");
+        assert_eq!(reviewer.platform, "claude");
+        assert!(
+            reviewer.model.is_none(),
+            "omitted model must default to None"
         );
     }
 }
