@@ -1802,8 +1802,24 @@ fn blueprint_json(blueprint: &Blueprint) -> serde_json::Value {
     })
 }
 
-fn build_node_update_response(node_id: &str) -> CallToolResult {
-    success_result(&format!("Loop node '{node_id}' updated."))
+fn build_node_update_response_with_changes(
+    node_id: &str,
+    changed_keys: &[String],
+) -> CallToolResult {
+    if changed_keys.is_empty() {
+        return success_result(&format!(
+            "Loop node '{node_id}' updated (no config changes)."
+        ));
+    }
+    let mut map = serde_json::Map::new();
+    map.insert("node_id".to_string(), serde_json::json!(node_id));
+    map.insert(
+        "changed_config_keys".to_string(),
+        serde_json::json!(changed_keys),
+    );
+    CallToolResult::success(vec![Content::text(
+        serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap_or_default(),
+    )])
 }
 
 fn build_id_result(id: &str, key: &str) -> CallToolResult {
@@ -2272,27 +2288,16 @@ fn build_spec_run_info(db: &Database, spec: &LoopSpec) -> Result<SpecRunInfo, Mc
 }
 
 fn build_loop_summary_json(db: &Database, lp: &Loop) -> Result<serde_json::Value, McpError> {
-    let specs = db.list_loop_specs(&lp.id).map_err(internal_error)?;
-    // `Failed` is included so a spec that dead-ended on a failing node with
-    // no outgoing edge still surfaces here — dispatch stops on the first
-    // `Failed` spec (never advances past it), so it's always the earliest
-    // non-terminal spec in position order and `find` still picks it over
-    // any untouched `Pending` spec that was never reached.
-    let current_spec = specs
-        .into_iter()
-        .find(|spec| {
-            matches!(
-                spec.status,
-                LoopSpecStatus::Running
-                    | LoopSpecStatus::Pending
-                    | LoopSpecStatus::Interrupted
-                    | LoopSpecStatus::Failed
-            )
-        })
-        .map(|spec| build_spec_run_info(db, &spec))
-        .transpose()?;
+    // CB30: one helper decides "what spec is this loop on" — never the
+    // raw bound list, whose queue/idea runs read as a nameless placeholder.
+    let current_spec = match active_loop_spec_context(db, lp).map_err(internal_error)? {
+        ActiveLoopSpec::Bound(spec) | ActiveLoopSpec::QueueMember { spec, .. } => Some(spec),
+        ActiveLoopSpec::Idea { .. } | ActiveLoopSpec::None => None,
+    }
+    .map(|spec| build_spec_run_info(db, &spec))
+    .transpose()?;
 
-    Ok(serde_json::json!({
+    let mut out = serde_json::json!({
         "id": lp.id,
         "name": lp.name,
         "status": lp.status.as_str(),
@@ -2305,7 +2310,15 @@ fn build_loop_summary_json(db: &Database, lp: &Loop) -> Result<serde_json::Value
         "created_at": lp.created_at.to_rfc3339(),
         "workdir": lp.workdir,
         "archived": lp.archived,
-    }))
+    });
+    // CB30: when the loop draws from a queue, say so and name it, so the
+    // reader knows where the sequence comes from.
+    if let Some(queue_id) = lp.active_run_queue_id.as_deref() {
+        if let Some(queue) = db.get_queue(queue_id).map_err(internal_error)? {
+            out["queue"] = serde_json::json!({ "id": queue.id, "name": queue.name });
+        }
+    }
+    Ok(out)
 }
 
 /// Serialize a loop's trigger for MCP responses: always a `type` label, plus
@@ -5284,7 +5297,7 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "loop_update_node",
-        description = "Update an existing loop node."
+        description = "Update an existing loop node. Config merges with the stored config by default (partial update: keys present are changed, keys absent are left as-is). Set `config_replace` to `true` to replace the entire config instead."
     )]
     async fn loop_update_node(
         &self,
@@ -5344,11 +5357,42 @@ impl TaskTriggerHandler {
             return Ok(error_result(&e));
         }
 
-        let config = params.config.map(serde_json::Value::Object);
-        if kind.is_some() || config.is_some() {
+        let config_replace = params.config_replace.unwrap_or(false);
+        let (effective_config, changed_keys) = match (&params.config, config_replace) {
+            (Some(provided), false) => {
+                let mut merged = node.config.as_object().cloned().unwrap_or_default();
+                let mut changed = Vec::new();
+                for (key, value) in provided {
+                    let old_value = merged.get(key);
+                    if old_value != Some(value) {
+                        changed.push(key.clone());
+                    }
+                    merged.insert(key.clone(), value.clone());
+                }
+                (serde_json::Value::Object(merged), changed)
+            }
+            (Some(provided), true) => {
+                let mut changed = Vec::new();
+                let default_map = serde_json::Map::new();
+                let stored_map = node.config.as_object().unwrap_or(&default_map);
+                for (key, value) in provided {
+                    if stored_map.get(key) != Some(value) {
+                        changed.push(key.clone());
+                    }
+                }
+                for key in stored_map.keys() {
+                    if !provided.contains_key(key) {
+                        changed.push(key.clone());
+                    }
+                }
+                (serde_json::Value::Object(provided.clone()), changed)
+            }
+            (None, _) => (node.config.clone(), Vec::new()),
+        };
+
+        if kind.is_some() || params.config.is_some() {
             let effective_kind = kind.unwrap_or(node.kind);
-            let effective_config = config.as_ref().unwrap_or(&node.config);
-            if let Err(e) = validate_node_config(effective_kind, effective_config) {
+            if let Err(e) = validate_node_config(effective_kind, &effective_config) {
                 return Ok(error_result(&e));
             }
             // A router's routes must stay consistent with whatever edges
@@ -5356,7 +5400,7 @@ impl TaskTriggerHandler {
             // just removed, and (once wiring has started) no declared route
             // left without one — see `validate_router_route_coverage`.
             if effective_kind == LoopNodeKind::Router {
-                let (routes, _fallback) = match parse_router_routes(effective_config) {
+                let (routes, _fallback) = match parse_router_routes(&effective_config) {
                     Ok(parsed) => parsed,
                     Err(e) => return Ok(error_result(&e)),
                 };
@@ -5379,11 +5423,20 @@ impl TaskTriggerHandler {
             }
         }
 
+        let config_to_store = if params.config.is_some() {
+            Some(&effective_config)
+        } else {
+            None
+        };
+
         self.db
-            .update_loop_node_details(&node_id, name, kind, config.as_ref(), params.position)
+            .update_loop_node_details(&node_id, name, kind, config_to_store, params.position)
             .map_err(internal_error)?;
 
-        Ok(build_node_update_response(&node_id))
+        Ok(build_node_update_response_with_changes(
+            &node_id,
+            &changed_keys,
+        ))
     }
 
     #[tool(
@@ -8848,6 +8901,118 @@ fn queue_running_spec(db: &Database, loop_id: &str) -> Result<Option<LoopSpec>, 
     Ok(None)
 }
 
+/// What a loop is actually working on (CB30).
+///
+/// `list_loop_specs` returns the loop's *bound* specs, which for a queue or
+/// idea run is the blank-name placeholder row the engine inserts as
+/// `loop_runs.spec_id` bookkeeping — never the work itself. Every display
+/// surface must go through [`active_loop_spec_context`] instead of reading
+/// the bound list directly, so `loop_get`, `loop list` and `canopy loop
+/// info` agree on the answer.
+#[derive(Debug)]
+pub(crate) enum ActiveLoopSpec {
+    /// A normal bound spec (never a placeholder).
+    Bound(LoopSpec),
+    /// A queue member spec currently in flight.
+    QueueMember {
+        spec: LoopSpec,
+        queue_id: String,
+        queue_name: String,
+    },
+    /// An idea-driven run: a placeholder exists but must not be shown.
+    Idea { placeholder_id: String },
+    /// Nothing running (all done, or nothing queued yet).
+    None,
+}
+
+/// The single answer to "what spec is this loop on", shared by `loop_get`
+/// ([`loop_details_json`]), `loop list` ([`build_loop_summary_json`]) and
+/// `canopy loop info` (`handle_loop_info` in `daemon/loop_cli.rs`).
+///
+/// The placeholder is hidden, never relabelled: a fabricated name would
+/// replace a confusing answer with a false one.
+pub(crate) fn active_loop_spec_context(db: &Database, lp: &Loop) -> anyhow::Result<ActiveLoopSpec> {
+    if let Some(queue_id) = lp.active_run_queue_id.as_deref() {
+        if let Some(queue_name) = db.get_queue(queue_id)?.map(|queue| queue.name) {
+            let mut running: Option<LoopSpec> = None;
+            let mut pending: Option<LoopSpec> = None;
+            for spec_id in db.list_queue_member_spec_ids(queue_id)? {
+                if let Some(spec) = db.get_loop_spec(&spec_id)? {
+                    if spec.status == LoopSpecStatus::Running {
+                        if running.is_none() {
+                            running = Some(spec);
+                        }
+                    // Same fallback shape as `build_loop_summary_json`'s
+                    // bound-spec search: the next runnable (or stalled)
+                    // member in queue order when nothing is `Running`.
+                    } else if pending.is_none()
+                        && matches!(
+                            spec.status,
+                            LoopSpecStatus::Pending
+                                | LoopSpecStatus::Interrupted
+                                | LoopSpecStatus::Failed
+                        )
+                    {
+                        pending = Some(spec);
+                    }
+                }
+            }
+            // A `Running` member anywhere beats an earlier pending one:
+            // dispatch is sequential, so a running member means everything
+            // before it already completed.
+            if let Some(spec) = running.or(pending) {
+                return Ok(ActiveLoopSpec::QueueMember {
+                    spec,
+                    queue_id: queue_id.to_string(),
+                    queue_name,
+                });
+            }
+            // Queue drained (or empty): fall through to the bound/idea
+            // logic so a finished queue loop reports `None` rather than a
+            // stale member. Callers still render the queue link itself from
+            // `active_run_queue_id`.
+        }
+    }
+    let mut placeholder_id: Option<String> = None;
+    let mut current: Option<LoopSpec> = None;
+    // `list_loop_specs` returns position order, so the first non-terminal
+    // real spec is the one dispatch is on — the same pick
+    // `build_loop_summary_json` historically made, minus the placeholder.
+    for spec in db.list_loop_specs(&lp.id)? {
+        if crate::loop_engine::is_no_spec_placeholder(&spec) {
+            if placeholder_id.is_none() {
+                placeholder_id = Some(spec.id.clone());
+            }
+            continue;
+        }
+        if current.is_none()
+            && matches!(
+                spec.status,
+                LoopSpecStatus::Running
+                    | LoopSpecStatus::Pending
+                    | LoopSpecStatus::Interrupted
+                    | LoopSpecStatus::Failed
+            )
+        {
+            current = Some(spec);
+        }
+    }
+    if let Some(spec) = current {
+        return Ok(ActiveLoopSpec::Bound(spec));
+    }
+    if let Some(placeholder_id) = placeholder_id {
+        // CB30: a completed queue-driven loop still has `active_run_queue_id`
+        // set (B31 keeps it as last-run context) and only the placeholder in
+        // its bound specs. Without this guard, we'd report `Idea` for a
+        // finished queue — replacing one false answer with another.
+        if lp.active_run_queue_id.is_some() {
+            return Ok(ActiveLoopSpec::None);
+        }
+        return Ok(ActiveLoopSpec::Idea { placeholder_id });
+    }
+    Ok(ActiveLoopSpec::None)
+}
+
 impl TaskTriggerHandler {
     async fn restart_updated_watcher(
         &self,
@@ -8971,7 +9136,7 @@ fn sync_message_json(message: &crate::domain::sync::SyncMessage) -> serde_json::
 }
 
 fn loop_details_json(db: &Database, lp: &LoopDetails) -> anyhow::Result<serde_json::Value> {
-    let specs = lp
+    let mut specs = lp
         .specs
         .iter()
         // Skip the blank-name placeholder an idea-driven run binds to the
@@ -8981,13 +9146,39 @@ fn loop_details_json(db: &Database, lp: &LoopDetails) -> anyhow::Result<serde_js
         .filter(|spec| !spec.spec.name.trim().is_empty())
         .map(|spec| loop_spec_details_json(db, spec, lp.lp.status))
         .collect::<anyhow::Result<Vec<_>>>()?;
+    // CB30: while the loop draws from a queue, the bound list above is just
+    // the placeholder — name the queue spec actually running instead, so
+    // this surface agrees with `loop_node_runs_list`.
+    let ctx = active_loop_spec_context(db, &lp.lp)?;
+    match &ctx {
+        ActiveLoopSpec::QueueMember { spec, .. } => {
+            if !specs
+                .iter()
+                .any(|s| s.get("id").and_then(|v| v.as_str()) == Some(spec.id.as_str()))
+            {
+                let details = crate::domain::loops::LoopSpecDetails {
+                    nodes: db.list_loop_nodes(&spec.id)?,
+                    edges: db.list_loop_edges(&spec.id)?,
+                    spec: spec.clone(),
+                };
+                specs.push(loop_spec_details_json(db, &details, lp.lp.status)?);
+            }
+        }
+        // The placeholder id is engine bookkeeping (a bound row like any
+        // other); it is read here only to assert the sentinel invariant —
+        // the row itself is never rendered.
+        ActiveLoopSpec::Idea { placeholder_id } => {
+            debug_assert!(!placeholder_id.is_empty());
+        }
+        ActiveLoopSpec::Bound(_) | ActiveLoopSpec::None => {}
+    }
     let ensembles = db
         .list_ensembles_for_loop(&lp.lp.id)?
         .iter()
         .map(ensemble_details_json)
         .collect::<Vec<_>>();
 
-    Ok(serde_json::json!({
+    let mut out = serde_json::json!({
         "id": lp.lp.id,
         "name": lp.lp.name,
         "description": lp.lp.description,
@@ -9019,7 +9210,30 @@ fn loop_details_json(db: &Database, lp: &LoopDetails) -> anyhow::Result<serde_js
             .iter()
             .map(loop_completion_hook_run_json)
             .collect::<Vec<_>>(),
-    }))
+    });
+    // CB30: when the loop draws from a queue, say so and name it; when it
+    // runs a loose idea, say that instead of leaving an empty `specs` to be
+    // misread as "nothing running".
+    match &ctx {
+        ActiveLoopSpec::QueueMember {
+            queue_id,
+            queue_name,
+            ..
+        } => {
+            out["queue"] = serde_json::json!({ "id": queue_id, "name": queue_name });
+        }
+        ActiveLoopSpec::Bound(_) | ActiveLoopSpec::Idea { .. } | ActiveLoopSpec::None => {
+            if let Some(queue_id) = lp.lp.active_run_queue_id.as_deref() {
+                if let Some(queue) = db.get_queue(queue_id)? {
+                    out["queue"] = serde_json::json!({ "id": queue.id, "name": queue.name });
+                }
+            }
+        }
+    }
+    if matches!(ctx, ActiveLoopSpec::Idea { .. }) && out.get("queue").is_none() {
+        out["mode"] = serde_json::json!("idea");
+    }
+    Ok(out)
 }
 
 /// Serialize an ensemble (F1) as the one unit `loop_get`/`loop_update_ensemble`
@@ -9536,9 +9750,9 @@ impl ServerHandler for TaskTriggerHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_ensemble_unit, build_get_tools_response, build_id_result, build_json_result,
-        build_loop_completion_hook, build_loop_trigger, build_loop_update_response,
-        build_node_update_response, build_spec_update_response, effective_member_prompt,
+        active_loop_spec_context, build_ensemble_unit, build_get_tools_response, build_id_result,
+        build_json_result, build_loop_completion_hook, build_loop_summary_json, build_loop_trigger,
+        build_loop_update_response, build_spec_update_response, effective_member_prompt,
         find_in_flight_run, handle_retry_current_node, handle_skip_next_spec, header_str,
         in_flight_run_error, json_value_kind_name, loop_details_json, loop_run_status_guard,
         loop_trigger_json, member_node_config, missing_sync_identity_error, node_copy_note,
@@ -9551,8 +9765,8 @@ mod tests {
         validate_queue_exists, validate_queue_member_removable, validate_queue_not_consumed,
         validate_queue_reorder, validate_queue_reorder_locking, validate_route_edge_target,
         validate_spec_deletable, validate_spec_exists, validate_spec_set_status_target,
-        validate_spec_status, validate_spec_workdir, BuiltEnsembleUnit, EnsembleMemberParams,
-        EnsembleUnitSpec, TaskTriggerHandler, MISSING_SYNC_IDENTITY_MESSAGE,
+        validate_spec_status, validate_spec_workdir, ActiveLoopSpec, BuiltEnsembleUnit,
+        EnsembleMemberParams, EnsembleUnitSpec, TaskTriggerHandler, MISSING_SYNC_IDENTITY_MESSAGE,
     };
     use crate::daemon::params::{
         LoopCompletionHookParams, LoopCopyEnsembleParams, LoopCopyNodeParams,
@@ -11542,6 +11756,280 @@ mod tests {
         assert_eq!(json["graph"]["nodes"][0]["id"], "graph-node");
         assert_eq!(json["graph"]["nodes"][0]["loop_id"], loop_id);
         assert!(json["specs"].as_array().unwrap().is_empty());
+    }
+
+    /// CB30 test helpers: a blank-name placeholder bound to a loop (engine
+    /// bookkeeping for spec-less dispatches) and a named spec bound to a
+    /// loop or standing alone as a queue member.
+    fn cb30_test_loop(id: &str, status: LoopStatus) -> Loop {
+        Loop {
+            archived: false,
+            paused_by_reconciliation: false,
+            infra_node_id: None,
+            id: id.to_string(),
+            name: id.to_string(),
+            description: None,
+            workdir: "/tmp".to_string(),
+            status,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            hooks: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn placeholder_spec(id: &str, loop_id: &str, status: LoopSpecStatus) -> LoopSpec {
+        let mut spec = standalone_spec(id);
+        spec.loop_id = Some(loop_id.to_string());
+        spec.name = String::new();
+        spec.status = status;
+        spec
+    }
+
+    fn named_spec(
+        id: &str,
+        loop_id: Option<&str>,
+        name: &str,
+        position: i64,
+        status: LoopSpecStatus,
+    ) -> LoopSpec {
+        let mut spec = standalone_spec(id);
+        spec.loop_id = loop_id.map(str::to_string);
+        spec.name = name.to_string();
+        spec.position = position;
+        spec.status = status;
+        spec
+    }
+
+    fn queue_driven_test_db() -> (tempfile::TempDir, Database) {
+        // A running loop drawing from a queue with two named members, plus
+        // the blank-name placeholder the engine binds to the loop itself.
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let mut lp = cb30_test_loop("loop-q", LoopStatus::Running);
+        lp.active_run_queue_id = Some("q1".to_string());
+        db.insert_loop(&lp).unwrap();
+        insert_queue(&db, "q1");
+        db.insert_loop_spec(&placeholder_spec("ph", "loop-q", LoopSpecStatus::Running))
+            .unwrap();
+        db.insert_loop_spec(&named_spec(
+            "spec-a",
+            None,
+            "CM4 — queue work",
+            0,
+            LoopSpecStatus::Running,
+        ))
+        .unwrap();
+        db.append_queue_member("q1", "spec-a", None).unwrap();
+        db.insert_loop_spec(&named_spec(
+            "spec-b",
+            None,
+            "CM6 — next work",
+            0,
+            LoopSpecStatus::Pending,
+        ))
+        .unwrap();
+        db.append_queue_member("q1", "spec-b", None).unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn loop_get_reports_queue_spec_not_placeholder() {
+        // CB30-1: while a loop executes a queue, the loop level names the
+        // queue spec in progress — its id and name — not the placeholder.
+        let (_dir, db) = queue_driven_test_db();
+
+        let details = db.get_loop_details("loop-q").unwrap().unwrap();
+        let json = loop_details_json(&db, &details).unwrap();
+        let specs = json["specs"].as_array().unwrap();
+        assert!(
+            !specs.is_empty(),
+            "queue-driven loop_get must name the running queue spec: {json}"
+        );
+        assert!(
+            specs
+                .iter()
+                .all(|s| !s["name"].as_str().unwrap_or("").trim().is_empty()),
+            "no surface lists a spec whose name is blank: {json}"
+        );
+        let running = specs
+            .iter()
+            .find(|s| s["id"] == "spec-a")
+            .expect("running queue spec must appear in loop_get specs");
+        assert_eq!(running["name"], "CM4 — queue work");
+        assert_eq!(json["queue"]["id"], "q1");
+        assert_eq!(json["queue"]["name"], "q1-name");
+
+        // The shared helper agrees: it is the same answer every surface
+        // must give.
+        let lp = db.get_loop("loop-q").unwrap().unwrap();
+        match active_loop_spec_context(&db, &lp).unwrap() {
+            ActiveLoopSpec::QueueMember {
+                spec,
+                queue_id,
+                queue_name,
+            } => {
+                assert_eq!(spec.id, "spec-a");
+                assert_eq!(spec.name, "CM4 — queue work");
+                assert_eq!(queue_id, "q1");
+                assert_eq!(queue_name, "q1-name");
+            }
+            _ => panic!("queue-driven loop must resolve to QueueMember"),
+        }
+    }
+
+    #[test]
+    fn loop_get_idea_run_shows_mode_idea_not_placeholder() {
+        // CB30-4(idea): a loop run from a loose idea reports that it is
+        // running an idea, and does not present the placeholder as a spec.
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        db.insert_loop(&cb30_test_loop("loop-idea", LoopStatus::Running))
+            .unwrap();
+        db.insert_loop_spec(&placeholder_spec(
+            "ph-idea",
+            "loop-idea",
+            LoopSpecStatus::Running,
+        ))
+        .unwrap();
+
+        let details = db.get_loop_details("loop-idea").unwrap().unwrap();
+        let json = loop_details_json(&db, &details).unwrap();
+        assert!(
+            json["specs"].as_array().unwrap().is_empty(),
+            "idea-driven loop_get must not list the placeholder: {json}"
+        );
+        assert_eq!(json["mode"], "idea");
+        assert!(
+            json.get("queue").is_none(),
+            "idea-driven loop_get must not carry a queue: {json}"
+        );
+
+        let lp = db.get_loop("loop-idea").unwrap().unwrap();
+        assert!(
+            matches!(
+                active_loop_spec_context(&db, &lp).unwrap(),
+                ActiveLoopSpec::Idea { .. }
+            ),
+            "placeholder-only loop must resolve to Idea"
+        );
+        let summary = build_loop_summary_json(&db, &lp).unwrap();
+        assert!(
+            summary["current_spec"].is_null(),
+            "idea-driven summary must not name the placeholder: {summary}"
+        );
+    }
+
+    #[test]
+    fn loop_get_bound_specs_unchanged() {
+        // CB30-3: a loop running its own bound specs still reports those,
+        // unchanged — no queue/mode annotation.
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        db.insert_loop(&cb30_test_loop("loop-bound", LoopStatus::Running))
+            .unwrap();
+        db.insert_loop_spec(&named_spec(
+            "spec-1",
+            Some("loop-bound"),
+            "First work",
+            0,
+            LoopSpecStatus::Running,
+        ))
+        .unwrap();
+        db.insert_loop_spec(&named_spec(
+            "spec-2",
+            Some("loop-bound"),
+            "Second work",
+            1,
+            LoopSpecStatus::Pending,
+        ))
+        .unwrap();
+
+        let details = db.get_loop_details("loop-bound").unwrap().unwrap();
+        let json = loop_details_json(&db, &details).unwrap();
+        let names: Vec<&str> = json["specs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["First work", "Second work"]);
+        assert!(json.get("queue").is_none());
+        assert!(json.get("mode").is_none());
+
+        let lp = db.get_loop("loop-bound").unwrap().unwrap();
+        match active_loop_spec_context(&db, &lp).unwrap() {
+            ActiveLoopSpec::Bound(spec) => assert_eq!(spec.name, "First work"),
+            _ => panic!("bound-spec loop must resolve to Bound"),
+        }
+        let summary = build_loop_summary_json(&db, &lp).unwrap();
+        assert_eq!(summary["current_spec"], "First work");
+        assert!(summary.get("queue").is_none());
+    }
+
+    #[test]
+    fn loop_list_summary_shows_queue_spec() {
+        // CB30-5: `loop list` names the running queue spec, never blank,
+        // and carries the queue link.
+        let (_dir, db) = queue_driven_test_db();
+
+        let lp = db.get_loop("loop-q").unwrap().unwrap();
+        let summary = build_loop_summary_json(&db, &lp).unwrap();
+        assert_eq!(summary["current_spec"], "CM4 — queue work");
+        assert_eq!(summary["queue"]["id"], "q1");
+        assert_eq!(summary["queue"]["name"], "q1-name");
+    }
+
+    #[test]
+    fn completed_queue_loop_is_not_idea() {
+        // CB30/B31: a completed queue-driven loop keeps `active_run_queue_id`
+        // set (B31 — last-run context). The shared helper must NOT report it
+        // as `Idea` just because only the placeholder remains in bound specs.
+        let dir = tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let mut lp = cb30_test_loop("loop-done", LoopStatus::Completed);
+        lp.active_run_queue_id = Some("q-done".to_string());
+        db.insert_loop(&lp).unwrap();
+        insert_queue(&db, "q-done");
+        db.insert_loop_spec(&placeholder_spec(
+            "ph-done",
+            "loop-done",
+            LoopSpecStatus::Completed,
+        ))
+        .unwrap();
+        let done = named_spec(
+            "spec-done",
+            None,
+            "CM4 — done",
+            0,
+            LoopSpecStatus::Completed,
+        );
+        db.insert_loop_spec(&done).unwrap();
+        db.append_queue_member("q-done", "spec-done", None).unwrap();
+
+        match active_loop_spec_context(&db, &lp).unwrap() {
+            ActiveLoopSpec::None => {}
+            other => panic!("completed queue loop must be None, got {other:?}"),
+        }
+        let json =
+            loop_details_json(&db, &db.get_loop_details("loop-done").unwrap().unwrap()).unwrap();
+        assert!(
+            json.get("mode").is_none(),
+            "completed queue loop must not say 'idea': {json}"
+        );
+        assert_eq!(json["queue"]["id"], "q-done");
+        assert!(
+            json["specs"].as_array().unwrap().is_empty(),
+            "no spec to show once the queue is drained: {json}"
+        );
+        let summary = build_loop_summary_json(&db, &lp).unwrap();
+        assert!(summary["current_spec"].is_null());
+        assert_eq!(summary["queue"]["id"], "q-done");
     }
 
     #[test]
@@ -13682,7 +14170,7 @@ mod tests {
         assert!(note.contains("loop_add_edge"), "{note}");
     }
 
-    // ── build_loop_update_response / build_spec_update_response / build_node_update_response ──
+    // ── build_loop_update_response / build_spec_update_response ──
 
     #[test]
     fn build_loop_update_response_contains_loop_id() {
@@ -13698,15 +14186,6 @@ mod tests {
         let result = build_spec_update_response("spec-99");
         let text = format!("{:?}", result.content);
         assert!(text.contains("spec-99"), "{text}");
-        assert!(text.contains("updated"), "{text}");
-        assert!(result.is_error != Some(true));
-    }
-
-    #[test]
-    fn build_node_update_response_contains_node_id() {
-        let result = build_node_update_response("node-7");
-        let text = format!("{:?}", result.content);
-        assert!(text.contains("node-7"), "{text}");
         assert!(text.contains("updated"), "{text}");
         assert!(result.is_error != Some(true));
     }
@@ -14561,16 +15040,6 @@ mod additional_tests {
         let result = build_spec_update_response("spec-abc");
         let text = format!("{:?}", result.content);
         assert!(text.contains("spec-abc"));
-        assert!(text.contains("updated"));
-    }
-
-    // ── build_node_update_response ────────────────────────────────
-
-    #[test]
-    fn build_node_update_response_text() {
-        let result = build_node_update_response("node-xyz");
-        let text = format!("{:?}", result.content);
-        assert!(text.contains("node-xyz"));
         assert!(text.contains("updated"));
     }
 
@@ -19084,6 +19553,7 @@ mod endpoint_tests {
                 name: Some("Node A Renamed".to_string()),
                 kind: None,
                 config: None,
+                config_replace: None,
                 position: None,
             }))
             .await
@@ -19100,6 +19570,7 @@ mod endpoint_tests {
                 name: None,
                 kind: None,
                 config: None,
+                config_replace: None,
                 position: None,
             }))
             .await
@@ -19112,6 +19583,7 @@ mod endpoint_tests {
                 name: Some("x".to_string()),
                 kind: None,
                 config: None,
+                config_replace: None,
                 position: None,
             }))
             .await
@@ -19197,6 +19669,7 @@ mod endpoint_tests {
                 name: None,
                 kind: None,
                 config: Some(new_config),
+                config_replace: None,
                 position: None,
             }))
             .await
@@ -19208,6 +19681,292 @@ mod endpoint_tests {
         assert_eq!(skills.len(), 2);
         assert_eq!(skills[0].as_str().unwrap(), "delta");
         assert_eq!(skills[1].as_str().unwrap(), "epsilon");
+    }
+
+    #[tokio::test]
+    async fn loop_update_node_partial_config_merge_preserves_prompt() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+
+        let long_prompt = "A very long prompt that should not be touched by a model change.\
+            Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor.\
+            Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris.";
+        let mut config = agent_node_config("old-platform");
+        config.insert(
+            "prompt_template".to_string(),
+            serde_json::json!(long_prompt),
+        );
+        config.insert("model".to_string(), serde_json::json!("old-model"));
+
+        let added = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Agent".to_string(),
+                kind: Some("agent".to_string()),
+                config: Some(config),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        let node_id = extract_id(&added, "node_id");
+
+        let updated = handler
+            .loop_update_node(Parameters(LoopUpdateNodeParams {
+                node_id: node_id.clone(),
+                name: None,
+                kind: None,
+                config: Some({
+                    let mut m = serde_json::Map::new();
+                    m.insert("model".to_string(), serde_json::json!("new-model"));
+                    m
+                }),
+                config_replace: None,
+                position: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&updated), "{}", text(&updated));
+
+        let stored = db.get_loop_node(&node_id).unwrap().unwrap();
+        assert_eq!(
+            stored.config["prompt_template"].as_str().unwrap(),
+            long_prompt
+        );
+        assert_eq!(stored.config["model"].as_str().unwrap(), "new-model");
+        assert_eq!(stored.config["platform"].as_str().unwrap(), "old-platform");
+
+        let response_text = text(&updated);
+        assert!(
+            response_text.contains("model"),
+            "response should name changed key: {response_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_update_node_partial_config_merge_timeout_leaves_others() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+
+        let mut config = agent_node_config("claude");
+        config.insert("model".to_string(), serde_json::json!("some-model"));
+        config.insert("commit_rights".to_string(), serde_json::json!(true));
+
+        let added = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Agent".to_string(),
+                kind: Some("agent".to_string()),
+                config: Some(config),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        let node_id = extract_id(&added, "node_id");
+
+        let updated = handler
+            .loop_update_node(Parameters(LoopUpdateNodeParams {
+                node_id: node_id.clone(),
+                name: None,
+                kind: None,
+                config: Some({
+                    let mut m = serde_json::Map::new();
+                    m.insert("timeout_minutes".to_string(), serde_json::json!(30));
+                    m
+                }),
+                config_replace: None,
+                position: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&updated), "{}", text(&updated));
+
+        let stored = db.get_loop_node(&node_id).unwrap().unwrap();
+        assert_eq!(stored.config["platform"].as_str().unwrap(), "claude");
+        assert_eq!(stored.config["model"].as_str().unwrap(), "some-model");
+        assert_eq!(stored.config["commit_rights"], serde_json::json!(true));
+        assert_eq!(stored.config["timeout_minutes"], serde_json::json!(30));
+    }
+
+    #[tokio::test]
+    async fn loop_update_node_full_replacement_drops_keys() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+
+        let mut config = agent_node_config("claude");
+        config.insert("model".to_string(), serde_json::json!("some-model"));
+        config.insert("timeout_minutes".to_string(), serde_json::json!(10));
+
+        let added = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Agent".to_string(),
+                kind: Some("agent".to_string()),
+                config: Some(config),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        let node_id = extract_id(&added, "node_id");
+
+        let updated = handler
+            .loop_update_node(Parameters(LoopUpdateNodeParams {
+                node_id: node_id.clone(),
+                name: None,
+                kind: None,
+                config: Some({
+                    let mut m = serde_json::Map::new();
+                    m.insert("platform".to_string(), serde_json::json!("new-platform"));
+                    m
+                }),
+                config_replace: Some(true),
+                position: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&updated), "{}", text(&updated));
+
+        let stored = db.get_loop_node(&node_id).unwrap().unwrap();
+        assert_eq!(stored.config["platform"].as_str().unwrap(), "new-platform");
+        assert!(
+            stored.config.get("model").is_none(),
+            "model should be dropped by full replacement"
+        );
+        assert!(
+            stored.config.get("timeout_minutes").is_none(),
+            "timeout_minutes should be dropped by full replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_update_node_unknown_key_rejected_in_both_modes() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+
+        let added = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Agent".to_string(),
+                kind: Some("agent".to_string()),
+                config: Some(agent_node_config("claude")),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        let node_id = extract_id(&added, "node_id");
+
+        let merge_result = handler
+            .loop_update_node(Parameters(LoopUpdateNodeParams {
+                node_id: node_id.clone(),
+                name: None,
+                kind: None,
+                config: Some({
+                    let mut m = serde_json::Map::new();
+                    m.insert("totally_bogus_key".to_string(), serde_json::json!("x"));
+                    m
+                }),
+                config_replace: None,
+                position: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&merge_result));
+        assert!(
+            text(&merge_result).contains("totally_bogus_key"),
+            "error should name the bad key: {}",
+            text(&merge_result)
+        );
+        assert!(
+            text(&merge_result).contains("Accepted keys"),
+            "error should name accepted keys: {}",
+            text(&merge_result)
+        );
+
+        let replace_result = handler
+            .loop_update_node(Parameters(LoopUpdateNodeParams {
+                node_id: node_id.clone(),
+                name: None,
+                kind: None,
+                config: Some({
+                    let mut m = serde_json::Map::new();
+                    m.insert("another_bogus".to_string(), serde_json::json!("y"));
+                    m
+                }),
+                config_replace: Some(true),
+                position: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&replace_result));
+        assert!(
+            text(&replace_result).contains("another_bogus"),
+            "error should name the bad key: {}",
+            text(&replace_result)
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_update_node_response_names_changed_keys() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+
+        let mut config = agent_node_config("claude");
+        config.insert("model".to_string(), serde_json::json!("old-model"));
+        config.insert("timeout_minutes".to_string(), serde_json::json!(5));
+
+        let added = handler
+            .loop_add_node(Parameters(LoopAddNodeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Agent".to_string(),
+                kind: Some("agent".to_string()),
+                config: Some(config),
+                blueprint: None,
+                config_overrides: None,
+            }))
+            .await
+            .unwrap();
+        let node_id = extract_id(&added, "node_id");
+
+        let updated = handler
+            .loop_update_node(Parameters(LoopUpdateNodeParams {
+                node_id: node_id.clone(),
+                name: None,
+                kind: None,
+                config: Some({
+                    let mut m = serde_json::Map::new();
+                    m.insert("model".to_string(), serde_json::json!("new-model"));
+                    m.insert("timeout_minutes".to_string(), serde_json::json!(10));
+                    m
+                }),
+                config_replace: None,
+                position: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&updated), "{}", text(&updated));
+
+        let response_text = text(&updated);
+        assert!(
+            response_text.contains("model"),
+            "response should name 'model' as changed: {response_text}"
+        );
+        assert!(
+            response_text.contains("timeout_minutes"),
+            "response should name 'timeout_minutes' as changed: {response_text}"
+        );
     }
 
     #[tokio::test]
@@ -19988,6 +20747,7 @@ mod endpoint_tests {
                 name: None,
                 kind: None,
                 config: Some(router_node_config(&two_routes(), "retry")),
+                config_replace: None,
                 position: None,
             }))
             .await
@@ -20010,6 +20770,7 @@ mod endpoint_tests {
                     ]),
                     "escalate",
                 )),
+                config_replace: None,
                 position: None,
             }))
             .await

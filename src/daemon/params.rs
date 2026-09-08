@@ -693,8 +693,13 @@ pub struct LoopUpdateNodeParams {
     pub name: Option<String>,
     /// New node kind: agent, check, or gate.
     pub kind: Option<String>,
-    /// Replacement node config payload.
+    /// Config payload. By default merges with the stored config (partial update):
+    /// keys present are changed, keys absent are left as-is.
+    /// Set `config_replace` to `true` to replace the entire config instead.
     pub config: Option<serde_json::Map<String, serde_json::Value>>,
+    /// When `true`, `config` replaces the entire stored config instead of merging.
+    /// Defaults to `false` (merge).
+    pub config_replace: Option<bool>,
     /// New visual position within the spec.
     pub position: Option<i64>,
 }

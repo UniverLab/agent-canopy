@@ -6557,7 +6557,7 @@ fn no_spec_placeholder(loop_id: &str) -> LoopSpec {
 /// `description` — so `run_loop_dispatch` can purge a prior attempt's
 /// terminal bookkeeping row without touching a still-live resume row or any
 /// real user-authored spec (`loop_add_spec` rejects an empty name).
-fn is_no_spec_placeholder(spec: &LoopSpec) -> bool {
+pub(crate) fn is_no_spec_placeholder(spec: &LoopSpec) -> bool {
     spec.name.trim().is_empty()
 }
 

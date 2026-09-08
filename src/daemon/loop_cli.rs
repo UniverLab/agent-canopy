@@ -19,6 +19,7 @@ use chrono::{DateTime, Utc};
 use clap::Subcommand;
 
 use crate::daemon::cli_daemon::call_tool;
+use crate::daemon::handler::{active_loop_spec_context, ActiveLoopSpec};
 use crate::db::Database;
 use crate::domain::db_paths::database_path;
 use crate::domain::loops::{
@@ -489,6 +490,40 @@ fn handle_loop_list(db: &Database, workdir: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// One spec row for `loop info`'s Specs section. Callers guarantee `spec`
+/// is never the blank-name placeholder — it is hidden, not relabelled.
+fn print_loop_info_spec_line(spec: &LoopSpec) {
+    let admin_tag = if spec.completed_via.as_deref() == Some("admin") {
+        " (admin)"
+    } else {
+        ""
+    };
+    println!(
+        " {} {}{}",
+        spec_status_icon(spec.status),
+        spec.name,
+        admin_tag
+    );
+}
+
+/// Header for the run-history reconstruction of a loop with nothing bound
+/// and nothing in flight (e.g. a drained queue-driven loop). Names the
+/// queue when the loop still links to one, so the reader knows where the
+/// sequence came from.
+fn print_loop_info_queue_history_header(db: &Database, lp: &Loop) -> Result<()> {
+    if let Some(queue_id) = lp.active_run_queue_id.as_deref() {
+        if let Some(queue) = db.get_queue(queue_id)? {
+            println!(
+                " (queue-driven: \"{}\" — showing specs worked so far, not the full queue)",
+                queue.name
+            );
+            return Ok(());
+        }
+    }
+    println!(" (queue-driven — showing specs worked so far, not the full queue)");
+    Ok(())
+}
+
 fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
     // Resolves by id/name (not a browsing list), so an archived loop must
     // still be found here.
@@ -583,49 +618,62 @@ fn handle_loop_info(db: &Database, id_or_name: &str) -> Result<()> {
         }
     }
 
-    let specs = db.list_loop_specs(&lp.id)?;
     let all_runs = db.list_loop_runs_for_loop(&lp.id)?;
     let hook_runs = db.list_loop_completion_hook_runs(&lp.id)?;
 
     println!("\n\x1b[1m── Specs ──────────────────────────────────────────────────────\x1b[0m");
-    if !specs.is_empty() {
-        for spec in &specs {
-            let admin_tag = if spec.completed_via.as_deref() == Some("admin") {
-                " (admin)"
+    // CB30: one helper decides what the loop is on — the raw bound list
+    // reads as a nameless placeholder for queue/idea runs.
+    match active_loop_spec_context(db, lp)? {
+        ActiveLoopSpec::Bound(_) | ActiveLoopSpec::None => {
+            let visible: Vec<LoopSpec> = db
+                .list_loop_specs(&lp.id)?
+                .into_iter()
+                .filter(|spec| !spec.name.trim().is_empty())
+                .collect();
+            if !visible.is_empty() {
+                for spec in &visible {
+                    print_loop_info_spec_line(spec);
+                }
+            } else if !all_runs.is_empty() {
+                // Nothing bound and nothing in flight — e.g. a drained
+                // queue-driven loop. Reconstruct what ran so far from
+                // `loop_runs`, which always records the real `loop_id`
+                // regardless of queue membership. Placeholders are engine
+                // bookkeeping, never work: skip them.
+                print_loop_info_queue_history_header(db, lp)?;
+                for spec_id in distinct_spec_ids_in_order(&all_runs) {
+                    if let Some(spec) = db.get_loop_spec(spec_id)? {
+                        if spec.name.trim().is_empty() {
+                            continue;
+                        }
+                        print_loop_info_spec_line(&spec);
+                    }
+                }
             } else {
-                ""
-            };
-            println!(
-                " {} {}{}",
-                spec_status_icon(spec.status),
-                spec.name,
-                admin_tag
-            );
-        }
-    } else if !all_runs.is_empty() {
-        // No specs are bound to this loop directly — it's draining a queue
-        // (queue members never set `loop_specs.loop_id`, see `LoopEngine::
-        // run_loop`), so there's no fixed queue to show. Reconstruct what
-        // ran so far from `loop_runs`, which always records the real
-        // `loop_id` regardless of queue membership.
-        println!(" (queue-driven — showing specs worked so far, not the full queue)");
-        for spec_id in distinct_spec_ids_in_order(&all_runs) {
-            if let Some(spec) = db.get_loop_spec(spec_id)? {
-                let admin_tag = if spec.completed_via.as_deref() == Some("admin") {
-                    " (admin)"
-                } else {
-                    ""
-                };
-                println!(
-                    " {} {}{}",
-                    spec_status_icon(spec.status),
-                    spec.name,
-                    admin_tag
-                );
+                println!(" (no specs queued)");
             }
         }
-    } else {
-        println!(" (no specs queued)");
+        ActiveLoopSpec::QueueMember {
+            spec, queue_name, ..
+        } => {
+            println!(" (queue-driven: \"{queue_name}\" — showing current spec)");
+            print_loop_info_spec_line(&spec);
+            for spec_id in distinct_spec_ids_in_order(&all_runs) {
+                if *spec_id == spec.id {
+                    continue;
+                }
+                if let Some(prior) = db.get_loop_spec(spec_id)? {
+                    if prior.name.trim().is_empty() {
+                        continue;
+                    }
+                    print_loop_info_spec_line(&prior);
+                }
+            }
+        }
+        ActiveLoopSpec::Idea { .. } => {
+            println!(" (idea-driven — no bound specs)");
+        }
     }
 
     // A `running`-status run row can outlive its loop (e.g. a run left over
@@ -791,18 +839,23 @@ fn loop_progress(db: &Database, lp: &Loop, bound_specs: &[LoopSpec]) -> Result<(
 /// or else the next `pending`/`interrupted` one (equally runnable — see
 /// `queue_next_pending_spec_id`) in position order. Mirrors
 /// `build_loop_summary_json` in `daemon/handler.rs` so the CLI and MCP report
-/// the same "current spec" for a given loop.
+/// the same "current spec" for a given loop. The blank-name placeholder is
+/// engine bookkeeping, never work: it is skipped here, not reported.
 fn current_spec(specs: &[LoopSpec]) -> Option<&LoopSpec> {
     specs
         .iter()
+        .filter(|s| !s.name.trim().is_empty())
         .find(|s| s.status == LoopSpecStatus::Running)
         .or_else(|| {
-            specs.iter().find(|s| {
-                matches!(
-                    s.status,
-                    LoopSpecStatus::Pending | LoopSpecStatus::Interrupted
-                )
-            })
+            specs
+                .iter()
+                .filter(|s| !s.name.trim().is_empty())
+                .find(|s| {
+                    matches!(
+                        s.status,
+                        LoopSpecStatus::Pending | LoopSpecStatus::Interrupted
+                    )
+                })
         })
 }
 
@@ -810,6 +863,7 @@ fn current_spec(specs: &[LoopSpec]) -> Option<&LoopSpec> {
 /// loops (via [`current_spec`]) and queue-driven loops, which never bind a
 /// spec to `loop_specs.loop_id` and so must fall back to `loop_runs` (see
 /// [`Database::list_loop_runs_for_loop`]) to find what's currently running.
+/// A blank-name placeholder resolves to `None`, never to an empty name.
 fn current_spec_name(db: &Database, lp: &Loop, bound_specs: &[LoopSpec]) -> Result<Option<String>> {
     if let Some(spec) = current_spec(bound_specs) {
         return Ok(Some(spec.name.clone()));
@@ -818,7 +872,10 @@ fn current_spec_name(db: &Database, lp: &Loop, bound_specs: &[LoopSpec]) -> Resu
     let Some(run) = current_running_run(&runs).or_else(|| runs.last()) else {
         return Ok(None);
     };
-    Ok(db.get_loop_spec(&run.spec_id)?.map(|s| s.name))
+    Ok(db
+        .get_loop_spec(&run.spec_id)?
+        .filter(|s| !s.name.trim().is_empty())
+        .map(|s| s.name))
 }
 
 /// The run currently in flight, if any — assumes `runs` is ordered by
@@ -1734,6 +1791,88 @@ mod tests {
         ];
         let result = current_spec_name(&db, &lp, &specs).unwrap();
         assert_eq!(result, Some("spec-b".to_string()));
+    }
+
+    #[test]
+    fn loop_surfaces_never_show_blank_name_spec() {
+        // CB30-4: for every dispatch shape (bound, queue, idea) the shared
+        // helper and the `loop list`/`loop info` name lookup never yield a
+        // blank name — the regression is an automated reader concluding
+        // "this loop is on a nameless spec" while it works a named one.
+        use crate::domain::queues::Queue;
+
+        fn assert_no_blank(name: Option<String>, shape: &str) {
+            if let Some(name) = name {
+                assert!(
+                    !name.trim().is_empty(),
+                    "{shape} surface named a blank spec"
+                );
+            }
+        }
+
+        // Queue-driven: placeholder bound to the loop, named member running.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(&dir.path().join("test.db")).unwrap();
+        let mut lp = make_loop("loop-q", "queue-loop", LoopStatus::Running);
+        lp.active_run_queue_id = Some("queue-1".to_string());
+        db.insert_loop(&lp).unwrap();
+        db.insert_queue(&Queue {
+            id: "queue-1".to_string(),
+            name: "Q".to_string(),
+            created_at: Utc::now(),
+        })
+        .unwrap();
+        let mut ph = make_spec("loop-q", "", 0, LoopSpecStatus::Running);
+        db.insert_loop_spec(&ph).unwrap();
+        ph.id = "spec-a".to_string();
+        ph.loop_id = None;
+        ph.name = "QM — real work".to_string();
+        db.insert_loop_spec(&ph).unwrap();
+        db.append_queue_member("queue-1", "spec-a", None).unwrap();
+
+        match active_loop_spec_context(&db, &lp).unwrap() {
+            ActiveLoopSpec::QueueMember { spec, .. } => {
+                assert!(!spec.name.trim().is_empty());
+                assert_eq!(spec.name, "QM — real work");
+            }
+            _ => panic!("queue-driven loop must resolve to QueueMember"),
+        }
+        let bound = db.list_loop_specs("loop-q").unwrap();
+        assert_no_blank(current_spec_name(&db, &lp, &bound).unwrap(), "queue");
+        // The placeholder itself must never be picked as "current".
+        assert!(current_spec(&bound).is_none_or(|s| !s.name.trim().is_empty()));
+
+        // Idea-driven: only the placeholder exists.
+        let mut lp_idea = make_loop("loop-idea", "idea-loop", LoopStatus::Running);
+        lp_idea.id = "loop-idea".to_string();
+        db.insert_loop(&lp_idea).unwrap();
+        db.insert_loop_spec(&make_spec("loop-idea", "", 0, LoopSpecStatus::Running))
+            .unwrap();
+        assert!(matches!(
+            active_loop_spec_context(&db, &lp_idea).unwrap(),
+            ActiveLoopSpec::Idea { .. }
+        ));
+        let bound_idea = db.list_loop_specs("loop-idea").unwrap();
+        assert_no_blank(
+            current_spec_name(&db, &lp_idea, &bound_idea).unwrap(),
+            "idea",
+        );
+
+        // Bound: named specs behave exactly as before.
+        let lp_bound = make_loop("loop-bound", "bound-loop", LoopStatus::Running);
+        db.insert_loop(&lp_bound).unwrap();
+        db.insert_loop_spec(&make_spec(
+            "loop-bound",
+            "Real work",
+            0,
+            LoopSpecStatus::Running,
+        ))
+        .unwrap();
+        let bound_specs = db.list_loop_specs("loop-bound").unwrap();
+        assert_eq!(
+            current_spec_name(&db, &lp_bound, &bound_specs).unwrap(),
+            Some("Real work".to_string())
+        );
     }
 
     #[test]
