@@ -841,11 +841,39 @@ pub struct LoopUpdateEnsembleParams {
     pub straggler_timeout_minutes: Option<Option<i64>>,
     /// New shared member agent timeout in minutes.
     pub timeout_minutes: Option<i64>,
-    /// New `pass` exit target node ID.
+    /// New `pass` exit target node ID — or an ensemble ID to chain this
+    /// ensemble's quorum directly into another ensemble (every member of the
+    /// target gets a pass edge from this quorum, no intermediate node).
     pub on_pass_to: Option<String>,
     /// New `fail` exit target node ID, or null to clear it (dead end on
-    /// fail).
+    /// fail). Accepts an ensemble ID like `on_pass_to`.
     pub on_fail_to: Option<Option<String>>,
+    /// New entry source node ID. Replaces EVERY existing entry edge: after
+    /// this call the ensemble is entered only from `from_node`. Never names
+    /// member nodes — the fan-out to every member is rebuilt as one unit.
+    pub from_node: Option<String>,
+    /// Entry routing condition for `from_node`: pass, fail, or always.
+    /// Omit to keep the ensemble's current entry condition.
+    pub condition: Option<String>,
+    /// Another entry source node ID. Adds entry edges from this node to
+    /// every member while keeping the existing entries, so the ensemble can
+    /// be entered from several places (e.g. a designer, a failing gate, and
+    /// a reviewer bouncing back) with no relay node.
+    pub add_entry_from: Option<String>,
+    /// Entry routing condition for `add_entry_from`. Defaults to always.
+    pub add_entry_condition: Option<String>,
+    /// An entry source node ID to detach. Removes its entry edges to every
+    /// member. Refused when it is the ensemble's last entry source — an
+    /// ensemble always keeps at least one entry.
+    pub remove_entry_from: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopDeleteEnsembleParams {
+    /// Existing ensemble ID. Removes the ensemble as one unit — its member
+    /// nodes, its quorum node, and every edge naming any of them. Refused
+    /// while the owning loop is running, like the other topology tools.
+    pub ensemble_id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

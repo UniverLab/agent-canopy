@@ -11247,6 +11247,54 @@ echo done
         );
     }
 
+    #[test]
+    fn select_next_step_resolves_ensemble_from_any_of_several_entry_sources() {
+        // CM14: an ensemble entered from two different nodes resolves to the
+        // ensemble from EACH of them — multi-source entry needs no relay.
+        let edge = |id: &str, from: &str, to: &str| LoopEdge {
+            id: id.to_string(),
+            spec_id: Some("spec".to_string()),
+            loop_id: None,
+            from_node: from.to_string(),
+            to_node: to.to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Always,
+        };
+        let edges = vec![
+            edge("e1", "designer", "m1"),
+            edge("e2", "designer", "m2"),
+            edge("e3", "gate", "m1"),
+            edge("e4", "gate", "m2"),
+        ];
+        let ensembles = vec![ensemble_details_fixture("ens1", "join1", &["m1", "m2"])];
+
+        for from in ["designer", "gate"] {
+            let next = select_next_step(&edges, &ensembles, from, LoopRunStatus::Pass).unwrap();
+            let sel = next.unwrap();
+            assert_eq!(sel.cursor, SpecCursor::Ensemble("ens1".to_string()));
+        }
+    }
+
+    #[test]
+    fn select_next_step_resolves_chained_ensemble_from_upstream_quorum() {
+        // CM14: a quorum fanned out to another ensemble's members resolves to
+        // that ensemble — chaining needs no intermediate node.
+        let edge = |id: &str, to: &str| LoopEdge {
+            id: id.to_string(),
+            spec_id: Some("spec".to_string()),
+            loop_id: None,
+            from_node: "join1".to_string(),
+            to_node: to.to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Pass,
+        };
+        let edges = vec![edge("e1", "n1"), edge("e2", "n2")];
+        let ensembles = vec![ensemble_details_fixture("ens2", "join2", &["n1", "n2"])];
+
+        let next = select_next_step(&edges, &ensembles, "join1", LoopRunStatus::Pass).unwrap();
+
+        let sel = next.unwrap();
+        assert_eq!(sel.cursor, SpecCursor::Ensemble("ens2".to_string()));
+    }
+
     fn ensemble_details_fixture(
         ensemble_id: &str,
         join_node_id: &str,

@@ -467,6 +467,249 @@ impl Database {
         Ok(())
     }
 
+    /// Replace an ensemble's entry wiring with a single new source, atomically:
+    /// every current entry edge (into a member from outside the unit) is
+    /// deleted and a fresh fan-out from `new_from_node` to every member is
+    /// inserted, and the `ensembles` row's `entry_from_node`/`entry_condition`
+    /// follows — all in one transaction, so a failure leaves the previous
+    /// edges intact rather than an ensemble with no entry. The caller
+    /// (`loop_update_ensemble`) owns validation: `new_from_node` exists in
+    /// the ensemble's graph and is not ensemble-owned.
+    pub fn rewire_ensemble_entry(
+        &self,
+        ensemble_id: &str,
+        new_from_node: &str,
+        new_condition: &LoopEdgeCondition,
+    ) -> Result<()> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let tx = conn.transaction()?;
+        let (spec_id, loop_id, join_node_id, member_ids) =
+            tx_ensemble_graph_scope(&tx, ensemble_id)?;
+
+        delete_entry_edges(&tx, &member_ids, &join_node_id)?;
+        insert_entry_fan_out(
+            &tx,
+            spec_id.as_deref(),
+            loop_id.as_deref(),
+            new_from_node,
+            new_condition,
+            &member_ids,
+        )?;
+        tx.execute(
+            "UPDATE ensembles SET entry_from_node = ?1, entry_condition = ?2 WHERE id = ?3",
+            params![new_from_node, new_condition.as_str(), ensemble_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Add one more entry source to an ensemble, atomically: entry edges from
+    /// `from_node` to every member are inserted alongside the existing ones,
+    /// so the ensemble can be entered from several places with no relay node.
+    /// Refuses a node that is already an entry source. The `ensembles` row is
+    /// untouched — it keeps naming the primary entry.
+    pub fn add_ensemble_entry_source(
+        &self,
+        ensemble_id: &str,
+        from_node: &str,
+        condition: &LoopEdgeCondition,
+    ) -> Result<()> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let tx = conn.transaction()?;
+        let (spec_id, loop_id, _, member_ids) = tx_ensemble_graph_scope(&tx, ensemble_id)?;
+
+        let already: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM loop_edges WHERE from_node = ?1 AND to_node IN (
+                 SELECT node_id FROM ensemble_members WHERE ensemble_id = ?2
+             )",
+            params![from_node, ensemble_id],
+            |row| row.get(0),
+        )?;
+        if already > 0 {
+            anyhow::bail!(
+                "Node '{from_node}' is already an entry source of ensemble '{ensemble_id}'; pass a different node, or detach it first with remove_entry_from."
+            );
+        }
+
+        insert_entry_fan_out(
+            &tx,
+            spec_id.as_deref(),
+            loop_id.as_deref(),
+            from_node,
+            condition,
+            &member_ids,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Detach one entry source from an ensemble, atomically: every entry edge
+    /// from `from_node` to a member is deleted. Refuses the ensemble's last
+    /// entry source (an ensemble always keeps at least one entry), and when
+    /// the detached source was the row's primary entry promotes another
+    /// remaining source so the row never names a source with no edges.
+    pub fn remove_ensemble_entry_source(&self, ensemble_id: &str, from_node: &str) -> Result<()> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let tx = conn.transaction()?;
+        let (_, _, join_node_id, member_ids) = tx_ensemble_graph_scope(&tx, ensemble_id)?;
+
+        let sources = tx_entry_sources(&tx, ensemble_id, &member_ids, &join_node_id)?;
+        if !sources.iter().any(|(node, _)| node == from_node) {
+            anyhow::bail!("Node '{from_node}' is not an entry source of ensemble '{ensemble_id}'.");
+        }
+        if sources.len() < 2 {
+            anyhow::bail!(
+                "Cannot detach '{from_node}': it is the last entry source of ensemble '{ensemble_id}'. Rewire it with from_node instead, or delete the whole unit with loop_delete_ensemble."
+            );
+        }
+
+        tx.execute(
+            "DELETE FROM loop_edges WHERE from_node = ?1 AND to_node IN (
+                 SELECT node_id FROM ensemble_members WHERE ensemble_id = ?2
+             )",
+            params![from_node, ensemble_id],
+        )?;
+
+        let primary: String = tx.query_row(
+            "SELECT entry_from_node FROM ensembles WHERE id = ?1",
+            params![ensemble_id],
+            |row| row.get(0),
+        )?;
+        if primary == from_node {
+            let (next_node, next_condition) = sources
+                .into_iter()
+                .find(|(node, _)| node != from_node)
+                .expect("at least two sources were verified above");
+            tx.execute(
+                "UPDATE ensembles SET entry_from_node = ?1, entry_condition = ?2 WHERE id = ?3",
+                params![next_node, next_condition.as_str(), ensemble_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Retarget one of the quorum's exit wirings (`pass` or `fail`), atomically:
+    /// every existing edge from the join with `condition` is deleted and a
+    /// fresh edge per `to_nodes` is inserted, and the `ensembles` row follows
+    /// in the same transaction. `to_nodes` has one entry for a plain node
+    /// target, or every member of a target ensemble when chaining ensembles
+    /// (no intermediate node) — with `row_target` naming the value stored in
+    /// the row (`on_pass_to`, or `on_fail_to`): the node id, or the target
+    /// ensemble's quorum id when chained. `None` clears `on_fail_to` (a pass
+    /// exit always has a target).
+    pub fn retarget_ensemble_exit(
+        &self,
+        ensemble_id: &str,
+        condition: &LoopEdgeCondition,
+        to_nodes: &[String],
+        row_target: Option<&str>,
+    ) -> Result<()> {
+        if to_nodes.is_empty() {
+            anyhow::bail!("Cannot retarget an ensemble exit to zero targets.");
+        }
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let tx = conn.transaction()?;
+        let (spec_id, loop_id, join_node_id, _) = tx_ensemble_graph_scope(&tx, ensemble_id)?;
+
+        tx.execute(
+            "DELETE FROM loop_edges WHERE from_node = ?1 AND condition = ?2",
+            params![join_node_id, condition.as_str()],
+        )?;
+        for to_node in to_nodes {
+            tx.execute(
+                "INSERT INTO loop_edges (id, spec_id, loop_id, from_node, to_node, condition)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    uuid::Uuid::new_v4().to_string(),
+                    spec_id,
+                    loop_id,
+                    join_node_id,
+                    to_node,
+                    condition.as_str(),
+                ],
+            )?;
+        }
+        match condition {
+            LoopEdgeCondition::Pass => {
+                let Some(target) = row_target else {
+                    anyhow::bail!("A pass exit always has a target.");
+                };
+                tx.execute(
+                    "UPDATE ensembles SET on_pass_to = ?1 WHERE id = ?2",
+                    params![target, ensemble_id],
+                )?;
+            }
+            LoopEdgeCondition::Fail => {
+                tx.execute(
+                    "UPDATE ensembles SET on_fail_to = ?1 WHERE id = ?2",
+                    params![row_target, ensemble_id],
+                )?;
+            }
+            _ => {
+                anyhow::bail!("Ensemble exits only route on pass or fail.");
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Delete an ensemble as one unit — every member node, the quorum node,
+    /// and every edge naming any of them (entry fan-out, member→join fan-in,
+    /// join exits), plus the `ensembles`/`ensemble_members` rows (via `ON
+    /// DELETE CASCADE`) — in one transaction. The caller
+    /// (`loop_delete_ensemble`) owns the guards: loop not running, and no
+    /// other ensemble's exit chained into this one.
+    pub fn delete_ensemble_unit(&self, ensemble_id: &str) -> Result<DeletedEnsembleUnit> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow!("Lock poisoned: {}", e))?;
+        let tx = conn.transaction()?;
+        let (_, _, join_node_id, member_ids) = tx_ensemble_graph_scope(&tx, ensemble_id)?;
+
+        let mut all_owned = member_ids.clone();
+        all_owned.push(join_node_id.clone());
+        let placeholders = all_owned.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let deleted_edges: i64 = tx.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM loop_edges WHERE from_node IN ({placeholders}) OR to_node IN ({placeholders})"
+            ),
+            rusqlite::params_from_iter(all_owned.iter().chain(all_owned.iter())),
+            |row| row.get(0),
+        )?;
+
+        for node_id in &all_owned {
+            tx.execute("DELETE FROM loop_nodes WHERE id = ?1", params![node_id])?;
+        }
+        // The `ensembles` row is typically already gone here: its
+        // `join_node_id`/`entry_from_node`/`on_pass_to` foreign keys are all
+        // `ON DELETE CASCADE`, so deleting the owned nodes above cascades to
+        // the row itself (existence was verified up front by
+        // `tx_ensemble_graph_scope`). Delete explicitly anyway for the case
+        // where a foreign key was deferred — affecting zero rows is fine.
+        tx.execute("DELETE FROM ensembles WHERE id = ?1", params![ensemble_id])?;
+        tx.commit()?;
+        Ok(DeletedEnsembleUnit {
+            ensemble_id: ensemble_id.to_string(),
+            member_node_ids: member_ids,
+            join_node_id,
+            deleted_edge_count: deleted_edges,
+        })
+    }
+
     pub fn insert_ensemble_blueprint(&self, blueprint: &EnsembleBlueprint) -> Result<()> {
         let conn = self
             .conn
@@ -734,6 +977,164 @@ fn from_timestamp(value: i64) -> rusqlite::Result<DateTime<Utc>> {
             )),
         )
     })
+}
+
+/// What [`Database::delete_ensemble_unit`] removed — member and quorum ids
+/// for the response, plus how many wiring edges went with them.
+#[derive(Debug)]
+pub struct DeletedEnsembleUnit {
+    pub ensemble_id: String,
+    pub member_node_ids: Vec<String>,
+    pub join_node_id: String,
+    pub deleted_edge_count: i64,
+}
+
+/// Distinct `(from_node, condition)` entry wirings into an ensemble's members,
+/// derived from the graph's edges rather than the `ensembles` row: every edge
+/// into a member from outside the unit (not from a fellow member, not from
+/// the quorum). The edges ARE the wiring — the row's
+/// `entry_from_node`/`entry_condition` simply names the primary (first)
+/// source — so multi-source entry needs no extra bookkeeping column, and the
+/// engine's fan-out detection (which reads these same edges) works unchanged
+/// no matter how many sources there are.
+pub fn ensemble_entry_sources(
+    members: &[EnsembleMember],
+    join_node_id: &str,
+    edges: &[LoopEdge],
+) -> Vec<(String, LoopEdgeCondition)> {
+    let member_ids: std::collections::HashSet<&str> = members
+        .iter()
+        .map(|member| member.node_id.as_str())
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut sources = Vec::new();
+    for edge in edges {
+        if !member_ids.contains(edge.to_node.as_str()) {
+            continue;
+        }
+        if member_ids.contains(edge.from_node.as_str()) || edge.from_node == join_node_id {
+            continue;
+        }
+        if seen.insert((edge.from_node.clone(), edge.condition.clone())) {
+            sources.push((edge.from_node.clone(), edge.condition.clone()));
+        }
+    }
+    sources.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.as_str().cmp(b.1.as_str())));
+    sources
+}
+
+/// The graph scope plus unit membership every entry/exit transaction needs:
+/// `(spec_id, loop_id, join_node_id, member_ids in position order)`. Bails
+/// when the ensemble does not exist.
+type EnsembleGraphScope = (Option<String>, Option<String>, String, Vec<String>);
+
+fn tx_ensemble_graph_scope(
+    tx: &rusqlite::Transaction<'_>,
+    ensemble_id: &str,
+) -> Result<EnsembleGraphScope> {
+    let (spec_id, loop_id, join_node_id): (Option<String>, Option<String>, String) = tx
+        .query_row(
+            "SELECT spec_id, loop_id, join_node_id FROM ensembles WHERE id = ?1",
+            params![ensemble_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("Ensemble '{ensemble_id}' not found."))?;
+    let mut stmt = tx.prepare(
+        "SELECT node_id FROM ensemble_members WHERE ensemble_id = ?1 ORDER BY position ASC",
+    )?;
+    let member_ids = stmt
+        .query_map(params![ensemble_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok((spec_id, loop_id, join_node_id, member_ids))
+}
+
+/// Entry sources read inside a transaction — same shape as
+/// [`ensemble_entry_sources`], but querying the rows the transaction itself
+/// sees.
+fn tx_entry_sources(
+    tx: &rusqlite::Transaction<'_>,
+    ensemble_id: &str,
+    member_ids: &[String],
+    join_node_id: &str,
+) -> Result<Vec<(String, LoopEdgeCondition)>> {
+    let mut sources = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut stmt = tx.prepare(
+        "SELECT DISTINCT from_node, condition FROM loop_edges WHERE to_node IN (
+             SELECT node_id FROM ensemble_members WHERE ensemble_id = ?1
+         )",
+    )?;
+    let rows = stmt.query_map(params![ensemble_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (from_node, condition_raw) = row?;
+        if member_ids.iter().any(|id| id == &from_node) || from_node == join_node_id {
+            continue;
+        }
+        let Some(condition) = LoopEdgeCondition::from_str(&condition_raw) else {
+            continue;
+        };
+        if seen.insert((from_node.clone(), condition.clone())) {
+            sources.push((from_node, condition));
+        }
+    }
+    sources.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.as_str().cmp(b.1.as_str())));
+    Ok(sources)
+}
+
+/// Delete every entry edge into `member_ids` from outside the unit (same
+/// predicate as [`ensemble_entry_sources`]).
+fn delete_entry_edges(
+    tx: &rusqlite::Transaction<'_>,
+    member_ids: &[String],
+    join_node_id: &str,
+) -> Result<()> {
+    if member_ids.is_empty() {
+        return Ok(());
+    }
+    let placeholders = member_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "DELETE FROM loop_edges WHERE to_node IN ({placeholders})
+         AND from_node NOT IN ({placeholders}) AND from_node <> ?"
+    );
+    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(member_ids.len() * 2 + 1);
+    for id in member_ids {
+        params.push(id);
+    }
+    for id in member_ids {
+        params.push(id);
+    }
+    params.push(&join_node_id);
+    tx.execute(&sql, params.as_slice())?;
+    Ok(())
+}
+
+/// Insert one entry edge per member from `from_node` with `condition`.
+fn insert_entry_fan_out(
+    tx: &rusqlite::Transaction<'_>,
+    spec_id: Option<&str>,
+    loop_id: Option<&str>,
+    from_node: &str,
+    condition: &LoopEdgeCondition,
+    member_ids: &[String],
+) -> Result<()> {
+    for member_id in member_ids {
+        tx.execute(
+            "INSERT INTO loop_edges (id, spec_id, loop_id, from_node, to_node, condition)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                spec_id,
+                loop_id,
+                from_node,
+                member_id,
+                condition.as_str(),
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

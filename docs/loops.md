@@ -101,10 +101,14 @@ Members differ by `platform`/`model`, and each may set its own
 `prompt_override` to review the same input from a different angle instead
 of sharing the template. `loop_update_ensemble` changes the shared prompt
 (propagated to every member without its own override), the member list,
-quorum config (`min_pass`, `straggler_timeout_minutes`), and exit wiring,
-all without touching member nodes directly. `loop_get` returns the
-ensemble as one unit (`ensemble_id`, members, quorum config) alongside
-its expanded nodes.
+quorum config (`min_pass`, `straggler_timeout_minutes`), exit wiring
+(`on_pass_to`/`on_fail_to` take a node id or another ensemble's id, chaining
+quorums with no intermediate node), and entry wiring (`from_node` replaces
+every entry; `add_entry_from`/`remove_entry_from` add or detach one source so
+several nodes can enter with no relay), all without touching member nodes
+directly. `loop_delete_ensemble` removes the whole unit. `loop_get` returns the
+ensemble as one unit (`ensemble_id`, members, quorum config, every entry
+source) alongside its expanded nodes.
 
 The quorum fires only once every member branch has terminated
 (pass, fail, or straggler timeout past
@@ -360,7 +364,7 @@ by reconstructing what ran from the run history.
 
 | Stage | Tools |
 |---|---|
-| Authoring | `loop_create`, `loop_update`, `loop_add_spec`, `loop_update_spec`, `loop_add_node`, `loop_update_node`, `loop_add_edge`, `loop_update_edge`, `loop_delete_edge`, `loop_delete_node`, `loop_add_ensemble`, `loop_update_ensemble`, `loop_copy_node`, `loop_copy_ensemble`, `loop_audit_node_configs` |
+| Authoring | `loop_create`, `loop_update`, `loop_add_spec`, `loop_update_spec`, `loop_add_node`, `loop_update_node`, `loop_add_edge`, `loop_update_edge`, `loop_delete_edge`, `loop_delete_node`, `loop_add_ensemble`, `loop_update_ensemble`, `loop_delete_ensemble`, `loop_copy_node`, `loop_copy_ensemble`, `loop_audit_node_configs` |
 | Sharing | `loop_export`, `loop_import`, `loop_archive`, `loop_restore` |
 | Inspection | `loop_get`, `loop_list`, `loop_node_runs_list`, `loop_node_run_get` |
 | Runtime | `loop_run`, `loop_reset`, `loop_schedule_autorun`, `loop_schedule_continue`, `loop_pause`, `loop_continue`, `loop_complete_node`, `loop_report_blocker`, `loop_preflight` |

@@ -465,7 +465,13 @@ struct EnsembleUnitSpec<'a> {
     entry_from_node: &'a str,
     entry_condition: LoopEdgeCondition,
     on_pass_to: &'a str,
+    /// When the pass exit chains into another ensemble: that ensemble's
+    /// member ids — the quorum fans out to all of them while `on_pass_to`
+    /// holds the target's quorum id. `None` means a plain single-node exit.
+    on_pass_fan_out: Option<Vec<String>>,
     on_fail_to: Option<&'a str>,
+    /// Same as `on_pass_fan_out`, for the fail exit.
+    on_fail_fan_out: Option<Vec<String>>,
     min_pass: i64,
     timeout_minutes: i64,
     straggler_timeout_minutes: Option<i64>,
@@ -557,23 +563,39 @@ fn build_ensemble_unit(spec: &EnsembleUnitSpec) -> BuiltEnsembleUnit {
         created_at: now,
     };
 
-    edges.push(LoopEdge {
-        id: uuid::Uuid::new_v4().to_string(),
-        spec_id: spec.spec_id.clone(),
-        loop_id: spec.loop_id.clone(),
-        from_node: join_node_id.clone(),
-        to_node: spec.on_pass_to.to_string(),
-        condition: LoopEdgeCondition::Pass,
-    });
-    if let Some(on_fail_to) = spec.on_fail_to {
+    // Quorum exits: one edge to the target node — or, when chained into
+    // another ensemble, one edge per member of that ensemble (no intermediate
+    // node). The `ensembles` row still holds the single `on_pass_to`/
+    // `on_fail_to` value (the node id, or the target's quorum id).
+    let pass_targets = spec
+        .on_pass_fan_out
+        .clone()
+        .unwrap_or_else(|| vec![spec.on_pass_to.to_string()]);
+    for to_node in &pass_targets {
         edges.push(LoopEdge {
             id: uuid::Uuid::new_v4().to_string(),
             spec_id: spec.spec_id.clone(),
             loop_id: spec.loop_id.clone(),
             from_node: join_node_id.clone(),
-            to_node: on_fail_to.to_string(),
-            condition: LoopEdgeCondition::Fail,
+            to_node: to_node.clone(),
+            condition: LoopEdgeCondition::Pass,
         });
+    }
+    if let Some(on_fail_to) = spec.on_fail_to {
+        let fail_targets = spec
+            .on_fail_fan_out
+            .clone()
+            .unwrap_or_else(|| vec![on_fail_to.to_string()]);
+        for to_node in &fail_targets {
+            edges.push(LoopEdge {
+                id: uuid::Uuid::new_v4().to_string(),
+                spec_id: spec.spec_id.clone(),
+                loop_id: spec.loop_id.clone(),
+                from_node: join_node_id.clone(),
+                to_node: to_node.clone(),
+                condition: LoopEdgeCondition::Fail,
+            });
+        }
     }
 
     let ensemble = Ensemble {
@@ -851,14 +873,15 @@ fn validate_not_join_kind(kind: LoopNodeKind) -> Result<(), String> {
 /// it belongs to an ensemble (member or quorum) — a member's prompt/platform/
 /// model (including its optional `prompt_override`) and the quorum's own
 /// config are all owned by the ensemble unit, so every edit goes through
-/// `loop_update_ensemble`, never a direct node/edge tool.
+/// `loop_update_ensemble`, never a direct node/edge tool. Deleting the whole
+/// unit is `loop_delete_ensemble`'s job, never `loop_delete_node`'s.
 fn validate_node_not_ensemble_owned(db: &Database, node_id: &str) -> Result<(), String> {
     if let Some(details) = db
         .get_ensemble_by_member_node(node_id)
         .map_err(|e| e.to_string())?
     {
         return Err(format!(
-            "Node '{node_id}' is a member of ensemble '{}' ('{}'); edit it via loop_update_ensemble instead.",
+            "Node '{node_id}' is a member of ensemble '{}' ('{}'); edit it via loop_update_ensemble instead (entry wiring: from_node/add_entry_from/remove_entry_from), and delete the whole unit with loop_delete_ensemble instead of this node.",
             details.ensemble.id, details.ensemble.name
         ));
     }
@@ -867,7 +890,7 @@ fn validate_node_not_ensemble_owned(db: &Database, node_id: &str) -> Result<(), 
         .map_err(|e| e.to_string())?
     {
         return Err(format!(
-            "Node '{node_id}' is the quorum of ensemble '{}' ('{}'); edit it via loop_update_ensemble instead.",
+            "Node '{node_id}' is the quorum of ensemble '{}' ('{}'); edit it via loop_update_ensemble instead (exit wiring: on_pass_to/on_fail_to), and delete the whole unit with loop_delete_ensemble instead of this node.",
             details.ensemble.id, details.ensemble.name
         ));
     }
@@ -2235,7 +2258,9 @@ fn plan_ensemble_copy(
         entry_from_node: &entry_from_node,
         entry_condition: entry_condition.clone(),
         on_pass_to: &on_pass_to,
+        on_pass_fan_out: None,
         on_fail_to: on_fail_to.as_deref(),
+        on_fail_fan_out: None,
         min_pass,
         timeout_minutes,
         straggler_timeout_minutes,
@@ -2254,6 +2279,92 @@ fn plan_ensemble_copy(
         on_pass_to,
         on_fail_to,
     })
+}
+
+/// Where one quorum exit (pass or fail) points: a plain node, or a whole
+/// other ensemble — the chained case, where the quorum fans out to every
+/// member of the target with no intermediate node. The `ensembles` row keeps
+/// naming the target in the same column either way (a node id, or the target
+/// ensemble's quorum id when chained), so reads never need a new column.
+#[derive(Debug)]
+enum EnsembleExitTarget {
+    Node(String),
+    Ensemble {
+        join_node_id: String,
+        member_ids: Vec<String>,
+    },
+}
+
+impl EnsembleExitTarget {
+    /// Edge targets for the fan-out: the single node, or every member of the
+    /// chained ensemble.
+    fn edge_targets(&self) -> Vec<String> {
+        match self {
+            EnsembleExitTarget::Node(id) => vec![id.clone()],
+            EnsembleExitTarget::Ensemble { member_ids, .. } => member_ids.clone(),
+        }
+    }
+
+    /// Value stored in the `ensembles` row's `on_pass_to`/`on_fail_to`
+    /// column: the node id, or the chained ensemble's quorum id.
+    fn row_target(&self) -> String {
+        match self {
+            EnsembleExitTarget::Node(id) => id.clone(),
+            EnsembleExitTarget::Ensemble { join_node_id, .. } => join_node_id.clone(),
+        }
+    }
+}
+
+/// If `raw` names an ensemble (by id or prefix), resolve it as a chained exit
+/// target: the target must live in the same graph (`owner_spec_id`/
+/// `owner_loop_id`) and must not be the source ensemble itself. Returns
+/// `Ok(None)` when `raw` names no ensemble, so the caller falls through to
+/// its plain-node handling — node ids and unknown ids both take that path.
+fn resolve_chained_exit_ensemble(
+    db: &Database,
+    raw: &str,
+    source_ensemble_id: &str,
+    owner_spec_id: Option<&str>,
+    owner_loop_id: Option<&str>,
+) -> Result<Option<EnsembleExitTarget>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let Some(target_id) = db
+        .resolve_ensemble_id_by_prefix(trimmed)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    let details = db
+        .get_ensemble_details(&target_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Ensemble '{target_id}' not found."))?;
+    if !source_ensemble_id.is_empty() && details.ensemble.id == source_ensemble_id {
+        return Err(
+            "An ensemble's exit cannot target itself; pass a different ensemble id or a node id."
+                .to_string(),
+        );
+    }
+    if details.ensemble.spec_id.as_deref() != owner_spec_id
+        || details.ensemble.loop_id.as_deref() != owner_loop_id
+    {
+        return Err(format!(
+            "Ensemble '{}' ('{}') is not in this ensemble's graph; chained exits stay within one graph.",
+            details.ensemble.id, details.ensemble.name
+        ));
+    }
+    if details.members.is_empty() {
+        return Err(format!(
+            "Ensemble '{}' ('{}') has no members to route into.",
+            details.ensemble.id, details.ensemble.name
+        ));
+    }
+    Ok(Some(EnsembleExitTarget::Ensemble {
+        join_node_id: details.ensemble.join_node_id.clone(),
+        member_ids: details.members.iter().map(|m| m.node_id.clone()).collect(),
+    }))
 }
 
 struct SpecRunInfo {
@@ -5613,7 +5724,7 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "loop_add_ensemble",
-        description = "Create an ensemble in ONE call: N (2-8) parallel agent-node members sharing one prompt by default, plus the quorum that waits for all of them, consolidates their outputs (attributed per member), and routes onward. Members differ by platform/model, and each may set its own prompt_override to review the same input from a different angle instead of sharing the template. (Formerly called 'fusion' — retired to avoid colliding with OpenRouter's fusion technology.)"
+        description = "Create an ensemble in ONE call: N (2-8) parallel agent-node members sharing one prompt by default, plus the quorum that waits for all of them, consolidates their outputs (attributed per member), and routes onward. Members differ by platform/model, and each may set its own prompt_override to review the same input from a different angle instead of sharing the template. (Formerly called 'fusion' — retired to avoid colliding with OpenRouter's fusion technology.) on_pass_to/on_fail_to accept a node id or another ensemble's id (chained: the quorum fans out to every member of that ensemble, no intermediate node). Entry rewiring, extra entry sources, and deletion are loop_update_ensemble/loop_delete_ensemble."
     )]
     async fn loop_add_ensemble(
         &self,
@@ -5728,59 +5839,91 @@ impl TaskTriggerHandler {
         }
         if let Err(e) = validate_node_not_ensemble_owned(&self.db, &from_node) {
             return Ok(error_result(&format!(
-                "Cannot wire an ensemble's entry from an ensemble-owned node (nested ensembles are not supported): {e}"
+                "Cannot wire an ensemble's entry from an ensemble-owned node: {e} To chain ensembles, create this one from a plain node and then route the upstream ensemble's exit into it (loop_update_ensemble on_pass_to/on_fail_to accept an ensemble id)."
             )));
         }
 
-        let on_pass_to = match resolve_prefix_or_error(
+        let (owner_spec_id, owner_loop_id): (Option<String>, Option<String>) = match &target {
+            GraphTarget::Spec(spec_id) => (Some(spec_id.clone()), None),
+            GraphTarget::Loop(loop_id) => (None, Some(loop_id.clone())),
+        };
+        // An exit target is a plain node — or, to chain ensembles with no
+        // intermediate node, another ensemble's id (the quorum fans out to
+        // every member of that ensemble).
+        let on_pass_target = match resolve_chained_exit_ensemble(
             &self.db,
             params.on_pass_to.trim(),
-            Database::resolve_loop_node_id_by_prefix,
-            "node",
+            "",
+            owner_spec_id.as_deref(),
+            owner_loop_id.as_deref(),
         ) {
-            Ok(id) => id,
-            Err(e) => return Ok(e),
-        };
-        if let Err(e) = validate_non_empty(&on_pass_to, "on_pass_to") {
-            return Ok(error_result(&e));
-        }
-        if !node_exists(&on_pass_to) {
-            return Ok(error_result(&format!(
-                "Loop node '{on_pass_to}' not found in the target graph."
-            )));
-        }
-        if let Err(e) = validate_node_not_ensemble_owned(&self.db, &on_pass_to) {
-            return Ok(error_result(&format!(
-                "Cannot wire an ensemble's exit into another ensemble's members/quorum (nested ensembles are not supported): {e}"
-            )));
-        }
-
-        let on_fail_to = match &params.on_fail_to {
-            Some(raw) => {
-                match resolve_prefix_or_error(
+            Ok(Some(target)) => target,
+            Ok(None) => {
+                let on_pass_to = match resolve_prefix_or_error(
                     &self.db,
-                    raw.trim(),
+                    params.on_pass_to.trim(),
                     Database::resolve_loop_node_id_by_prefix,
                     "node",
                 ) {
-                    Ok(id) => Some(id),
+                    Ok(id) => id,
                     Err(e) => return Ok(e),
+                };
+                if let Err(e) = validate_non_empty(&on_pass_to, "on_pass_to") {
+                    return Ok(error_result(&e));
+                }
+                if !node_exists(&on_pass_to) {
+                    return Ok(error_result(&format!(
+                        "Loop node '{on_pass_to}' not found in the target graph."
+                    )));
+                }
+                if let Err(e) = validate_node_not_ensemble_owned(&self.db, &on_pass_to) {
+                    return Ok(error_result(&format!(
+                            "Cannot wire an ensemble's exit directly into another ensemble's members/quorum: {e} To route into the whole ensemble, pass its ensemble id as on_pass_to instead of a member/quorum node id."
+                        )));
+                }
+                EnsembleExitTarget::Node(on_pass_to)
+            }
+            Err(e) => return Ok(error_result(&e)),
+        };
+
+        let on_fail_target: Option<EnsembleExitTarget> = match &params.on_fail_to {
+            Some(raw) => {
+                match resolve_chained_exit_ensemble(
+                    &self.db,
+                    raw.trim(),
+                    "",
+                    owner_spec_id.as_deref(),
+                    owner_loop_id.as_deref(),
+                ) {
+                    Ok(Some(target)) => Some(target),
+                    Ok(None) => {
+                        match resolve_prefix_or_error(
+                            &self.db,
+                            raw.trim(),
+                            Database::resolve_loop_node_id_by_prefix,
+                            "node",
+                        ) {
+                            Ok(id) => {
+                                if !node_exists(&id) {
+                                    return Ok(error_result(&format!(
+                                        "Loop node '{id}' not found in the target graph."
+                                    )));
+                                }
+                                if let Err(e) = validate_node_not_ensemble_owned(&self.db, &id) {
+                                    return Ok(error_result(&format!(
+                                    "Cannot wire an ensemble's exit directly into another ensemble's members/quorum: {e} To route into the whole ensemble, pass its ensemble id as on_fail_to instead of a member/quorum node id."
+                                    )));
+                                }
+                                Some(EnsembleExitTarget::Node(id))
+                            }
+                            Err(e) => return Ok(e),
+                        }
+                    }
+                    Err(e) => return Ok(error_result(&e)),
                 }
             }
             None => None,
         };
-        if let Some(ref on_fail_to) = on_fail_to {
-            if !node_exists(on_fail_to) {
-                return Ok(error_result(&format!(
-                    "Loop node '{on_fail_to}' not found in the target graph."
-                )));
-            }
-            if let Err(e) = validate_node_not_ensemble_owned(&self.db, on_fail_to) {
-                return Ok(error_result(&format!(
-                "Cannot wire an ensemble's exit into another ensemble's members/quorum (nested ensembles are not supported): {e}"
-                )));
-            }
-        }
 
         let min_pass = params
             .min_pass
@@ -5815,6 +5958,17 @@ impl TaskTriggerHandler {
             .map(|node| node.position + 1)
             .unwrap_or(1);
 
+        let on_pass_row = on_pass_target.row_target();
+        let on_pass_fan_out = match &on_pass_target {
+            EnsembleExitTarget::Node(_) => None,
+            EnsembleExitTarget::Ensemble { .. } => Some(on_pass_target.edge_targets()),
+        };
+        let (on_fail_row, on_fail_fan_out): (Option<String>, Option<Vec<String>>) =
+            match &on_fail_target {
+                None => (None, None),
+                Some(EnsembleExitTarget::Node(id)) => (Some(id.clone()), None),
+                Some(target) => (Some(target.row_target()), Some(target.edge_targets())),
+            };
         let built = build_ensemble_unit(&EnsembleUnitSpec {
             spec_id,
             loop_id,
@@ -5823,8 +5977,10 @@ impl TaskTriggerHandler {
             members: &members,
             entry_from_node: &from_node,
             entry_condition: condition,
-            on_pass_to: &on_pass_to,
-            on_fail_to: on_fail_to.as_deref(),
+            on_pass_to: &on_pass_row,
+            on_pass_fan_out,
+            on_fail_to: on_fail_row.as_deref(),
+            on_fail_fan_out,
             min_pass,
             timeout_minutes,
             straggler_timeout_minutes: params.straggler_timeout_minutes,
@@ -5974,7 +6130,7 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "loop_update_ensemble",
-        description = "Update an ensemble's shared prompt (propagated to every member without its own prompt_override), member list (platform/model/prompt_override — added/removed/replaced by position), quorum config (min_pass, straggler_timeout_minutes, timeout_minutes), and/or exit wiring (on_pass_to/on_fail_to) — all in one call, without touching individual member nodes directly."
+        description = "Update an ensemble's shared prompt (propagated to every member without its own prompt_override), member list (platform/model/prompt_override — added/removed/replaced by position), quorum config (min_pass, straggler_timeout_minutes, timeout_minutes), entry wiring (from_node/condition replaces every entry; add_entry_from/remove_entry_from add or detach one entry source so several nodes can enter with no relay), and/or exit wiring (on_pass_to/on_fail_to take a node id or another ensemble's id to chain quorums with no intermediate node) — all in one call, without touching individual member nodes directly."
     )]
     async fn loop_update_ensemble(
         &self,
@@ -6009,6 +6165,11 @@ impl TaskTriggerHandler {
                 params.timeout_minutes.is_some(),
                 params.on_pass_to.is_some(),
                 params.on_fail_to.is_some(),
+                params.from_node.is_some(),
+                params.condition.is_some(),
+                params.add_entry_from.is_some(),
+                params.add_entry_condition.is_some(),
+                params.remove_entry_from.is_some(),
             ],
             "loop_update_ensemble",
         ) {
@@ -6244,7 +6405,137 @@ impl TaskTriggerHandler {
                 .map_err(internal_error)?;
         }
 
+        // ── entry wiring: from_node/condition (replace), add_entry_from,
+        // remove_entry_from ─────────────────────────────────────────────
+        // Entry edges are the only ensemble wiring `loop_add_edge` can never
+        // express (members refuse direct edges), so they are all managed here
+        // as one unit: the caller names source nodes, never member ids.
+        if params.from_node.is_some()
+            || params.condition.is_some()
+            || params.add_entry_from.is_some()
+            || params.add_entry_condition.is_some()
+            || params.remove_entry_from.is_some()
+        {
+            if let Err(e) = validate_topology_mutation_allowed(
+                &self.db,
+                details.ensemble.spec_id.as_deref(),
+                details.ensemble.loop_id.as_deref(),
+            ) {
+                return Ok(error_result(&e));
+            }
+            if params.from_node.is_some()
+                && (params.add_entry_from.is_some() || params.remove_entry_from.is_some())
+            {
+                return Ok(error_result(
+                    "from_node replaces every entry edge on its own; pass add_entry_from/remove_entry_from in a separate loop_update_ensemble call.",
+                ));
+            }
+            if params.condition.is_some() && params.from_node.is_none() {
+                return Ok(error_result(
+                    "condition only applies alongside from_node; pass both, or omit condition to keep the current entry condition.",
+                ));
+            }
+            if params.add_entry_condition.is_some() && params.add_entry_from.is_none() {
+                return Ok(error_result(
+                    "add_entry_condition only applies alongside add_entry_from; pass both, or omit add_entry_condition (it defaults to always).",
+                ));
+            }
+            // `owner_nodes` from the member block above is still in scope and
+            // still current — entry ops move edges, never nodes.
+            let node_exists = |id: &str| owner_nodes.iter().any(|node| node.id == id);
+            let resolve_entry_source = |raw: &str, field: &str| -> Result<String, String> {
+                if raw.trim().is_empty() {
+                    return Err(format!("{field} must not be empty."));
+                }
+                let id = self
+                    .db
+                    .resolve_loop_node_id_by_prefix(raw.trim())
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("Loop node '{}' not found.", raw.trim()))?;
+                if !node_exists(&id) {
+                    return Err(format!(
+                        "Loop node '{id}' not found in the ensemble's graph."
+                    ));
+                }
+                if let Err(e) = validate_node_not_ensemble_owned(&self.db, &id) {
+                    return Err(format!(
+                        "Cannot wire an ensemble's entry from an ensemble-owned node: {e} To chain ensembles, route the upstream ensemble's exit into this one instead (loop_update_ensemble on_pass_to/on_fail_to accept an ensemble id)."
+                    ));
+                }
+                Ok(id)
+            };
+
+            if let Some(raw_from) = params.from_node.as_deref() {
+                let from_node = match resolve_entry_source(raw_from, "from_node") {
+                    Ok(id) => id,
+                    Err(e) => return Ok(error_result(&e)),
+                };
+                let entry_condition = match params.condition.as_deref() {
+                    Some(raw) => match validate_edge_condition(raw.trim()) {
+                        Ok(condition) => condition,
+                        Err(e) => return Ok(error_result(&e)),
+                    },
+                    None => details.ensemble.entry_condition.clone(),
+                };
+                if let Err(e) =
+                    self.db
+                        .rewire_ensemble_entry(&ensemble_id, &from_node, &entry_condition)
+                {
+                    return Ok(error_result(&e.to_string()));
+                }
+                details.ensemble.entry_from_node = from_node;
+                details.ensemble.entry_condition = entry_condition;
+            }
+
+            if let Some(raw_remove) = params.remove_entry_from.as_deref() {
+                let remove_from = match resolve_entry_source(raw_remove, "remove_entry_from") {
+                    Ok(id) => id,
+                    Err(e) => return Ok(error_result(&e)),
+                };
+                if let Err(e) = self
+                    .db
+                    .remove_ensemble_entry_source(&ensemble_id, &remove_from)
+                {
+                    return Ok(error_result(&e.to_string()));
+                }
+                if details.ensemble.entry_from_node == remove_from {
+                    details = self
+                        .db
+                        .get_ensemble_details(&ensemble_id)
+                        .map_err(internal_error)?
+                        .ok_or_else(|| {
+                            internal_error(format!("Ensemble '{ensemble_id}' vanished mid-update."))
+                        })?;
+                }
+            }
+
+            if let Some(raw_add) = params.add_entry_from.as_deref() {
+                let add_from = match resolve_entry_source(raw_add, "add_entry_from") {
+                    Ok(id) => id,
+                    Err(e) => return Ok(error_result(&e)),
+                };
+                let add_condition = match params.add_entry_condition.as_deref() {
+                    Some(raw) => match validate_edge_condition(raw.trim()) {
+                        Ok(condition) => condition,
+                        Err(e) => return Ok(error_result(&e)),
+                    },
+                    None => LoopEdgeCondition::Always,
+                };
+                if let Err(e) =
+                    self.db
+                        .add_ensemble_entry_source(&ensemble_id, &add_from, &add_condition)
+                {
+                    return Ok(error_result(&e.to_string()));
+                }
+            }
+        }
+
         // ── exit wiring: on_pass_to / on_fail_to ──────────────────────
+        // Each target is a plain node id — or another ensemble's id, chaining
+        // the quorum directly into that ensemble (one edge per member, no
+        // intermediate node). Both go through the atomic
+        // `retarget_ensemble_exit`, so a failed retarget leaves the previous
+        // edges intact.
         if params.on_pass_to.is_some() || params.on_fail_to.is_some() {
             let owner_nodes = match (&details.ensemble.spec_id, &details.ensemble.loop_id) {
                 (Some(spec_id), None) => {
@@ -6257,86 +6548,163 @@ impl TaskTriggerHandler {
                 _ => Vec::new(),
             };
             let node_exists = |id: &str| owner_nodes.iter().any(|node| node.id == id);
+            let resolve_exit_target = |raw: &str,
+                                       field: &str|
+             -> Result<EnsembleExitTarget, String> {
+                match resolve_chained_exit_ensemble(
+                    &self.db,
+                    raw.trim(),
+                    &ensemble_id,
+                    details.ensemble.spec_id.as_deref(),
+                    details.ensemble.loop_id.as_deref(),
+                ) {
+                    Ok(Some(target)) => Ok(target),
+                    Ok(None) => {
+                        let trimmed = raw.trim();
+                        if trimmed.is_empty() {
+                            return Err(format!("{field} must not be empty."));
+                        }
+                        if !node_exists(trimmed) {
+                            return Err(format!(
+                                "Loop node '{trimmed}' not found in the ensemble's graph."
+                            ));
+                        }
+                        if let Err(e) = validate_node_not_ensemble_owned(&self.db, trimmed) {
+                            return Err(format!(
+                                    "Cannot wire an ensemble's exit directly into another ensemble's members/quorum: {e} To route into the whole ensemble, pass its ensemble id as {field} instead of a member/quorum node id."
+                                ));
+                        }
+                        Ok(EnsembleExitTarget::Node(trimmed.to_string()))
+                    }
+                    Err(e) => Err(e),
+                }
+            };
 
-            if let Some(on_pass_to) = params.on_pass_to.as_deref().map(str::trim) {
-                if let Err(e) = validate_non_empty(on_pass_to, "on_pass_to") {
-                    return Ok(error_result(&e));
+            if let Some(on_pass_to) = params.on_pass_to.as_deref() {
+                let target = match resolve_exit_target(on_pass_to, "on_pass_to") {
+                    Ok(target) => target,
+                    Err(e) => return Ok(error_result(&e)),
+                };
+                if let Err(e) = self.db.retarget_ensemble_exit(
+                    &ensemble_id,
+                    &LoopEdgeCondition::Pass,
+                    &target.edge_targets(),
+                    Some(&target.row_target()),
+                ) {
+                    return Ok(error_result(&e.to_string()));
                 }
-                if !node_exists(on_pass_to) {
-                    return Ok(error_result(&format!(
-                        "Loop node '{on_pass_to}' not found in the ensemble's graph."
-                    )));
-                }
-                if let Err(e) = validate_node_not_ensemble_owned(&self.db, on_pass_to) {
-                    return Ok(error_result(&format!(
-                        "Cannot wire an ensemble's exit into another ensemble's members/quorum: {e}"
-                    )));
-                }
-                self.db
-                    .delete_loop_edges_from_node_with_condition(
-                        &details.ensemble.join_node_id,
-                        &LoopEdgeCondition::Pass,
-                    )
-                    .map_err(internal_error)?;
-                self.db
-                    .insert_loop_edge(&LoopEdge {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        spec_id: details.ensemble.spec_id.clone(),
-                        loop_id: details.ensemble.loop_id.clone(),
-                        from_node: details.ensemble.join_node_id.clone(),
-                        to_node: on_pass_to.to_string(),
-                        condition: LoopEdgeCondition::Pass,
-                    })
-                    .map_err(internal_error)?;
             }
 
             if let Some(on_fail_to) = &params.on_fail_to {
-                self.db
-                    .delete_loop_edges_from_node_with_condition(
-                        &details.ensemble.join_node_id,
-                        &LoopEdgeCondition::Fail,
-                    )
-                    .map_err(internal_error)?;
-                if let Some(target) = on_fail_to
+                match on_fail_to
                     .as_deref()
                     .map(str::trim)
                     .filter(|v| !v.is_empty())
                 {
-                    if !node_exists(target) {
-                        return Ok(error_result(&format!(
-                            "Loop node '{target}' not found in the ensemble's graph."
-                        )));
+                    None => {
+                        // Clear to a dead end on fail.
+                        self.db
+                            .delete_loop_edges_from_node_with_condition(
+                                &details.ensemble.join_node_id,
+                                &LoopEdgeCondition::Fail,
+                            )
+                            .map_err(internal_error)?;
+                        self.db
+                            .update_ensemble_exit_wiring(&ensemble_id, None, Some(None))
+                            .map_err(internal_error)?;
                     }
-                    if let Err(e) = validate_node_not_ensemble_owned(&self.db, target) {
-                        return Ok(error_result(&format!(
-                            "Cannot wire an ensemble's exit into another ensemble's members/quorum: {e}"
-                        )));
+                    Some(target_raw) => {
+                        let target = match resolve_exit_target(target_raw, "on_fail_to") {
+                            Ok(target) => target,
+                            Err(e) => return Ok(error_result(&e)),
+                        };
+                        if let Err(e) = self.db.retarget_ensemble_exit(
+                            &ensemble_id,
+                            &LoopEdgeCondition::Fail,
+                            &target.edge_targets(),
+                            Some(&target.row_target()),
+                        ) {
+                            return Ok(error_result(&e.to_string()));
+                        }
                     }
-                    self.db
-                        .insert_loop_edge(&LoopEdge {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            spec_id: details.ensemble.spec_id.clone(),
-                            loop_id: details.ensemble.loop_id.clone(),
-                            from_node: details.ensemble.join_node_id,
-                            to_node: target.to_string(),
-                            condition: LoopEdgeCondition::Fail,
-                        })
-                        .map_err(internal_error)?;
                 }
             }
-
-            self.db
-                .update_ensemble_exit_wiring(
-                    &ensemble_id,
-                    params.on_pass_to.as_deref(),
-                    params.on_fail_to.as_ref().map(|value| value.as_deref()),
-                )
-                .map_err(internal_error)?;
         }
 
         Ok(success_result(&format!(
             "Ensemble '{ensemble_id}' updated."
         )))
+    }
+
+    #[tool(
+        name = "loop_delete_ensemble",
+        description = "Delete an ensemble — its members, its quorum, and every edge naming any of them — as one operation. Refused while the owning loop is running, like the other topology tools. Refused while another ensemble's exit is chained into it (rewire that exit with loop_update_ensemble first)."
+    )]
+    async fn loop_delete_ensemble(
+        &self,
+        Parameters(params): Parameters<LoopDeleteEnsembleParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let ensemble_id = match resolve_prefix_or_error(
+            &self.db,
+            params.ensemble_id.trim(),
+            Database::resolve_ensemble_id_by_prefix,
+            "ensemble",
+        ) {
+            Ok(id) => id,
+            Err(e) => return Ok(e),
+        };
+        let Some(details) = self
+            .db
+            .get_ensemble_details(&ensemble_id)
+            .map_err(internal_error)?
+        else {
+            return Ok(error_result(&format!(
+                "Ensemble '{ensemble_id}' not found."
+            )));
+        };
+        if let Err(e) = validate_topology_mutation_allowed(
+            &self.db,
+            details.ensemble.spec_id.as_deref(),
+            details.ensemble.loop_id.as_deref(),
+        ) {
+            return Ok(error_result(&e));
+        }
+        // Another ensemble chained into this one holds exit edges from its
+        // quorum to these members and names this quorum in its row — deleting
+        // here would strand both. Rewire there first.
+        let siblings = match (&details.ensemble.spec_id, &details.ensemble.loop_id) {
+            (Some(spec_id), None) => self
+                .db
+                .list_ensembles_for_spec(spec_id)
+                .map_err(internal_error)?,
+            (None, Some(loop_id)) => self
+                .db
+                .list_ensembles_for_loop(loop_id)
+                .map_err(internal_error)?,
+            _ => Vec::new(),
+        };
+        let join_node_id = details.ensemble.join_node_id.as_str();
+        if let Some(blocker) = siblings.iter().find(|sibling| {
+            sibling.ensemble.id != ensemble_id
+                && (sibling.ensemble.on_pass_to.as_str() == join_node_id
+                    || sibling.ensemble.on_fail_to.as_deref() == Some(join_node_id))
+        }) {
+            return Ok(error_result(&format!(
+                "Ensemble '{ensemble_id}' cannot be deleted while ensemble '{}' ('{}') routes its exit into it; rewire that exit with loop_update_ensemble first.",
+                blocker.ensemble.id, blocker.ensemble.name
+            )));
+        }
+
+        match self.db.delete_ensemble_unit(&ensemble_id) {
+            Ok(deleted) => Ok(success_result(&format!(
+                "Ensemble '{}' deleted: {} member(s), its quorum '{}', and {} edge(s) naming them.",
+                deleted.ensemble_id,
+                deleted.member_node_ids.len(),
+                deleted.join_node_id,
+                deleted.deleted_edge_count,
+            ))),
+            Err(e) => Ok(error_result(&e.to_string())),
+        }
     }
 
     // ---- Queue tools (Q1) --------------------------------------------------
@@ -9251,7 +9619,7 @@ fn loop_details_json(db: &Database, lp: &LoopDetails) -> anyhow::Result<serde_js
     let ensembles = db
         .list_ensembles_for_loop(&lp.lp.id)?
         .iter()
-        .map(ensemble_details_json)
+        .map(|details| ensemble_details_json(details, &lp.graph_edges))
         .collect::<Vec<_>>();
 
     let mut out = serde_json::json!({
@@ -9315,9 +9683,19 @@ fn loop_details_json(db: &Database, lp: &LoopDetails) -> anyhow::Result<serde_js
 /// Serialize an ensemble (F1) as the one unit `loop_get`/`loop_update_ensemble`
 /// address — members in position order alongside the join's own config, so a
 /// client can render/edit it without reconstructing it from the underlying
-/// nodes/edges itself.
-fn ensemble_details_json(details: &crate::domain::loops::EnsembleDetails) -> serde_json::Value {
+/// nodes/edges itself. `edges` is the owning graph's full edge list, from
+/// which every entry source (not just the primary `entry_from_node`) is
+/// derived — an ensemble entered from several places shows all of them.
+fn ensemble_details_json(
+    details: &crate::domain::loops::EnsembleDetails,
+    edges: &[LoopEdge],
+) -> serde_json::Value {
     let ensemble = &details.ensemble;
+    let entry_sources = crate::db::ensembles::ensemble_entry_sources(
+        &details.members,
+        &ensemble.join_node_id,
+        edges,
+    );
     serde_json::json!({
         "id": ensemble.id,
         "name": ensemble.name,
@@ -9326,6 +9704,10 @@ fn ensemble_details_json(details: &crate::domain::loops::EnsembleDetails) -> ser
         "join_node_id": ensemble.join_node_id,
         "entry_from_node": ensemble.entry_from_node,
         "entry_condition": ensemble.entry_condition.as_str(),
+        "entry_sources": entry_sources.iter().map(|(node_id, condition)| serde_json::json!({
+            "node_id": node_id,
+            "condition": condition.as_str(),
+        })).collect::<Vec<_>>(),
         "min_pass": ensemble.min_pass,
         "straggler_timeout_minutes": ensemble.straggler_timeout_minutes,
         "effective_straggler_timeout_minutes": ensemble.effective_straggler_timeout_minutes(),
@@ -9403,7 +9785,7 @@ fn loop_spec_details_json(
     let ensembles = db
         .list_ensembles_for_spec(&spec.spec.id)?
         .iter()
-        .map(ensemble_details_json)
+        .map(|details| ensemble_details_json(details, &spec.edges))
         .collect::<Vec<_>>();
 
     Ok(serde_json::json!({
@@ -12599,7 +12981,9 @@ mod tests {
             entry_from_node: from,
             entry_condition: LoopEdgeCondition::Always,
             on_pass_to: to,
+            on_pass_fan_out: None,
             on_fail_to: None,
+            on_fail_fan_out: None,
             min_pass: 2,
             timeout_minutes: 30,
             straggler_timeout_minutes: None,
@@ -16275,7 +16659,7 @@ mod coverage_tests {
                 },
             ],
         };
-        let json = super::ensemble_details_json(&details);
+        let json = super::ensemble_details_json(&details, &[]);
         assert_eq!(json["id"], "ens1");
         assert_eq!(json["min_pass"], 2);
         assert_eq!(json["effective_straggler_timeout_minutes"], 10);
@@ -16321,7 +16705,7 @@ mod coverage_tests {
                 prompt_override: None,
             }],
         };
-        let json = super::ensemble_details_json(&details);
+        let json = super::ensemble_details_json(&details, &[]);
         assert_eq!(json["effective_straggler_timeout_minutes"], 45);
         assert!(json["on_fail_to"].is_null());
     }
@@ -16534,7 +16918,9 @@ mod coverage_tests {
             entry_from_node: "kickoff",
             entry_condition: LoopEdgeCondition::Always,
             on_pass_to: "arbiter",
+            on_pass_fan_out: None,
             on_fail_to: Some("cleanup"),
+            on_fail_fan_out: None,
             min_pass: 1,
             timeout_minutes: 30,
             straggler_timeout_minutes: Some(10),
@@ -16563,7 +16949,9 @@ mod coverage_tests {
             entry_from_node: "start",
             entry_condition: LoopEdgeCondition::Pass,
             on_pass_to: "end",
+            on_pass_fan_out: None,
             on_fail_to: None,
+            on_fail_fan_out: None,
             min_pass: 1,
             timeout_minutes: 15,
             straggler_timeout_minutes: None,
@@ -16595,7 +16983,9 @@ mod coverage_tests {
             entry_from_node: "start",
             entry_condition: LoopEdgeCondition::Always,
             on_pass_to: "end",
+            on_pass_fan_out: None,
             on_fail_to: None,
+            on_fail_fan_out: None,
             min_pass: 3,
             timeout_minutes: 30,
             straggler_timeout_minutes: None,
@@ -22225,7 +22615,8 @@ mod endpoint_tests {
 
         // loop_get's ensemble view distinguishes shared vs. override per
         // member without the caller having to diff node config themselves.
-        let ensembles_json = crate::daemon::handler::ensemble_details_json(&details);
+        let spec_edges = db.list_loop_edges(&spec.id).unwrap();
+        let ensembles_json = crate::daemon::handler::ensemble_details_json(&details, &spec_edges);
         let members_json = ensembles_json["members"].as_array().unwrap();
         assert_eq!(members_json[0]["prompt_source"], "override");
         assert_eq!(members_json[1]["prompt_source"], "shared");
@@ -22318,6 +22709,11 @@ mod endpoint_tests {
                 timeout_minutes: None,
                 on_pass_to: None,
                 on_fail_to: None,
+                from_node: None,
+                condition: None,
+                add_entry_from: None,
+                add_entry_condition: None,
+                remove_entry_from: None,
             }))
             .await
             .unwrap();
@@ -22336,6 +22732,11 @@ mod endpoint_tests {
                 timeout_minutes: None,
                 on_pass_to: None,
                 on_fail_to: None,
+                from_node: None,
+                condition: None,
+                add_entry_from: None,
+                add_entry_condition: None,
+                remove_entry_from: None,
             }))
             .await
             .unwrap();
@@ -22371,6 +22772,11 @@ mod endpoint_tests {
                 timeout_minutes: None,
                 on_pass_to: None,
                 on_fail_to: None,
+                from_node: None,
+                condition: None,
+                add_entry_from: None,
+                add_entry_condition: None,
+                remove_entry_from: None,
             }))
             .await
             .unwrap();
@@ -22421,6 +22827,11 @@ mod endpoint_tests {
                 timeout_minutes: None,
                 on_pass_to: None,
                 on_fail_to: None,
+                from_node: None,
+                condition: None,
+                add_entry_from: None,
+                add_entry_condition: None,
+                remove_entry_from: None,
             }))
             .await
             .unwrap();
@@ -22440,6 +22851,11 @@ mod endpoint_tests {
                 timeout_minutes: None,
                 on_pass_to: None,
                 on_fail_to: None,
+                from_node: None,
+                condition: None,
+                add_entry_from: None,
+                add_entry_condition: None,
+                remove_entry_from: None,
             }))
             .await
             .unwrap();
@@ -22457,6 +22873,11 @@ mod endpoint_tests {
                 timeout_minutes: None,
                 on_pass_to: None,
                 on_fail_to: None,
+                from_node: None,
+                condition: None,
+                add_entry_from: None,
+                add_entry_condition: None,
+                remove_entry_from: None,
             }))
             .await
             .unwrap();
@@ -22474,6 +22895,11 @@ mod endpoint_tests {
                 timeout_minutes: None,
                 on_pass_to: Some(alt_exit.clone()),
                 on_fail_to: None,
+                from_node: None,
+                condition: None,
+                add_entry_from: None,
+                add_entry_condition: None,
+                remove_entry_from: None,
             }))
             .await
             .unwrap();
@@ -22493,6 +22919,11 @@ mod endpoint_tests {
                 timeout_minutes: None,
                 on_pass_to: Some("not-a-node".to_string()),
                 on_fail_to: None,
+                from_node: None,
+                condition: None,
+                add_entry_from: None,
+                add_entry_condition: None,
+                remove_entry_from: None,
             }))
             .await
             .unwrap();
@@ -22509,10 +22940,509 @@ mod endpoint_tests {
                 timeout_minutes: None,
                 on_pass_to: None,
                 on_fail_to: None,
+                from_node: None,
+                condition: None,
+                add_entry_from: None,
+                add_entry_condition: None,
+                remove_entry_from: None,
             }))
             .await
             .unwrap();
         assert!(is_err(&missing_ensemble));
+    }
+
+    // ── CM14: ensemble entry rewiring, multi-source entry, deletion ──
+
+    /// Build a two-member ensemble for the CM14 tests: `name` entered from
+    /// `from_node`, routing on pass to `on_pass_to`.
+    async fn add_two_member_ensemble(
+        handler: &TaskTriggerHandler,
+        spec_id: &str,
+        name: &str,
+        from_node: &str,
+        on_pass_to: &str,
+    ) -> String {
+        let created = handler
+            .loop_add_ensemble(Parameters(LoopAddEnsembleParams {
+                spec_id: Some(spec_id.to_string()),
+                loop_id: None,
+                name: name.to_string(),
+                kind: None,
+                prompt_template: Some("Do the thing {{spec_name}}".to_string()),
+                members: Some(vec![
+                    crate::daemon::params::EnsembleMemberParams {
+                        platform: "claude".to_string(),
+                        model: None,
+                        prompt_override: None,
+                    },
+                    crate::daemon::params::EnsembleMemberParams {
+                        platform: "opencode".to_string(),
+                        model: None,
+                        prompt_override: None,
+                    },
+                ]),
+                blueprint: None,
+                from_node: from_node.to_string(),
+                condition: "always".to_string(),
+                min_pass: None,
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: on_pass_to.to_string(),
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&created), "{}", text(&created));
+        extract_id(&created, "ensemble_id")
+    }
+
+    fn blank_ensemble_update(ensemble_id: &str) -> LoopUpdateEnsembleParams {
+        LoopUpdateEnsembleParams {
+            ensemble_id: ensemble_id.to_string(),
+            kind: None,
+            prompt_template: None,
+            members: None,
+            min_pass: None,
+            straggler_timeout_minutes: None,
+            timeout_minutes: None,
+            on_pass_to: None,
+            on_fail_to: None,
+            from_node: None,
+            condition: None,
+            add_entry_from: None,
+            add_entry_condition: None,
+            remove_entry_from: None,
+        }
+    }
+
+    /// `from_node` moves every entry edge to the new source with the new
+    /// condition and leaves no edge from the old source; a failed rewire
+    /// leaves the previous edges (and row) intact.
+    #[tokio::test]
+    async fn loop_update_ensemble_from_node_replaces_every_entry_edge() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let old_entry = add_agent_node(&handler, &spec.id, "OldEntry").await;
+        let new_entry = add_agent_node(&handler, &spec.id, "NewEntry").await;
+        let arbiter = add_agent_node(&handler, &spec.id, "Arbiter").await;
+        let ensemble_id =
+            add_two_member_ensemble(&handler, &spec.id, "Workers", &old_entry, &arbiter).await;
+        let member_ids: Vec<String> = db
+            .get_ensemble_details(&ensemble_id)
+            .unwrap()
+            .unwrap()
+            .members
+            .iter()
+            .map(|m| m.node_id.clone())
+            .collect();
+
+        let mut update = blank_ensemble_update(&ensemble_id);
+        update.from_node = Some(new_entry.clone());
+        update.condition = Some("pass".to_string());
+        let rewired = handler
+            .loop_update_ensemble(Parameters(update))
+            .await
+            .unwrap();
+        assert!(!is_err(&rewired), "{}", text(&rewired));
+
+        let edges = db.list_loop_edges(&spec.id).unwrap();
+        assert!(
+            !edges
+                .iter()
+                .any(|e| e.from_node == old_entry && member_ids.contains(&e.to_node)),
+            "no entry edge may remain from the old source"
+        );
+        for member_id in &member_ids {
+            assert!(
+                edges.iter().any(|e| e.from_node == new_entry
+                    && e.to_node == *member_id
+                    && e.condition == LoopEdgeCondition::Pass),
+                "new source must reach every member with the new condition"
+            );
+        }
+        let details = db.get_ensemble_details(&ensemble_id).unwrap().unwrap();
+        assert_eq!(details.ensemble.entry_from_node, new_entry);
+        assert_eq!(details.ensemble.entry_condition, LoopEdgeCondition::Pass);
+
+        // A failed rewire (unknown source) changes nothing.
+        let mut bad_update = blank_ensemble_update(&ensemble_id);
+        bad_update.from_node = Some("ghost-node".to_string());
+        let failed = handler
+            .loop_update_ensemble(Parameters(bad_update))
+            .await
+            .unwrap();
+        assert!(is_err(&failed));
+        let edges_after = db.list_loop_edges(&spec.id).unwrap();
+        assert_eq!(edges_after.len(), edges.len());
+        for member_id in &member_ids {
+            assert!(edges_after
+                .iter()
+                .any(|e| e.from_node == new_entry && e.to_node == *member_id));
+        }
+        let details_after = db.get_ensemble_details(&ensemble_id).unwrap().unwrap();
+        assert_eq!(details_after.ensemble.entry_from_node, new_entry);
+    }
+
+    /// An ensemble entered from three different nodes carries entry edges
+    /// from each of them to every member, and the graph still validates —
+    /// the review-loop shape (designer, failing gate, reviewer bouncing
+    /// back) with no relay node.
+    #[tokio::test]
+    async fn loop_update_ensemble_multi_source_entry_reaches_every_member() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let designer = add_agent_node(&handler, &spec.id, "Designer").await;
+        let gate = add_agent_node(&handler, &spec.id, "Gate").await;
+        let reviewer = add_agent_node(&handler, &spec.id, "Reviewer").await;
+        let arbiter = add_agent_node(&handler, &spec.id, "Arbiter").await;
+        let ensemble_id =
+            add_two_member_ensemble(&handler, &spec.id, "Implementers", &designer, &arbiter).await;
+        let member_ids: Vec<String> = db
+            .get_ensemble_details(&ensemble_id)
+            .unwrap()
+            .unwrap()
+            .members
+            .iter()
+            .map(|m| m.node_id.clone())
+            .collect();
+
+        for source in [&gate, &reviewer] {
+            let mut update = blank_ensemble_update(&ensemble_id);
+            update.add_entry_from = Some(source.clone());
+            let added = handler
+                .loop_update_ensemble(Parameters(update))
+                .await
+                .unwrap();
+            assert!(!is_err(&added), "{}", text(&added));
+        }
+
+        let edges = db.list_loop_edges(&spec.id).unwrap();
+        for source in [&designer, &gate, &reviewer] {
+            for member_id in &member_ids {
+                assert!(
+                    edges.iter().any(|e| e.from_node == *source
+                        && e.to_node == *member_id
+                        && e.condition == LoopEdgeCondition::Always),
+                    "source '{source}' must reach member '{member_id}'"
+                );
+            }
+        }
+        // The primary entry is untouched by additive wiring.
+        let details = db.get_ensemble_details(&ensemble_id).unwrap().unwrap();
+        assert_eq!(details.ensemble.entry_from_node, designer);
+
+        // The multi-entry graph validates as a unit.
+        let ensembles = db.list_ensembles_for_spec(&spec.id).unwrap();
+        let nodes = db.list_loop_nodes(&spec.id).unwrap();
+        crate::domain::validation::validate_ensembles_in_graph(&ensembles, &nodes, &edges)
+            .expect("three-source entry must validate");
+
+        // `loop_get` shows every entry source, not just the primary.
+        let got = handler
+            .loop_get(Parameters(LoopGetParams {
+                loop_id: lp.id.clone(),
+            }))
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw_text(&got)).unwrap();
+        let ensembles_json = json["specs"][0]["ensembles"].as_array().unwrap();
+        assert_eq!(ensembles_json.len(), 1);
+        let sources = ensembles_json[0]["entry_sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 3);
+    }
+
+    /// Detaching one entry source removes only its edges; detaching the
+    /// primary promotes another source; the last source cannot be detached.
+    #[tokio::test]
+    async fn loop_update_ensemble_entry_remove_detaches_one_source() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let first = add_agent_node(&handler, &spec.id, "First").await;
+        let second = add_agent_node(&handler, &spec.id, "Second").await;
+        let arbiter = add_agent_node(&handler, &spec.id, "Arbiter").await;
+        let ensemble_id =
+            add_two_member_ensemble(&handler, &spec.id, "Workers", &first, &arbiter).await;
+        let member_ids: Vec<String> = db
+            .get_ensemble_details(&ensemble_id)
+            .unwrap()
+            .unwrap()
+            .members
+            .iter()
+            .map(|m| m.node_id.clone())
+            .collect();
+
+        let mut add = blank_ensemble_update(&ensemble_id);
+        add.add_entry_from = Some(second.clone());
+        assert!(!is_err(
+            &handler.loop_update_ensemble(Parameters(add)).await.unwrap()
+        ));
+
+        // Detach the primary: the other source is promoted in its place.
+        let mut remove = blank_ensemble_update(&ensemble_id);
+        remove.remove_entry_from = Some(first.clone());
+        let removed = handler
+            .loop_update_ensemble(Parameters(remove))
+            .await
+            .unwrap();
+        assert!(!is_err(&removed), "{}", text(&removed));
+        let edges = db.list_loop_edges(&spec.id).unwrap();
+        assert!(!edges.iter().any(|e| e.from_node == first));
+        for member_id in &member_ids {
+            assert!(edges
+                .iter()
+                .any(|e| e.from_node == second && e.to_node == *member_id));
+        }
+        let details = db.get_ensemble_details(&ensemble_id).unwrap().unwrap();
+        assert_eq!(details.ensemble.entry_from_node, second);
+
+        // The last source cannot be detached — and the refusal changes nothing.
+        let edge_count = edges.len();
+        let mut remove_last = blank_ensemble_update(&ensemble_id);
+        remove_last.remove_entry_from = Some(second.clone());
+        let refused = handler
+            .loop_update_ensemble(Parameters(remove_last))
+            .await
+            .unwrap();
+        assert!(is_err(&refused));
+        assert!(text(&refused).contains("last entry source"));
+        assert_eq!(db.list_loop_edges(&spec.id).unwrap().len(), edge_count);
+    }
+
+    /// `loop_delete_ensemble` removes members, quorum and all their edges as
+    /// one unit, leaves the rest of the graph intact, and strands no edge.
+    #[tokio::test]
+    async fn loop_delete_ensemble_removes_members_quorum_and_edges() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let entry = add_agent_node(&handler, &spec.id, "Entry").await;
+        let arbiter = add_agent_node(&handler, &spec.id, "Arbiter").await;
+        let ensemble_id =
+            add_two_member_ensemble(&handler, &spec.id, "Doomed", &entry, &arbiter).await;
+        let details = db.get_ensemble_details(&ensemble_id).unwrap().unwrap();
+        let owned: Vec<String> = details
+            .members
+            .iter()
+            .map(|m| m.node_id.clone())
+            .chain(std::iter::once(details.ensemble.join_node_id.clone()))
+            .collect();
+
+        let deleted = handler
+            .loop_delete_ensemble(Parameters(LoopDeleteEnsembleParams {
+                ensemble_id: ensemble_id.clone(),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&deleted), "{}", text(&deleted));
+
+        for node_id in &owned {
+            assert!(db.get_loop_node(node_id).unwrap().is_none());
+        }
+        assert!(db.get_ensemble_details(&ensemble_id).unwrap().is_none());
+        // The surrounding graph survives.
+        assert!(db.get_loop_node(&entry).unwrap().is_some());
+        assert!(db.get_loop_node(&arbiter).unwrap().is_some());
+        // No dangling edge may name a deleted node.
+        for edge in db.list_loop_edges(&spec.id).unwrap() {
+            assert!(
+                !owned.contains(&edge.from_node) && !owned.contains(&edge.to_node),
+                "dangling edge after delete: {edge:?}"
+            );
+            assert!(db.get_loop_node(&edge.from_node).unwrap().is_some());
+            assert!(db.get_loop_node(&edge.to_node).unwrap().is_some());
+        }
+
+        // Deleting twice reports not-found instead of succeeding silently.
+        let again = handler
+            .loop_delete_ensemble(Parameters(LoopDeleteEnsembleParams { ensemble_id }))
+            .await
+            .unwrap();
+        assert!(is_err(&again));
+    }
+
+    /// Deleting an ensemble while its loop runs is refused and changes nothing.
+    #[tokio::test]
+    async fn loop_delete_ensemble_refused_while_loop_running() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let entry = add_agent_node(&handler, &spec.id, "Entry").await;
+        let arbiter = add_agent_node(&handler, &spec.id, "Arbiter").await;
+        let ensemble_id =
+            add_two_member_ensemble(&handler, &spec.id, "Busy", &entry, &arbiter).await;
+        let details = db.get_ensemble_details(&ensemble_id).unwrap().unwrap();
+        let member_id = details.members[0].node_id.clone();
+
+        db.update_loop_status(&lp.id, LoopStatus::Running, None, None)
+            .unwrap();
+        let refused = handler
+            .loop_delete_ensemble(Parameters(LoopDeleteEnsembleParams {
+                ensemble_id: ensemble_id.clone(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&refused));
+        assert!(text(&refused).contains("running"), "{}", text(&refused));
+        assert!(db.get_ensemble_details(&ensemble_id).unwrap().is_some());
+        assert!(db.get_loop_node(&member_id).unwrap().is_some());
+
+        // Entry rewiring is a topology change too — refused while running.
+        let mut update = blank_ensemble_update(&ensemble_id);
+        update.from_node = Some(entry.clone());
+        let rewired = handler
+            .loop_update_ensemble(Parameters(update))
+            .await
+            .unwrap();
+        assert!(is_err(&rewired));
+        assert!(text(&rewired).contains("running"), "{}", text(&rewired));
+    }
+
+    /// A quorum routes into another ensemble with no intermediate node: the
+    /// node count does not grow, the join fans out to every member of the
+    /// target, and the target cannot be deleted while chained into.
+    #[tokio::test]
+    async fn loop_update_ensemble_chains_quorum_into_another_ensemble() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let designer = add_agent_node(&handler, &spec.id, "Designer").await;
+        let gate = add_agent_node(&handler, &spec.id, "Gate").await;
+        let end = add_agent_node(&handler, &spec.id, "End").await;
+        let implementers =
+            add_two_member_ensemble(&handler, &spec.id, "Implementers", &designer, &end).await;
+        let reviewers = add_two_member_ensemble(&handler, &spec.id, "Reviewers", &gate, &end).await;
+        let impl_details = db.get_ensemble_details(&implementers).unwrap().unwrap();
+        let review_details = db.get_ensemble_details(&reviewers).unwrap().unwrap();
+        let review_member_ids: Vec<String> = review_details
+            .members
+            .iter()
+            .map(|m| m.node_id.clone())
+            .collect();
+        let node_count = db.list_loop_nodes(&spec.id).unwrap().len();
+
+        // Chain: implementers' quorum passes straight into the reviewers.
+        let mut chain = blank_ensemble_update(&implementers);
+        chain.on_pass_to = Some(reviewers.clone());
+        let chained = handler
+            .loop_update_ensemble(Parameters(chain))
+            .await
+            .unwrap();
+        assert!(!is_err(&chained), "{}", text(&chained));
+
+        // No relay node was created for the chain.
+        assert_eq!(db.list_loop_nodes(&spec.id).unwrap().len(), node_count);
+        let edges = db.list_loop_edges(&spec.id).unwrap();
+        for member_id in &review_member_ids {
+            assert!(
+                edges
+                    .iter()
+                    .any(|e| e.from_node == impl_details.ensemble.join_node_id
+                        && e.to_node == *member_id
+                        && e.condition == LoopEdgeCondition::Pass),
+                "quorum must fan out to every member of the chained ensemble"
+            );
+        }
+        let chained_details = db.get_ensemble_details(&implementers).unwrap().unwrap();
+        assert_eq!(
+            chained_details.ensemble.on_pass_to,
+            review_details.ensemble.join_node_id
+        );
+        crate::domain::validation::validate_ensembles_in_graph(
+            &db.list_ensembles_for_spec(&spec.id).unwrap(),
+            &db.list_loop_nodes(&spec.id).unwrap(),
+            &edges,
+        )
+        .expect("chained ensembles must validate");
+
+        // The chained-into ensemble cannot be deleted while targeted.
+        let blocked = handler
+            .loop_delete_ensemble(Parameters(LoopDeleteEnsembleParams {
+                ensemble_id: reviewers.clone(),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&blocked));
+        assert!(text(&blocked).contains("routes its exit into it"));
+
+        // Unchain, then the deletion goes through.
+        let mut unchain = blank_ensemble_update(&implementers);
+        unchain.on_pass_to = Some(end.clone());
+        let unchained = handler
+            .loop_update_ensemble(Parameters(unchain))
+            .await
+            .unwrap();
+        assert!(!is_err(&unchained), "{}", text(&unchained));
+        let deleted = handler
+            .loop_delete_ensemble(Parameters(LoopDeleteEnsembleParams {
+                ensemble_id: reviewers.clone(),
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&deleted), "{}", text(&deleted));
+        assert!(db.get_ensemble_details(&reviewers).unwrap().is_none());
+    }
+
+    /// Member and quorum nodes still refuse direct wiring — and the refusals
+    /// now name the ensemble-level surface that does the job.
+    #[tokio::test]
+    async fn loop_add_edge_still_refuses_ensemble_nodes_with_helpful_message() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let entry = add_agent_node(&handler, &spec.id, "Entry").await;
+        let arbiter = add_agent_node(&handler, &spec.id, "Arbiter").await;
+        let ensemble_id =
+            add_two_member_ensemble(&handler, &spec.id, "Guarded", &entry, &arbiter).await;
+        let details = db.get_ensemble_details(&ensemble_id).unwrap().unwrap();
+        let member_id = details.members[0].node_id.clone();
+        let join_id = details.ensemble.join_node_id.clone();
+
+        let into_member = handler
+            .loop_add_edge(Parameters(LoopAddEdgeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                from_node: entry.clone(),
+                to_node: member_id.clone(),
+                condition: "always".to_string(),
+                route: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&into_member));
+        let member_msg = text(&into_member);
+        assert!(member_msg.contains("loop_update_ensemble"), "{member_msg}");
+        assert!(member_msg.contains("loop_delete_ensemble"), "{member_msg}");
+
+        let out_of_quorum = handler
+            .loop_add_edge(Parameters(LoopAddEdgeParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                from_node: join_id.clone(),
+                to_node: arbiter.clone(),
+                condition: "pass".to_string(),
+                route: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&out_of_quorum));
+        assert!(text(&out_of_quorum).contains("loop_update_ensemble"));
+
+        let delete_member = handler
+            .loop_delete_node(Parameters(LoopDeleteNodeParams { node_id: member_id }))
+            .await
+            .unwrap();
+        assert!(is_err(&delete_member));
+        assert!(text(&delete_member).contains("loop_delete_ensemble"));
+
+        let delete_quorum = handler
+            .loop_delete_node(Parameters(LoopDeleteNodeParams { node_id: join_id }))
+            .await
+            .unwrap();
+        assert!(is_err(&delete_quorum));
+        assert!(text(&delete_quorum).contains("loop_delete_ensemble"));
     }
 
     // ── sync_* / intelligence_* / get_tools / project_* ────────────
@@ -24912,6 +25842,11 @@ mod endpoint_tests {
                 timeout_minutes: None,
                 on_pass_to: None,
                 on_fail_to: None,
+                from_node: None,
+                condition: None,
+                add_entry_from: None,
+                add_entry_condition: None,
+                remove_entry_from: None,
             }))
             .await
             .unwrap();

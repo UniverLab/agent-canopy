@@ -296,6 +296,142 @@ mod ensemble_graph {
         let err = validate_ensembles_in_graph(&details, &nodes, &edges).unwrap_err();
         assert!(err.contains("fewer than 2 members"));
     }
+
+    /// CM14: a quorum fanned out to another ensemble's members validates when
+    /// the row holds the target's quorum id — chaining needs no intermediate
+    /// node.
+    #[test]
+    fn chained_exit_into_another_ensemble_passes() {
+        let (mut details, mut nodes, mut edges) = valid_fixture();
+        // Second ensemble: gate -> {r1} -> join2 -> arbiter. Single member is
+        // fine for a cascade unit.
+        let target = Ensemble {
+            id: "ens2".to_string(),
+            spec_id: Some("spec".to_string()),
+            loop_id: None,
+            name: "Reviewers".to_string(),
+            prompt_template: "{{spec_content}}".to_string(),
+            join_node_id: "join2".to_string(),
+            entry_from_node: "gate".to_string(),
+            entry_condition: LoopEdgeCondition::Always,
+            min_pass: 1,
+            straggler_timeout_minutes: None,
+            timeout_minutes: 30,
+            on_pass_to: "arbiter".to_string(),
+            on_fail_to: None,
+            kind: crate::domain::loops::EnsembleKind::Cascade,
+            round_robin_index: None,
+            created_at: Utc::now(),
+        };
+        let target_members = vec![EnsembleMember {
+            ensemble_id: "ens2".to_string(),
+            node_id: "r1".to_string(),
+            position: 0,
+            platform: "claude".to_string(),
+            model: None,
+            prompt_override: None,
+        }];
+        // ens1's quorum now routes into ens2 instead of the arbiter.
+        details[0].ensemble.on_pass_to = "join2".to_string();
+        details.push(EnsembleDetails {
+            ensemble: target,
+            members: target_members,
+        });
+        nodes.extend([node("gate"), node("r1"), node("join2")]);
+        edges.retain(|e| !(e.from_node == "join1" && e.to_node == "arbiter"));
+        edges.extend([
+            edge("join1", "r1", LoopEdgeCondition::Pass),
+            edge("gate", "r1", LoopEdgeCondition::Always),
+            edge("r1", "join2", LoopEdgeCondition::Always),
+            edge("join2", "arbiter", LoopEdgeCondition::Pass),
+        ]);
+        assert!(validate_ensembles_in_graph(&details, &nodes, &edges).is_ok());
+    }
+
+    /// CM14: a chained exit missing one member's edge is rejected.
+    #[test]
+    fn chained_exit_missing_a_member_edge_is_rejected() {
+        let (mut details, mut nodes, mut edges) = valid_fixture();
+        let target = Ensemble {
+            id: "ens2".to_string(),
+            spec_id: Some("spec".to_string()),
+            loop_id: None,
+            name: "Reviewers".to_string(),
+            prompt_template: "{{spec_content}}".to_string(),
+            join_node_id: "join2".to_string(),
+            entry_from_node: "gate".to_string(),
+            entry_condition: LoopEdgeCondition::Always,
+            min_pass: 2,
+            straggler_timeout_minutes: None,
+            timeout_minutes: 30,
+            on_pass_to: "arbiter".to_string(),
+            on_fail_to: None,
+            kind: crate::domain::loops::EnsembleKind::Parallel,
+            round_robin_index: None,
+            created_at: Utc::now(),
+        };
+        let target_members = vec![
+            EnsembleMember {
+                ensemble_id: "ens2".to_string(),
+                node_id: "r1".to_string(),
+                position: 0,
+                platform: "claude".to_string(),
+                model: None,
+                prompt_override: None,
+            },
+            EnsembleMember {
+                ensemble_id: "ens2".to_string(),
+                node_id: "r2".to_string(),
+                position: 1,
+                platform: "codex".to_string(),
+                model: None,
+                prompt_override: None,
+            },
+        ];
+        details[0].ensemble.on_pass_to = "join2".to_string();
+        details.push(EnsembleDetails {
+            ensemble: target,
+            members: target_members,
+        });
+        nodes.extend([node("gate"), node("r1"), node("r2"), node("join2")]);
+        edges.retain(|e| !(e.from_node == "join1" && e.to_node == "arbiter"));
+        // Only r1 gets the fan-out edge — r2 is missing.
+        edges.extend([
+            edge("join1", "r1", LoopEdgeCondition::Pass),
+            edge("gate", "r1", LoopEdgeCondition::Always),
+            edge("gate", "r2", LoopEdgeCondition::Always),
+            edge("r1", "join2", LoopEdgeCondition::Always),
+            edge("r2", "join2", LoopEdgeCondition::Always),
+            edge("join2", "arbiter", LoopEdgeCondition::Pass),
+        ]);
+        let err = validate_ensembles_in_graph(&details, &nodes, &edges).unwrap_err();
+        assert!(err.contains("no pass edge"), "{err}");
+    }
+
+    /// CM14: an entry source reaching only some members is rejected — entering
+    /// from it would be ambiguous at runtime.
+    #[test]
+    fn incomplete_entry_source_is_rejected() {
+        let (details, nodes, mut edges) = valid_fixture();
+        edges.push(edge("gate", "m1", LoopEdgeCondition::Always));
+        let mut nodes = nodes;
+        nodes.push(node("gate"));
+        let err = validate_ensembles_in_graph(&details, &nodes, &edges).unwrap_err();
+        assert!(err.contains("incomplete entry wiring"), "{err}");
+    }
+
+    /// CM14: every entry source reaching every member validates.
+    #[test]
+    fn complete_multi_source_entry_passes() {
+        let (details, nodes, mut edges) = valid_fixture();
+        edges.extend([
+            edge("gate", "m1", LoopEdgeCondition::Always),
+            edge("gate", "m2", LoopEdgeCondition::Always),
+        ]);
+        let mut nodes = nodes;
+        nodes.push(node("gate"));
+        assert!(validate_ensembles_in_graph(&details, &nodes, &edges).is_ok());
+    }
 }
 
 // ── validate_loop_graph (CB8) ───────────────────────────────────────

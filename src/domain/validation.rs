@@ -130,15 +130,44 @@ pub fn validate_ensembles_in_graph(
                 ));
             }
         }
-        if !has_edge(
-            &ensemble.join_node_id,
+        if !has_ensemble_exit_edge(
+            ensembles,
+            ensemble,
             &ensemble.on_pass_to,
-            LoopEdgeCondition::Pass,
+            &LoopEdgeCondition::Pass,
+            edges,
         ) {
+            let target = exit_target_label(ensembles, ensemble, &ensemble.on_pass_to);
             return Err(format!(
-                "{label}'s quorum has no pass edge to its on_pass_to target."
+                "{label}'s quorum has no pass edge to its on_pass_to target ({target})."
             ));
         }
+        if let Some(on_fail_to) = &ensemble.on_fail_to {
+            if !has_ensemble_exit_edge(
+                ensembles,
+                ensemble,
+                on_fail_to,
+                &LoopEdgeCondition::Fail,
+                edges,
+            ) {
+                let target = exit_target_label(ensembles, ensemble, on_fail_to);
+                return Err(format!(
+                    "{label}'s quorum has no fail edge to its on_fail_to target ({target})."
+                ));
+            }
+        }
+        // Every entry source — the primary `entry_from_node` and any added
+        // via `add_entry_from` — must reach EVERY member. A source reaching
+        // only some members would make entering from it ambiguous at runtime
+        // (the engine resolves an ensemble only when the outgoing targets are
+        // exactly the full member set). This runs after the per-member
+        // primary-entry check below so a broken primary entry keeps its
+        // original message.
+        let member_ids: HashSet<&str> = details
+            .members
+            .iter()
+            .map(|member| member.node_id.as_str())
+            .collect();
         for member in &details.members {
             if !node_exists(&member.node_id) {
                 return Err(format!(
@@ -167,9 +196,85 @@ pub fn validate_ensembles_in_graph(
                 ));
             }
         }
+        {
+            let mut reached: HashMap<&str, HashSet<&str>> = HashMap::new();
+            for edge in edges {
+                if !member_ids.contains(edge.to_node.as_str()) {
+                    continue;
+                }
+                if member_ids.contains(edge.from_node.as_str())
+                    || edge.from_node == ensemble.join_node_id
+                {
+                    continue;
+                }
+                reached
+                    .entry(edge.from_node.as_str())
+                    .or_default()
+                    .insert(edge.to_node.as_str());
+            }
+            let mut sources: Vec<(&str, usize)> =
+                reached.iter().map(|(from, to)| (*from, to.len())).collect();
+            sources.sort_unstable();
+            for (from, count) in sources {
+                if count != member_ids.len() {
+                    return Err(format!(
+                        "{label} has incomplete entry wiring from '{from}': reaches {count} of {} members — rewire with loop_update_ensemble (from_node/add_entry_from).",
+                        member_ids.len()
+                    ));
+                }
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Whether the quorum's exit wiring for `condition` is complete. `target` is
+/// usually a node id (one edge join→node), but when ensembles are chained the
+/// row holds the *target ensemble's quorum id* instead — in which case every
+/// member of that ensemble must have an edge from this join (the fan-out
+/// `loop_update_ensemble` builds, with no intermediate node).
+fn has_ensemble_exit_edge(
+    ensembles: &[EnsembleDetails],
+    ensemble: &crate::domain::loops::Ensemble,
+    target: &str,
+    condition: &LoopEdgeCondition,
+    edges: &[LoopEdge],
+) -> bool {
+    if let Some(target_details) = ensembles.iter().find(|details| {
+        details.ensemble.join_node_id == target && details.ensemble.id != ensemble.id
+    }) {
+        return target_details.members.iter().all(|member| {
+            edges.iter().any(|edge| {
+                edge.from_node == ensemble.join_node_id
+                    && edge.to_node == member.node_id
+                    && edge.condition == *condition
+            })
+        });
+    }
+    edges.iter().any(|edge| {
+        edge.from_node == ensemble.join_node_id
+            && edge.to_node == target
+            && edge.condition == *condition
+    })
+}
+
+/// Human-readable form of an exit target for validation errors: the chained
+/// ensemble's id when the row holds its quorum id, else the node id itself.
+fn exit_target_label(
+    ensembles: &[EnsembleDetails],
+    ensemble: &crate::domain::loops::Ensemble,
+    target: &str,
+) -> String {
+    match ensembles.iter().find(|details| {
+        details.ensemble.join_node_id == target && details.ensemble.id != ensemble.id
+    }) {
+        Some(target_details) => format!(
+            "ensemble '{}' ('{}')",
+            target_details.ensemble.id, target_details.ensemble.name
+        ),
+        None => format!("node '{target}'"),
+    }
 }
 
 /// A state that ends the graph — a node with no outgoing edge for that state.
