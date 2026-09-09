@@ -1974,7 +1974,7 @@ impl LoopEngine {
                         None
                     };
 
-                    let (final_execution, run, had_infra_crash) = loop {
+                    let (final_execution, run, mut had_infra_crash) = loop {
                         let execution = self
                             .execute_node(
                                 lp,
@@ -2103,7 +2103,7 @@ impl LoopEngine {
                     // of `pass`. A node that moved history without the right
                     // to fails, and the fail is persisted on the run row so
                     // `canopy loop info` shows it.
-                    let final_execution = match &commit_watch {
+                    let mut final_execution = match &commit_watch {
                         Some(watch) => match watch.violation(workdir).await {
                             Some(head_after) => {
                                 let violation = commit_rights_failure(
@@ -2132,22 +2132,62 @@ impl LoopEngine {
                         None => final_execution,
                     };
 
-                    // C15: if this node carries commit rights and its own
-                    // execution moved HEAD, that new HEAD is evidence this
-                    // *run* itself committed — record it regardless of the
-                    // node's own pass/fail verdict (an infra crash right
-                    // after a successful commit still leaves the commit
-                    // behind, and it must still count). Persisted eagerly so
-                    // a daemon restart before the next node dispatches never
-                    // loses it, and kept in sync with the in-memory value
-                    // handed to every check node from here on in this
-                    // dispatch.
-                    if let Some(head_before) = committer_head_before.as_deref() {
-                        if let Some(head_after) = capture_workdir_head(workdir).await {
-                            if head_after != head_before {
-                                self.db
-                                    .set_loop_spec_committed_head(&spec.id, Some(&head_after))?;
-                                spec_committed_head = Some(head_after);
+                    // CB39: verify spec_start_head is still an ancestor of
+                    // HEAD after a committing node's turn. Runs whether the
+                    // node reported pass or fail. Skipped when there is no
+                    // spec_start_head (non-git workdir) — the engine stays
+                    // usable outside git.
+                    let ancestry_broken = if let (Some(start_head), Some(_head_before)) =
+                        (spec_start_head.as_deref(), committer_head_before.as_deref())
+                    {
+                        match check_start_head_ancestry(workdir, start_head).await {
+                            Some(true) => false,
+                            Some(false) => {
+                                let current_head = capture_workdir_head(workdir)
+                                    .await
+                                    .unwrap_or_else(|| "<unknown>".to_string());
+                                let ancestry_fail = ancestry_failure(
+                                    &spec.name,
+                                    start_head,
+                                    &current_head,
+                                    final_execution.output.clone(),
+                                );
+                                tracing::warn!(
+                                    spec = %spec.name,
+                                    spec_start_head = %start_head,
+                                    current_head = %current_head,
+                                    "spec_start_head is no longer an ancestor of HEAD"
+                                );
+                                self.db.update_loop_run_result(
+                                    &run_id,
+                                    LoopRunStatus::Fail,
+                                    Some(&ancestry_fail.output),
+                                    Some(chrono::Utc::now()),
+                                )?;
+                                final_execution = ancestry_fail;
+                                had_infra_crash = true;
+                                true
+                            }
+                            None => false, // non-git workdir, skip
+                        }
+                    } else {
+                        false
+                    };
+
+                    // C15: only write spec_committed_head when ancestry check
+                    // passed (or was skipped). A broken ancestry means the start
+                    // head is orphaned — recording a committed head would mask
+                    // the problem.
+                    if !ancestry_broken {
+                        if let Some(head_before) = committer_head_before.as_deref() {
+                            if let Some(head_after) = capture_workdir_head(workdir).await {
+                                if head_after != head_before {
+                                    self.db.set_loop_spec_committed_head(
+                                        &spec.id,
+                                        Some(&head_after),
+                                    )?;
+                                    spec_committed_head = Some(head_after);
+                                }
                             }
                         }
                     }
@@ -6659,6 +6699,24 @@ async fn capture_workdir_head(workdir: &str) -> Option<String> {
     (!head.is_empty()).then_some(head)
 }
 
+/// CB39: whether `start_head` is still an ancestor of the workdir's current
+/// HEAD. Returns `Some(true)` when it is (the invariant holds), `Some(false)`
+/// when it is not (history was rewritten past the spec's baseline), and `None`
+/// when the check cannot be performed (non-git workdir or missing start head)
+/// — the caller skips verification in that case.
+async fn check_start_head_ancestry(workdir: &str, start_head: &str) -> Option<bool> {
+    let output = Command::new("git")
+        .arg("merge-base")
+        .arg("--is-ancestor")
+        .arg(start_head)
+        .arg("HEAD")
+        .current_dir(workdir)
+        .output()
+        .await
+        .ok()?;
+    Some(output.status.success())
+}
+
 /// Whether this node is a designated committer (B37): explicit graph
 /// configuration, `commit_rights: true`, never inferred from the node's name,
 /// kind, or prompt. Absent the key, a node has no commit rights.
@@ -6748,6 +6806,41 @@ fn commit_rights_failure(
             "node_id": node_id,
             "head_before": head_before,
             "head_after": head_after,
+            "message": message,
+        }),
+    );
+    output.insert("node_output".to_string(), node_output);
+
+    NodeExecution {
+        output: Value::Object(output),
+        summary: message,
+        status: LoopRunStatus::Fail,
+    }
+}
+
+/// CB39: turn a detected ancestry violation into the node's actual result.
+/// The message names the spec, the recorded start head, and the current HEAD
+/// — all inline, because the triage node that reads this has no repository
+/// access.
+fn ancestry_failure(
+    spec_name: &str,
+    spec_start_head: &str,
+    current_head: &str,
+    node_output: Value,
+) -> NodeExecution {
+    let message = format!(
+        "Spec '{spec_name}': recorded start head {spec_start_head} is no longer an ancestor \
+         of HEAD ({current_head}). History was rewritten past the spec's baseline \
+         (amend, reset, or rebase). The run is failed as infrastructure — \
+         the commit was left in place, a human must decide."
+    );
+    let mut output = serde_json::Map::new();
+    output.insert(
+        "ancestry_violation".to_string(),
+        serde_json::json!({
+            "spec": spec_name,
+            "spec_start_head": spec_start_head,
+            "current_head": current_head,
             "message": message,
         }),
     );
@@ -7602,6 +7695,213 @@ mod tests {
             Some(false),
             1
         )));
+    }
+
+    // ── CB39: spec_start_head ancestry verification ──────────────────────
+
+    #[tokio::test]
+    async fn committer_that_amends_previous_commit_fails_as_infrastructure() {
+        // Two committing nodes in one spec: the second rewrites history so
+        // spec_start_head is no longer reachable. The ancestry check must
+        // fail the second node's run as infrastructure and route via Break.
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        init_git_repo(dir.path());
+
+        // committer1: commits normally (pass edge -> committer2)
+        db.insert_loop_node(&rights_node(
+            &spec_id,
+            "committer1",
+            "git commit -q --allow-empty -m 'spec work'",
+            Some(true),
+            1,
+        ))
+        .unwrap();
+        // committer2: create a disconnected root commit so spec_start_head
+        // (captured before committer1 ran) is no longer reachable.
+        db.insert_loop_node(&rights_node(
+            &spec_id,
+            "committer2",
+            "git checkout --orphan fresh && git rm -rf . && echo disconnected > file.txt && git add . && git commit -m 'disconnected root' && git checkout -B main && git checkout main",
+            Some(true),
+            2,
+        ))
+        .unwrap();
+        // triage: reached via Break edge from committer2
+        db.insert_loop_node(&rights_node(&spec_id, "triage", "true", None, 3))
+            .unwrap();
+        // done: reached via Pass edge from committer2 (should NOT be reached)
+        db.insert_loop_node(&rights_node(&spec_id, "done", "true", None, 4))
+            .unwrap();
+
+        db.insert_loop_edge(&LoopEdge {
+            id: "e-pass-12".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "committer1".to_string(),
+            to_node: "committer2".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Pass,
+        })
+        .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "e-pass-2d".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "committer2".to_string(),
+            to_node: "done".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Pass,
+        })
+        .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "e-break-2t".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "committer2".to_string(),
+            to_node: "triage".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Break,
+        })
+        .unwrap();
+
+        engine
+            .run_loop(loop_id.clone(), None, None, None, None)
+            .await
+            .unwrap();
+
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+
+        // committer1 passed normally
+        let c1 = runs.iter().find(|r| r.node_id == "committer1").unwrap();
+        assert_eq!(c1.status, LoopRunStatus::Pass);
+
+        // committer2 failed — ancestry violation
+        let c2 = runs.iter().find(|r| r.node_id == "committer2").unwrap();
+        assert_eq!(c2.status, LoopRunStatus::Fail);
+        let output = c2.output.as_ref().unwrap();
+        let violation = output.get("ancestry_violation").unwrap();
+        assert!(
+            violation
+                .get("spec_start_head")
+                .and_then(|v| v.as_str())
+                .is_some(),
+            "violation must name the recorded spec_start_head"
+        );
+        assert!(
+            violation
+                .get("current_head")
+                .and_then(|v| v.as_str())
+                .is_some(),
+            "violation must name the current HEAD"
+        );
+        assert!(
+            violation
+                .get("message")
+                .and_then(|v| v.as_str())
+                .is_some_and(|m| m.contains("no longer an ancestor")),
+            "the reason must be stated in plain words"
+        );
+
+        // Break edge was taken — triage ran
+        assert!(
+            runs.iter().any(|r| r.node_id == "triage"),
+            "the Break edge must have been taken to triage"
+        );
+        // done must NOT have run
+        assert!(
+            !runs.iter().any(|r| r.node_id == "done"),
+            "the Pass edge must not have been taken to done"
+        );
+
+        // spec_committed_head must NOT have been updated to the disconnected
+        // root — it still holds committer1's value (or none if committer1
+        // didn't commit). The ancestry check prevents masking the problem.
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        if let Some(ref ch) = spec.spec_committed_head {
+            assert_ne!(
+                ch,
+                &git_head(dir.path()),
+                "spec_committed_head must not be the disconnected root"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn committer_that_commits_normally_passes_and_records_committed_head() {
+        // A single committing node that commits normally: ancestry check
+        // passes, spec_committed_head is written, no ancestry_violation.
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        init_git_repo(dir.path());
+
+        db.insert_loop_node(&rights_node(
+            &spec_id,
+            "committer",
+            "git commit -q --allow-empty -m 'work'",
+            Some(true),
+            1,
+        ))
+        .unwrap();
+
+        engine
+            .run_loop(loop_id.clone(), None, None, None, None)
+            .await
+            .unwrap();
+
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(spec.status, LoopSpecStatus::Completed);
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        assert_eq!(runs[0].status, LoopRunStatus::Pass);
+        assert!(
+            runs[0]
+                .output
+                .as_ref()
+                .is_none_or(|o| o.get("ancestry_violation").is_none()),
+            "no ancestry violation on a clean commit"
+        );
+        // spec_committed_head must be written
+        assert!(
+            spec.spec_committed_head.is_some(),
+            "spec_committed_head must be recorded after a clean commit"
+        );
+        assert_eq!(
+            spec.spec_committed_head.as_deref(),
+            Some(git_head(dir.path()).as_str()),
+            "spec_committed_head must match the actual HEAD"
+        );
+    }
+
+    #[tokio::test]
+    async fn ancestry_check_skipped_in_non_git_workdir() {
+        // Non-git workdir: ancestry check must be skipped (no error).
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+
+        db.insert_loop_node(&rights_node(&spec_id, "worker", "true", None, 1))
+            .unwrap();
+        db.insert_loop_node(&rights_node(&spec_id, "committer", "true", Some(true), 2))
+            .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "e-pass".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "worker".to_string(),
+            to_node: "committer".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Pass,
+        })
+        .unwrap();
+
+        engine
+            .run_loop(loop_id.clone(), None, None, None, None)
+            .await
+            .unwrap();
+
+        let spec = db.get_loop_spec(&spec_id).unwrap().unwrap();
+        assert_eq!(spec.status, LoopSpecStatus::Completed);
+        let runs = db.list_loop_runs_for_spec(&spec_id).unwrap();
+        assert_eq!(runs[0].status, LoopRunStatus::Pass);
+        assert!(
+            runs[0]
+                .output
+                .as_ref()
+                .is_none_or(|o| o.get("ancestry_violation").is_none()),
+            "non-git workdir must not produce an ancestry violation"
+        );
     }
 
     // ── B10: spec_start_head frozen-per-attempt, amend-proof ─────────────
