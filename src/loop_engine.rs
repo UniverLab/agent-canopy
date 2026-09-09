@@ -1850,9 +1850,28 @@ impl LoopEngine {
 
             let (final_execution, from_node_id, run_id, had_infra_crash) = match &cursor {
                 SpecCursor::Node(node_id) => {
-                    let node = nodes_by_id
-                        .get(node_id.as_str())
+                    // CM15: the dispatched node's CONFIG (platform, model, effort,
+                    // prompt, timeout, commit_rights, resume — everything read by
+                    // execute_agent_node / execute_check_node / execute_router_node)
+                    // is read from the database HERE, at the moment of dispatch —
+                    // not from the per-run `nodes` snapshot. So a loop_update_node
+                    // applied between two dispatches of this node lands on the
+                    // second dispatch (FR1). This read happens exactly once, before
+                    // the run row below is created, and the same `node` value is
+                    // reused for every infra retry of this dispatch, so a config
+                    // change never disturbs a run already in flight (FR3). The run
+                    // record still names the platform/model actually used because
+                    // execute_agent_node derives them from this same `node` (FR4).
+                    // `nodes_by_id` (the launch snapshot) stays authoritative for
+                    // graph TOPOLOGY — kind, position, edges, router routes — which
+                    // loop_update_node / loop_update_ensemble refuse to change while
+                    // the loop is `running` (FR5).
+                    let node_fresh = self
+                        .db
+                        .get_loop_node(node_id.as_str())
+                        .map_err(|e| anyhow!("Loop node '{}' lookup failed: {e}", node_id))?
                         .ok_or_else(|| anyhow!("Loop node '{}' not found.", node_id))?;
+                    let node = &node_fresh;
                     let (retry_limit, crash_max_secs, backoff_secs) = read_infra_config(node);
                     let mut attempt: u32 = 0;
                     // RS2: resume candidate for this attempt. On the first
@@ -2174,10 +2193,21 @@ impl LoopEngine {
                     )
                 }
                 SpecCursor::Ensemble(ensemble_id) => {
-                    let details = ensembles
-                        .iter()
-                        .find(|details| &details.ensemble.id == ensemble_id)
+                    // CM15: the ensemble's MEMBER SET and shared prompt are read
+                    // from the database HERE, once per dispatch of this ensemble
+                    // step (NFR3: the whole set in one read, never member-by-member
+                    // across an await), so a loop_update_ensemble applied between
+                    // two dispatches lands on the second (FR2). The launch-time
+                    // `ensembles` snapshot stays authoritative for the ensemble's
+                    // WIRING (entry/exit edges, used by cursor_node_ids /
+                    // select_next_step) and its `kind`, which loop_update_ensemble
+                    // refuses to change while the loop is `running` (FR5).
+                    let details_fresh = self
+                        .db
+                        .get_ensemble_details(ensemble_id)
+                        .map_err(|e| anyhow!("Ensemble '{}' lookup failed: {e}", ensemble_id))?
                         .ok_or_else(|| anyhow!("Ensemble '{}' not found in graph.", ensemble_id))?;
+                    let details = &details_fresh;
                     let final_execution = self
                         .execute_ensemble(
                             lp,
@@ -2539,6 +2569,30 @@ impl LoopEngine {
         // to force an immediate one in a fast test.
         let straggler_minutes = ensemble.effective_straggler_timeout_minutes().max(0) as u64;
 
+        // CM15: every member node's CONFIG (platform/model/prompt/timeout/…) is
+        // read fresh here, once, before any member task is spawned — so a
+        // loop_update_ensemble between two dispatches of this step lands on the
+        // second (FR2), and this dispatch can never see a half-applied member
+        // set (NFR3). See the load-point comment in run_spec's
+        // SpecCursor::Ensemble arm. `nodes_by_id` (launch snapshot) is still used
+        // for the commit-rights roster below because an ensemble member's
+        // commit_rights cannot change on a running loop — loop_update_node
+        // refuses ensemble-owned nodes and loop_update_ensemble has no such field.
+        let mut member_nodes: HashMap<String, LoopNode> = HashMap::new();
+        for member in &details.members {
+            let n = self
+                .db
+                .get_loop_node(&member.node_id)
+                .map_err(|e| {
+                    anyhow!(
+                        "Ensemble member node '{}' lookup failed: {e}",
+                        member.node_id
+                    )
+                })?
+                .ok_or_else(|| anyhow!("Ensemble member node '{}' not found.", member.node_id))?;
+            member_nodes.insert(member.node_id.clone(), n);
+        }
+
         // B37: members run concurrently against one workdir, so a moved HEAD
         // cannot be attributed to a single member — enforcement is therefore
         // at ensemble granularity, and the quorum fails as a whole. Skipped
@@ -2553,10 +2607,10 @@ impl LoopEngine {
 
         let mut set = tokio::task::JoinSet::new();
         for member in &details.members {
-            let node = (*nodes_by_id
-                .get(member.node_id.as_str())
-                .ok_or_else(|| anyhow!("Ensemble member node '{}' not found.", member.node_id))?)
-            .clone();
+            let node = member_nodes
+                .get(&member.node_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("Ensemble member node '{}' not found.", member.node_id))?;
             let run_id = uuid::Uuid::new_v4().to_string();
             self.db.insert_loop_run(&LoopNodeRun {
                 id: run_id.clone(),
@@ -3048,6 +3102,30 @@ impl LoopEngine {
         let ensemble = &details.ensemble;
         let straggler_minutes = ensemble.effective_straggler_timeout_minutes().max(0) as u64;
 
+        // CM15: every member node's CONFIG (platform/model/prompt/timeout/…) is
+        // read fresh here, once, before any member task is spawned — so a
+        // loop_update_ensemble between two dispatches of this step lands on the
+        // second (FR2), and this dispatch can never see a half-applied member
+        // set (NFR3). See the load-point comment in run_spec's
+        // SpecCursor::Ensemble arm. `nodes_by_id` (launch snapshot) is still used
+        // for the commit-rights roster below because an ensemble member's
+        // commit_rights cannot change on a running loop — loop_update_node
+        // refuses ensemble-owned nodes and loop_update_ensemble has no such field.
+        let mut member_nodes: HashMap<String, LoopNode> = HashMap::new();
+        for member in &details.members {
+            let n = self
+                .db
+                .get_loop_node(&member.node_id)
+                .map_err(|e| {
+                    anyhow!(
+                        "Ensemble member node '{}' lookup failed: {e}",
+                        member.node_id
+                    )
+                })?
+                .ok_or_else(|| anyhow!("Ensemble member node '{}' not found.", member.node_id))?;
+            member_nodes.insert(member.node_id.clone(), n);
+        }
+
         let any_member_may_commit = details.members.iter().any(|member| {
             nodes_by_id
                 .get(member.node_id.as_str())
@@ -3059,10 +3137,10 @@ impl LoopEngine {
         let previous_output_owned = previous_output.cloned();
 
         for member in &details.members {
-            let node = (*nodes_by_id
-                .get(member.node_id.as_str())
-                .ok_or_else(|| anyhow!("Ensemble member node '{}' not found.", member.node_id))?)
-            .clone();
+            let node = member_nodes
+                .get(&member.node_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("Ensemble member node '{}' not found.", member.node_id))?;
 
             let (execution, member_had_no_verdict) = self
                 .run_ensemble_member(
@@ -3247,6 +3325,30 @@ impl LoopEngine {
 
         let straggler_minutes = ensemble.effective_straggler_timeout_minutes().max(0) as u64;
 
+        // CM15: every member node's CONFIG (platform/model/prompt/timeout/…) is
+        // read fresh here, once, before any member task is spawned — so a
+        // loop_update_ensemble between two dispatches of this step lands on the
+        // second (FR2), and this dispatch can never see a half-applied member
+        // set (NFR3). See the load-point comment in run_spec's
+        // SpecCursor::Ensemble arm. `nodes_by_id` (launch snapshot) is still used
+        // for the commit-rights roster below because an ensemble member's
+        // commit_rights cannot change on a running loop — loop_update_node
+        // refuses ensemble-owned nodes and loop_update_ensemble has no such field.
+        let mut member_nodes: HashMap<String, LoopNode> = HashMap::new();
+        for member in &details.members {
+            let n = self
+                .db
+                .get_loop_node(&member.node_id)
+                .map_err(|e| {
+                    anyhow!(
+                        "Ensemble member node '{}' lookup failed: {e}",
+                        member.node_id
+                    )
+                })?
+                .ok_or_else(|| anyhow!("Ensemble member node '{}' not found.", member.node_id))?;
+            member_nodes.insert(member.node_id.clone(), n);
+        }
+
         // The failover walk may run any member, so watch commits across the
         // whole roster, exactly as cascade does.
         let any_member_may_commit = details.members.iter().any(|member| {
@@ -3266,10 +3368,10 @@ impl LoopEngine {
         for offset in 0..member_count {
             let current_index = (start_index + offset).rem_euclid(member_count);
             let member = &details.members[current_index as usize];
-            let node = (*nodes_by_id
-                .get(member.node_id.as_str())
-                .ok_or_else(|| anyhow!("Ensemble member node '{}' not found.", member.node_id))?)
-            .clone();
+            let node = member_nodes
+                .get(&member.node_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("Ensemble member node '{}' not found.", member.node_id))?;
 
             let (execution, member_had_no_verdict) = self
                 .run_ensemble_member(
@@ -7690,6 +7792,186 @@ mod tests {
                  the reviewer committed between every one of them"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn cm15_node_redispatch_reads_config_from_db_not_launch_snapshot() {
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        let ran_log = dir.path().join("ran.log");
+        let counter = dir.path().join("cnt");
+
+        // node-a: writes a config-derived marker each time it runs. Its command is
+        // rewritten (below) between its first and second dispatch.
+        db.insert_loop_node(&LoopNode {
+            id: "node-a".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "a".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": format!("printf A1 >> \"{}\"", ran_log.display()),
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        // node-b: fails once (sleeping 0.5s to widen the update window), then passes.
+        db.insert_loop_node(&LoopNode {
+            id: "node-b".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "b".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": format!(
+                    "n=$(cat \"{c}\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"{c}\"; \
+                     [ \"$n\" -ge 2 ] && printf APPROVED || {{ sleep 0.5; exit 1; }}",
+                    c = counter.display()
+                ),
+                "success_condition": "exit_code_0"
+            }),
+            position: 2,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "a->b".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "node-a".to_string(),
+            to_node: "node-b".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Pass,
+        })
+        .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "b->a".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "node-b".to_string(),
+            to_node: "node-a".to_string(),
+            condition: crate::domain::loops::LoopEdgeCondition::Fail,
+        })
+        .unwrap();
+
+        let engine = std::sync::Arc::new(engine);
+        let engine2 = std::sync::Arc::clone(&engine);
+        let loop_id2 = loop_id.clone();
+        let handle =
+            tokio::spawn(async move { engine2.run_loop(loop_id2, None, None, None, None).await });
+
+        // Wait until node-a has completed exactly once, then rewrite its command —
+        // this is the `loop_update_node` between two dispatches. Full-config replace,
+        // matching update_loop_node_details semantics.
+        loop {
+            let done = db
+                .list_loop_runs_for_spec(&spec_id)
+                .unwrap()
+                .iter()
+                .filter(|r| r.node_id == "node-a" && r.status != LoopRunStatus::Running)
+                .count();
+            if done >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        db.update_loop_node_details(
+            "node-a",
+            None,
+            None,
+            Some(&serde_json::json!({
+                "command": format!("printf A2 >> \"{}\"", ran_log.display()),
+                "success_condition": "exit_code_0"
+            })),
+            None,
+        )
+        .unwrap();
+
+        handle.await.unwrap().unwrap();
+
+        assert_eq!(
+            db.get_loop_spec(&spec_id).unwrap().unwrap().status,
+            LoopSpecStatus::Completed
+        );
+        let a_runs: Vec<_> = db
+            .list_loop_runs_for_spec(&spec_id)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.node_id == "node-a")
+            .collect();
+        assert_eq!(a_runs.len(), 2, "node-a must have been dispatched twice");
+        // First dispatch used the launch-time command, second used the updated one.
+        assert!(a_runs[0].output.as_ref().unwrap()["command"]
+            .as_str()
+            .unwrap()
+            .contains("A1"));
+        assert!(a_runs[1].output.as_ref().unwrap()["command"]
+            .as_str()
+            .unwrap()
+            .contains("A2"));
+        // Ground truth: the second dispatch actually executed the new command.
+        assert_eq!(std::fs::read_to_string(&ran_log).unwrap(), "A1A2");
+    }
+
+    #[tokio::test]
+    async fn cm15_config_change_during_a_running_node_does_not_alter_that_run() {
+        let (_dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        db.insert_loop_node(&LoopNode {
+            id: "node-slow".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            name: "slow".to_string(),
+            kind: LoopNodeKind::Check,
+            config: serde_json::json!({
+                "command": "sleep 2 && printf APPROVED",
+                "success_condition": "exit_code_0"
+            }),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+
+        let engine = std::sync::Arc::new(engine);
+        let engine2 = std::sync::Arc::clone(&engine);
+        let loop_id2 = loop_id.clone();
+        let handle =
+            tokio::spawn(async move { engine2.run_loop(loop_id2, None, None, None, None).await });
+
+        // Let the single dispatch get into `sleep 2`, then swap its command.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        db.update_loop_node_details(
+            "node-slow",
+            None,
+            None,
+            Some(&serde_json::json!({
+                "command": "printf CHANGED && false",
+                "success_condition": "exit_code_0"
+            })),
+            None,
+        )
+        .unwrap();
+
+        handle.await.unwrap().unwrap();
+
+        let runs: Vec<_> = db
+            .list_loop_runs_for_spec(&spec_id)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.node_id == "node-slow")
+            .collect();
+        assert_eq!(runs.len(), 1, "the node must have been dispatched once");
+        let out = runs[0].output.as_ref().unwrap();
+        assert_eq!(runs[0].status, LoopRunStatus::Pass);
+        assert_eq!(
+            out["command"], "sleep 2 && printf APPROVED",
+            "the in-flight run keeps the command it started with (FR3/FR4)"
+        );
+        assert!(out["stdout"].as_str().unwrap().contains("APPROVED"));
+        assert!(!out["stdout"].as_str().unwrap().contains("CHANGED"));
+        assert_eq!(
+            db.get_loop_spec(&spec_id).unwrap().unwrap().status,
+            LoopSpecStatus::Completed
+        );
     }
 
     #[tokio::test]
@@ -18026,6 +18308,142 @@ echo done
             ens.round_robin_index,
             Some(0),
             "the index advanced by one from 2, wrapping to 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn cm15_round_robin_reads_member_set_from_db_between_dispatches() {
+        // The ensemble is dispatched TWICE inside ONE run: `done-pass` (the
+        // join's on-pass target) is turned into a gate that fails the first
+        // time, routing back to `kickoff`, which re-enters the ensemble; on
+        // the second visit it passes and the spec completes. Between the two
+        // dispatches the member set is swapped exactly the way
+        // `loop_update_ensemble` swaps it (the `ensemble_members` rows plus
+        // each member node's config). Dispatch 1 must record the launch-time
+        // platform and dispatch 2 the replaced one — which only holds if the
+        // engine re-reads the ensemble from the database per dispatch instead
+        // of from the launch snapshot. Two separate `run_loop` calls would not
+        // prove this: each call rebuilds its snapshot from the current rows.
+        let (dir, db, engine, loop_id, spec_id) = loop_fixture().unwrap();
+        // Two members + two "replacement" platforms, all backed by a lingering
+        // script so the VerdictFiler can file a Pass before the process exits.
+        let s = write_member_script(dir.path(), "m.sh", "sleep 1");
+        let fake_home = setup_multi_cli_home(&[
+            ("cli-m0a", s.as_str()),
+            ("cli-m1a", s.as_str()),
+            ("cli-m0b", s.as_str()),
+            ("cli-m1b", s.as_str()),
+        ]);
+        insert_kind_ensemble(
+            &db,
+            &spec_id,
+            crate::domain::loops::EnsembleKind::RoundRobin,
+            &[("m0", "cli-m0a"), ("m1", "cli-m1a")],
+        );
+        // Turn `done-pass` into a fail-once gate and wire its Fail edge back to
+        // `kickoff` so a second ensemble dispatch happens in the same run. The
+        // 0.5s sleep widens the window for the member swap between dispatches.
+        let gate = dir.path().join("gate.cnt");
+        db.update_loop_node_details(
+            "done-pass",
+            None,
+            None,
+            Some(&serde_json::json!({
+                "command": format!(
+                    "n=$(cat \"{c}\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"{c}\"; \
+                     [ \"$n\" -ge 2 ] && printf DONE || {{ sleep 0.5; exit 1; }}",
+                    c = gate.display()
+                ),
+                "success_condition": "exit_code_0"
+            })),
+            None,
+        )
+        .unwrap();
+        db.insert_loop_edge(&LoopEdge {
+            id: "done-pass->kickoff".to_string(),
+            spec_id: Some(spec_id.clone()),
+            loop_id: None,
+            from_node: "done-pass".to_string(),
+            to_node: "kickoff".to_string(),
+            condition: LoopEdgeCondition::Fail,
+        })
+        .unwrap();
+
+        // members are node ids "m0"/"m1" (2nd tuple field is the platform name).
+        let _filer = VerdictFiler::spawn(
+            &db,
+            vec![("m0".to_string(), None), ("m1".to_string(), None)],
+        );
+        let _home = HomeGuard::set(fake_home.path());
+
+        let engine = std::sync::Arc::new(engine);
+        let engine2 = std::sync::Arc::clone(&engine);
+        let loop_id2 = loop_id.clone();
+        let handle =
+            tokio::spawn(async move { engine2.run_loop(loop_id2, None, None, None, None).await });
+
+        // Wait for the first ensemble dispatch to land its join row, then swap
+        // the member set — this is the `loop_update_ensemble` between the two
+        // dispatches of the same ensemble step.
+        loop {
+            let joins = db
+                .list_loop_runs_for_spec(&spec_id)
+                .unwrap()
+                .iter()
+                .filter(|r| r.node_id == "join1")
+                .count();
+            if joins >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        for (nid, plat) in [("m0", "cli-m0b"), ("m1", "cli-m1b")] {
+            db.update_ensemble_member("ens1", nid, plat, None, None)
+                .unwrap();
+            db.update_loop_node_details(
+                nid,
+                None,
+                None,
+                Some(&serde_json::json!({
+                    "platform": plat,
+                    "prompt_template": "ignored by the member's test script",
+                    "timeout_minutes": 5,
+                    "infra_backoff_seconds": 0
+                })),
+                None,
+            )
+            .unwrap();
+        }
+
+        handle.await.unwrap().unwrap();
+        drop(_home);
+        drop(_filer);
+
+        assert_eq!(
+            db.get_loop_spec(&spec_id).unwrap().unwrap().status,
+            LoopSpecStatus::Completed
+        );
+        let joins: Vec<_> = db
+            .list_loop_runs_for_spec(&spec_id)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.node_id == "join1")
+            .collect();
+        assert_eq!(
+            joins.len(),
+            2,
+            "the ensemble must have been dispatched twice"
+        );
+        assert_eq!(
+            joins[0].output.as_ref().unwrap()["member"]["platform"],
+            "cli-m0a",
+            "first dispatch uses the launch-time member set"
+        );
+        assert_eq!(
+            joins[1].output.as_ref().unwrap()["member"]["platform"],
+            "cli-m1b",
+            "second dispatch must read the replaced member set from the database, \
+             not the launch snapshot"
         );
     }
 

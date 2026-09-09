@@ -928,10 +928,14 @@ fn resolve_owning_loop_status(
 
 /// Reject a topology mutation (retargeting/deleting an edge, deleting a
 /// node) while the owning loop is `running`. Deliberately stricter than node
-/// CONFIG edits, which are safe because the graph is snapshotted per spec at
-/// `run_spec` — a config edit lands on the next spec. Topology is different:
-/// an edge retargeted or a node deleted mid-dispatch can send a live run to
-/// a node the engine never selected.
+/// CONFIG edits. Since CM15 the engine re-reads a node's config (and an
+/// ensemble's member set) from the database at each dispatch
+/// (`LoopEngine::run_spec`), so a `loop_update_node` / `loop_update_ensemble`
+/// config edit takes effect on that node's next dispatch within the same running
+/// spec. Topology is different: a node's `kind`/`position`, the ensemble `kind`,
+/// and entry/exit wiring (edges) are resolved once from the per-run snapshot and
+/// never re-read, so an edit to them mid-run would make execution and routing
+/// disagree — those are refused here.
 fn validate_topology_mutation_allowed(
     db: &Database,
     spec_id: Option<&str>,
@@ -5385,6 +5389,23 @@ impl TaskTriggerHandler {
         if let Err(e) = validate_node_not_ensemble_owned(&self.db, &node_id) {
             return Ok(error_result(&e));
         }
+        // CM15 / FR5: `kind` and `position` are graph TOPOLOGY — the running
+        // engine resolves routing, entry-node selection and router-route
+        // coverage from a per-run snapshot and never re-reads them mid-run.
+        // Only node CONFIG (platform/model/effort/prompt/timeout/commit_rights/
+        // resume) is read fresh per dispatch. Accepting a kind/position change on
+        // a running loop would silently fail to affect routing — the exact
+        // "silent success" this spec removes — so refuse it, naming the loop's
+        // state. `name` and `config` stay editable while running.
+        if params.kind.is_some() || params.position.is_some() {
+            if let Err(e) = validate_topology_mutation_allowed(
+                &self.db,
+                node.spec_id.as_deref(),
+                node.loop_id.as_deref(),
+            ) {
+                return Ok(error_result(&e));
+            }
+        }
 
         let name = match params.name.as_deref().map(str::trim) {
             Some("") => return Ok(error_result("Loop node name must not be empty.")),
@@ -6176,6 +6197,24 @@ impl TaskTriggerHandler {
             return Ok(error_result(&e));
         }
 
+        // CM15 / FR5: the ensemble's execution strategy (`kind`) selects the
+        // fan-out path (`execute_ensemble` match on `ensemble.kind`) from the
+        // per-run snapshot and is not re-read mid-run. Its members, shared
+        // prompt and quorum config ARE read fresh per dispatch, so those stay
+        // editable on a running loop — repairing a dead member mid-run is the
+        // whole point. `kind` is refused here; entry and exit wiring (also
+        // topology, also snapshot-pinned) are refused further down, each next
+        // to the code that applies it. Every refusal names the loop's state.
+        if params.kind.is_some() {
+            if let Err(e) = validate_topology_mutation_allowed(
+                &self.db,
+                details.ensemble.spec_id.as_deref(),
+                details.ensemble.loop_id.as_deref(),
+            ) {
+                return Ok(error_result(&e));
+            }
+        }
+
         if let Some(prompt_template) = &params.prompt_template {
             if let Err(e) = validate_non_empty(prompt_template.trim(), "Ensemble prompt_template") {
                 return Ok(error_result(&e));
@@ -6537,6 +6576,20 @@ impl TaskTriggerHandler {
         // `retarget_ensemble_exit`, so a failed retarget leaves the previous
         // edges intact.
         if params.on_pass_to.is_some() || params.on_fail_to.is_some() {
+            // CM15 / FR5: exit edges are graph TOPOLOGY. The engine routes a
+            // finished quorum with `select_next_step` against the per-run
+            // `edges` snapshot (see `LoopEngine::run_spec`), which is captured
+            // once at launch and never re-read — so an `on_pass_to`/`on_fail_to`
+            // retarget mid-run would return success and change nothing until the
+            // next launch. Refuse it while running, exactly as entry wiring is
+            // refused above, and name the loop's state.
+            if let Err(e) = validate_topology_mutation_allowed(
+                &self.db,
+                details.ensemble.spec_id.as_deref(),
+                details.ensemble.loop_id.as_deref(),
+            ) {
+                return Ok(error_result(&e));
+            }
             let owner_nodes = match (&details.ensemble.spec_id, &details.ensemble.loop_id) {
                 (Some(spec_id), None) => {
                     self.db.list_loop_nodes(spec_id).map_err(internal_error)?
@@ -21279,6 +21332,128 @@ mod endpoint_tests {
         // Nothing actually mutated while the loop was running.
         assert_eq!(db.get_loop_edge(&edge_id).unwrap().unwrap().to_node, b);
         assert!(db.get_loop_node(&b).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn cm15_running_loop_pins_node_kind_and_position_accepts_config() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let a = add_agent_node(&handler, &spec.id, "A").await;
+
+        db.update_loop_status(&lp.id, LoopStatus::Running, None, None)
+            .unwrap();
+
+        let kind_res = handler
+            .loop_update_node(Parameters(LoopUpdateNodeParams {
+                node_id: a.clone(),
+                name: None,
+                kind: Some("check".to_string()),
+                config: None,
+                config_replace: None,
+                position: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&kind_res));
+        assert!(text(&kind_res).contains("running"), "{}", text(&kind_res));
+
+        let pos_res = handler
+            .loop_update_node(Parameters(LoopUpdateNodeParams {
+                node_id: a.clone(),
+                name: None,
+                kind: None,
+                config: None,
+                config_replace: None,
+                position: Some(99),
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&pos_res));
+        assert!(text(&pos_res).contains("running"), "{}", text(&pos_res));
+
+        // The unpinned field (config) is still accepted and actually lands.
+        let cfg = serde_json::json!({ "platform": "codex" })
+            .as_object()
+            .unwrap()
+            .clone();
+        let cfg_res = handler
+            .loop_update_node(Parameters(LoopUpdateNodeParams {
+                node_id: a.clone(),
+                name: None,
+                kind: None,
+                config: Some(cfg),
+                config_replace: None,
+                position: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&cfg_res), "{}", text(&cfg_res));
+        assert_eq!(
+            db.get_loop_node(&a)
+                .unwrap()
+                .unwrap()
+                .config
+                .get("platform")
+                .and_then(|v| v.as_str()),
+            Some("codex"),
+        );
+    }
+
+    #[tokio::test]
+    async fn cm15_running_loop_pins_ensemble_kind_accepts_member_replacement() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let entry = add_agent_node(&handler, &spec.id, "Entry").await;
+        let arbiter = add_agent_node(&handler, &spec.id, "Arbiter").await;
+        let ens = add_two_member_ensemble(&handler, &spec.id, "Ens", &entry, &arbiter).await;
+
+        db.update_loop_status(&lp.id, LoopStatus::Running, None, None)
+            .unwrap();
+
+        let kind_res = handler
+            .loop_update_ensemble(Parameters(LoopUpdateEnsembleParams {
+                kind: Some("cascade".to_string()),
+                ..blank_ensemble_update(&ens)
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&kind_res));
+        assert!(text(&kind_res).contains("running"), "{}", text(&kind_res));
+
+        // Exit wiring is topology too — retargeting it mid-run is refused,
+        // not accepted-and-dropped.
+        let exit_res = handler
+            .loop_update_ensemble(Parameters(LoopUpdateEnsembleParams {
+                on_pass_to: Some(entry.clone()),
+                ..blank_ensemble_update(&ens)
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&exit_res));
+        assert!(text(&exit_res).contains("running"), "{}", text(&exit_res));
+
+        // Replacing the dead member set IS allowed while running.
+        let members_res = handler
+            .loop_update_ensemble(Parameters(LoopUpdateEnsembleParams {
+                members: Some(vec![
+                    EnsembleMemberParams {
+                        platform: "opencode".to_string(),
+                        model: None,
+                        prompt_override: None,
+                    },
+                    EnsembleMemberParams {
+                        platform: "opencode".to_string(),
+                        model: None,
+                        prompt_override: None,
+                    },
+                ]),
+                ..blank_ensemble_update(&ens)
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&members_res), "{}", text(&members_res));
     }
 
     // ── router nodes (routes + route edges) ──────────────────────────
