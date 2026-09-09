@@ -231,6 +231,14 @@ const RESERVED_FOCUS_KEYS: &[(KeyCode, KeyModifiers)] = &[
     // to make the transfer reachable again from inside a claimed session. The
     // owner doesn't use Codex's binding and will rebind it on Codex's side.
     (KeyCode::Char('t'), KeyModifiers::CONTROL),
+    // Shift+F4 ends the focused session (`handle_termination_shortcut`).
+    // Deliberately not frame navigation — a second eyes-open exception in the
+    // style of Ctrl+T above: bare F4 is a common child binding and stays the
+    // child's, but shifted-F4 is already canopy's "end the session" chord in
+    // split mode (see footer.rs), so reserving it makes one binding mean one
+    // thing everywhere and gives a claimed child a visible way out. Plain F4
+    // is intentionally NOT reserved.
+    (KeyCode::F(4), KeyModifiers::SHIFT),
 ];
 
 fn is_reserved_focus_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
@@ -406,20 +414,17 @@ fn handle_termination_shortcut(app: &mut App, code: KeyCode, modifiers: KeyModif
     }
 
     if modifiers.contains(KeyModifiers::SHIFT) {
-        return terminate_split_session_if_present(app);
+        // End the focused session whether or not a split is active. In a split
+        // this kills the focused pane's session (via terminate_focused_session,
+        // which also clears the now-dead group); without a split it kills the
+        // single focused session. Never dissolve-only: dissolving (keep both
+        // sessions) stays on plain F4.
+        app.terminate_focused_session();
+        return true;
     }
 
     if app.active_split_id.is_some() {
         app.dissolve_split();
-        return true;
-    }
-
-    app.terminate_focused_session();
-    true
-}
-
-fn terminate_split_session_if_present(app: &mut App) -> bool {
-    if app.active_split_id.is_none() {
         return true;
     }
 
@@ -1377,6 +1382,7 @@ mod focus_shortcuts_keyboard_claim_tests {
                 (KeyCode::Left, KeyModifiers::SHIFT),
                 (KeyCode::Right, KeyModifiers::SHIFT),
                 (KeyCode::Char('t'), KeyModifiers::CONTROL),
+                (KeyCode::F(4), KeyModifiers::SHIFT),
             ]
         );
         assert!(is_reserved_focus_key(KeyCode::F(10), KeyModifiers::NONE));
@@ -1386,6 +1392,20 @@ mod focus_shortcuts_keyboard_claim_tests {
         assert!(is_reserved_focus_key(
             KeyCode::Char('t'),
             KeyModifiers::CONTROL
+        ));
+    }
+
+    #[test]
+    fn shift_f4_is_reserved_but_plain_f4_is_not() {
+        // CT10: Shift+F4 must survive a claimed keyboard; bare F4 stays the
+        // child's so plain function keys keep working inside sessions.
+        assert!(is_reserved_focus_key(KeyCode::F(4), KeyModifiers::SHIFT));
+        assert!(!is_reserved_focus_key(KeyCode::F(4), KeyModifiers::NONE));
+        // Matching is `contains`, not equality: a terminal reporting extra
+        // modifiers alongside Shift still resolves.
+        assert!(is_reserved_focus_key(
+            KeyCode::F(4),
+            KeyModifiers::SHIFT | KeyModifiers::CONTROL
         ));
     }
 
@@ -1632,6 +1652,227 @@ mod focus_shortcuts_keyboard_claim_tests {
         assert!(app.split_picker_open);
         app.interactive_agents[0].kill();
         app.interactive_agents[1].kill();
+    }
+
+    #[test]
+    fn shift_f4_terminates_claimed_session_while_plain_f4_yields() {
+        // CT10 (T2): with a Kitty-claimed focused child (Codex shape),
+        // Shift+F4 terminates the session instead of reaching the PTY, while
+        // plain F4 is still forwarded (not consumed).
+        let agent = spawn_cat_agent("claimed-end-me");
+        *agent.kitty_keyboard_flags.lock().expect("lock") = Some(7);
+        let mut app = app_with_interactive_agent(agent);
+        assert!(focused_child_claimed_keyboard(&app));
+
+        let handled = handle_focus_shortcuts(&mut app, KeyCode::F(4), KeyModifiers::SHIFT);
+        assert!(
+            handled,
+            "Shift+F4 must be consumed, not forwarded to the PTY"
+        );
+        assert!(
+            app.interactive_agents.is_empty(),
+            "Shift+F4 must terminate the focused session"
+        );
+
+        // Fresh app, same claimed setup: plain F4 must NOT be consumed, so
+        // `handle_agent_key` forwards it to the PTY one layer up.
+        let agent = spawn_cat_agent("claimed-keeps-f4");
+        *agent.kitty_keyboard_flags.lock().expect("lock") = Some(7);
+        let mut app = app_with_interactive_agent(agent);
+        assert!(focused_child_claimed_keyboard(&app));
+        assert!(
+            !handle_focus_shortcuts(&mut app, KeyCode::F(4), KeyModifiers::NONE),
+            "plain F4 must reach the claimed child"
+        );
+        assert_eq!(
+            app.interactive_agents.len(),
+            1,
+            "plain F4 must not terminate anything while claimed"
+        );
+
+        app.interactive_agents[0].kill();
+    }
+
+    #[test]
+    fn shift_f4_terminates_alternate_screen_session_while_plain_f4_yields() {
+        // CT10 (T2): same contract through the other claim signal — a child
+        // in the alternate screen without Kitty flags.
+        let agent = spawn_cat_agent("altscreen-end-me");
+        agent.vt.lock().expect("vt lock").process(b"\x1b[?1049h");
+        assert!(agent.in_alternate_screen());
+        assert!(!agent.kitty_keyboard_negotiated());
+        let mut app = app_with_interactive_agent(agent);
+        assert!(focused_child_claimed_keyboard(&app));
+
+        let handled = handle_focus_shortcuts(&mut app, KeyCode::F(4), KeyModifiers::SHIFT);
+        assert!(
+            handled,
+            "Shift+F4 must be consumed, not forwarded to the PTY"
+        );
+        assert!(
+            app.interactive_agents.is_empty(),
+            "Shift+F4 must terminate the focused session"
+        );
+
+        let agent = spawn_cat_agent("altscreen-keeps-f4");
+        agent.vt.lock().expect("vt lock").process(b"\x1b[?1049h");
+        let mut app = app_with_interactive_agent(agent);
+        assert!(focused_child_claimed_keyboard(&app));
+        assert!(
+            !handle_focus_shortcuts(&mut app, KeyCode::F(4), KeyModifiers::NONE),
+            "plain F4 must reach the alternate-screen child"
+        );
+
+        app.interactive_agents[0].kill();
+    }
+
+    #[test]
+    fn plain_f4_keeps_current_meaning_without_a_claim() {
+        // CT10 (T3): unclaimed child, no split — plain F4 ends the session.
+        let agent = spawn_cat_agent("plain-f4-end");
+        let mut app = app_with_interactive_agent(agent);
+        assert!(!focused_child_claimed_keyboard(&app));
+
+        assert!(handle_focus_shortcuts(
+            &mut app,
+            KeyCode::F(4),
+            KeyModifiers::NONE
+        ));
+        assert!(
+            app.interactive_agents.is_empty(),
+            "plain F4 with no split must terminate the session"
+        );
+    }
+
+    fn app_with_split(left: InteractiveAgent, right: InteractiveAgent) -> App {
+        let db = test_db();
+        let data_dir = tempdir().expect("create data dir");
+        let mut app = App::new(Arc::clone(&db), data_dir.path()).expect("create app");
+        app.interactive_agents = vec![left, right];
+        app.split_groups.push(SplitGroup {
+            id: "split-1".to_string(),
+            orientation: SplitOrientation::Horizontal,
+            session_a: "split-left".to_string(),
+            session_b: "split-right".to_string(),
+            created_at: Utc::now(),
+        });
+        app.active_split_id = Some("split-1".to_string());
+        app.split_right_focused = false;
+        app.focus = Focus::Agent;
+        app
+    }
+
+    #[test]
+    fn plain_f4_dissolves_a_split_and_keeps_both_sessions() {
+        // CT10 (T3/FR4): unclaimed children in a split — plain F4 dissolves
+        // (both sessions survive, grouping drops).
+        let mut app = app_with_split(
+            spawn_cat_agent("split-left"),
+            spawn_cat_agent("split-right"),
+        );
+        assert!(!focused_child_claimed_keyboard(&app));
+
+        assert!(handle_focus_shortcuts(
+            &mut app,
+            KeyCode::F(4),
+            KeyModifiers::NONE
+        ));
+        assert!(
+            app.active_split_id.is_none(),
+            "plain F4 in a split must dissolve the grouping"
+        );
+        assert_eq!(
+            app.interactive_agents.len(),
+            2,
+            "dissolving keeps both sessions alive"
+        );
+
+        for agent in &mut app.interactive_agents {
+            agent.kill();
+        }
+    }
+
+    #[test]
+    fn shift_f4_in_a_split_ends_the_focused_pane_session() {
+        // CT10 (FR2): Shift+F4 in a split kills the focused pane's session
+        // (left here) and clears the now-dead grouping — it does NOT
+        // dissolve-only.
+        let mut app = app_with_split(
+            spawn_cat_agent("split-left"),
+            spawn_cat_agent("split-right"),
+        );
+        app.split_right_focused = false;
+        assert!(!focused_child_claimed_keyboard(&app));
+
+        assert!(handle_focus_shortcuts(
+            &mut app,
+            KeyCode::F(4),
+            KeyModifiers::SHIFT
+        ));
+        assert!(
+            app.active_split_id.is_none(),
+            "the dead pane's grouping must be cleared"
+        );
+        assert!(
+            app.interactive_agents
+                .iter()
+                .all(|agent| agent.name != "split-left"),
+            "Shift+F4 must kill the focused pane's session"
+        );
+        assert!(
+            app.interactive_agents
+                .iter()
+                .any(|agent| agent.name == "split-right"),
+            "the unfocused pane's session must survive"
+        );
+
+        for agent in &mut app.interactive_agents {
+            agent.kill();
+        }
+    }
+
+    #[test]
+    fn shift_f4_without_a_split_ends_the_single_session() {
+        // CT10 (T3/FR2): regression for the old `terminate_split_session_if_present`
+        // helper, which swallowed Shift+F4 when no split was active.
+        let agent = spawn_cat_agent("lone-session");
+        let mut app = app_with_interactive_agent(agent);
+        assert!(app.active_split_id.is_none());
+        assert!(!focused_child_claimed_keyboard(&app));
+
+        assert!(handle_focus_shortcuts(
+            &mut app,
+            KeyCode::F(4),
+            KeyModifiers::SHIFT
+        ));
+        assert!(
+            app.interactive_agents.is_empty(),
+            "Shift+F4 with no split must terminate the focused session"
+        );
+    }
+
+    #[test]
+    fn terminating_from_inside_focus_leaves_consistent_focus() {
+        // CT10 (T5): ending a session from inside focus must not leave the
+        // TUI focused on the session that just died.
+        let agent = spawn_cat_agent("claimed-focus-check");
+        *agent.kitty_keyboard_flags.lock().expect("lock") = Some(7);
+        let mut app = app_with_interactive_agent(agent);
+        assert!(matches!(app.focus, Focus::Agent));
+
+        assert!(handle_focus_shortcuts(
+            &mut app,
+            KeyCode::F(4),
+            KeyModifiers::SHIFT
+        ));
+        assert!(
+            matches!(app.focus, Focus::Preview),
+            "focus must leave the dead pane"
+        );
+        assert!(
+            app.agents.is_empty() || app.selected < app.agents.len(),
+            "selection must point at a live session"
+        );
     }
 
     #[test]

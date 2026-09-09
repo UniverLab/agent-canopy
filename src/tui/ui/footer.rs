@@ -136,7 +136,7 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Them
                 // While the focused child has claimed the keyboard (alternate
                 // screen or Kitty keyboard protocol), every canopy shortcut
                 // below yields to it except F10, the Shift+arrow frame
-                // navigation, and Ctrl+T — see
+                // navigation, Ctrl+T, and Shift+F4 (end) — see
                 // `agent_focus::RESERVED_FOCUS_KEYS`. Reflect that here so a
                 // shortcut that "did nothing" is explainable instead of
                 // looking broken.
@@ -145,9 +145,13 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Them
                 if child_claimed {
                     // Frame navigation stays with canopy even then, so it is
                     // still worth showing: only the content shortcuts yield.
+                    // Shift+F4 is the one session action that also survives a
+                    // claimed keyboard (see agent_focus::RESERVED_FOCUS_KEYS) —
+                    // plain F4 still belongs to the child while claimed.
                     h.push(("Shift+↑↓", "agents/rag"));
                     h.push(("Shift+←→", if in_split { "split focus" } else { "tab" }));
                     h.push(("Ctrl+T", "context"));
+                    h.push(("Shift+F4", "end"));
                 } else {
                     h.push(("Shift+↑↓", "agents/rag"));
                     h.push(("Ctrl+T", "context"));
@@ -770,6 +774,56 @@ mod tests {
         assert!(
             !text.contains('*'),
             "the '* other keys \u{2192} child' hint must be gone: {text}"
+        );
+
+        app.interactive_agents[0].kill();
+    }
+
+    #[test]
+    fn footer_with_claimed_keyboard_advertises_shift_f4_end() {
+        // CT10 (T4): while the child has claimed the keyboard, the footer
+        // must list Shift+F4 as `end` — the way out must be visible without
+        // leaving the session. Plain-F4-only hints (dissolve) stay hidden
+        // because plain F4 belongs to the child while claimed.
+        let agent = crate::tui::agent::InteractiveAgent::spawn(
+            crate::domain::models::Cli::new("cat"),
+            ".",
+            80,
+            24,
+            None,
+            None,
+            Color::Reset,
+            Some("claimed-end-agent"),
+            &[],
+            None,
+            None,
+            None,
+        )
+        .expect("spawn cat as a stand-in interactive child");
+        *agent.kitty_keyboard_flags.lock().expect("lock") = Some(7);
+
+        let mut app = make_app();
+        app.interactive_agents = vec![agent];
+        app.agents = vec![crate::tui::app::types::AgentEntry::Interactive(0)];
+        app.selected = 0;
+        app.focus = Focus::Agent;
+
+        let theme = Theme::classic();
+        let text = render_footer_to_text(200, 1, |frame, area| {
+            draw_footer(frame, area, &app, &theme);
+        });
+
+        assert!(
+            text.contains("Shift+F4"),
+            "claimed-keyboard footer must advertise Shift+F4: {text}"
+        );
+        assert!(
+            text.contains("end"),
+            "claimed-keyboard footer must label Shift+F4 as end: {text}"
+        );
+        assert!(
+            !text.contains("dissolve"),
+            "dissolve is plain-F4-only and must stay hidden while claimed: {text}"
         );
 
         app.interactive_agents[0].kill();
