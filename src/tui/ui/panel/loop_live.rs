@@ -54,6 +54,7 @@ pub(crate) fn draw_loop_live_view(frame: &mut Frame, area: Rect, app: &mut App, 
         &LiveViewContext {
             state,
             follow: app.loop_graph_follow,
+            follow_anchor: app.loop_graph_follow_anchor.as_deref(),
             highlighted_node_id: highlighted.as_deref(),
             node_info: &node_info,
             blocked,
@@ -69,6 +70,7 @@ pub(crate) fn draw_loop_live_view(frame: &mut Frame, area: Rect, app: &mut App, 
     app.loop_spec_strip_capacity = result.capacity;
     app.loop_live_view_total_lines = result.total_lines;
     app.loop_live_view_scroll = result.clamped_scroll;
+    app.loop_graph_follow_anchor = result.follow_anchor;
 
     // CT3: live-tail overlay renders last so it sits above the graph and
     // detail content. Viewer only — no input state is touched here.
@@ -84,6 +86,12 @@ pub(crate) fn draw_loop_live_view(frame: &mut Frame, area: Rect, app: &mut App, 
 struct LiveViewContext<'a> {
     state: &'a LoopLiveState,
     follow: bool,
+    /// CT8: the node id the graph last re-centred on while auto-following
+    /// (mirrors `App::loop_graph_follow_anchor`). Compared against
+    /// `highlighted_node_id` — which equals the engine's current node id
+    /// whenever `follow` is true — to decide whether this frame is a real
+    /// node transition that should re-centre the scroll.
+    follow_anchor: Option<&'a str>,
     highlighted_node_id: Option<&'a str>,
     node_info: &'a NodeRunInfo,
     blocked: bool,
@@ -106,6 +114,10 @@ struct LiveViewRenderResult {
     capacity: usize,
     total_lines: u16,
     clamped_scroll: u16,
+    /// CT8: the anchor to persist for next frame. In auto-follow this is the
+    /// current node id (adopted whether or not we re-centred this frame); in
+    /// manual it is carried through unchanged.
+    follow_anchor: Option<String>,
 }
 
 fn render_loop_live_view(
@@ -114,6 +126,21 @@ fn render_loop_live_view(
     ctx: &LiveViewContext,
 ) -> LiveViewRenderResult {
     let state = ctx.state;
+    // CT8: the top row is a persistent mode indicator that never scrolls with
+    // the graph content. Everything below runs on `area` minus that row.
+    let indicator_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: 1,
+    };
+    let area = Rect {
+        x: area.x,
+        y: area.y + 1,
+        width: area.width,
+        height: area.height.saturating_sub(1),
+    };
+    frame.render_widget(mode_indicator(ctx.follow, ctx.theme), indicator_area);
     let mut lines = header_lines(state, ctx.blocked, ctx.theme);
     lines.push(Line::from(""));
 
@@ -165,15 +192,47 @@ fn render_loop_live_view(
     let total_lines = lines.len() as u16;
     let max_scroll = total_lines.saturating_sub(area.height);
     let clamped_from_input = ctx.scroll.min(max_scroll);
-    let scroll = if ctx.follow {
-        if let Some(offset) = graph_result.flatten() {
-            let abs_offset = graph_start_line + offset;
-            ensure_visible(abs_offset, 3, clamped_from_input, area.height)
+
+    // CT8: who owns the scroll.
+    //
+    // Auto-follow: re-derive the scroll from the highlighted node ONLY on the
+    // frame where the current node's identity changed since the last
+    // re-centre (`ctx.follow_anchor`). While `follow` is true,
+    // `highlighted_node_id` == the engine's current node id, so this fires on
+    // a real node-to-node transition and on nothing else — not a status
+    // change, not elapsed time, not the user scrolling. Every other redraw
+    // keeps `clamped_from_input`, the user's own scroll, so the whole graph
+    // of a running loop can be read.
+    //
+    // Manual navigation: the scroll always chases the selection with the same
+    // margin `ensure_visible` uses, so the highlight can never leave the panel.
+    let (scroll, next_follow_anchor) = if ctx.follow {
+        let node_changed = ctx.highlighted_node_id != ctx.follow_anchor;
+        let scroll = if node_changed {
+            match graph_result.flatten() {
+                Some(offset) => ensure_visible(
+                    graph_start_line + offset,
+                    3,
+                    clamped_from_input,
+                    area.height,
+                ),
+                None => clamped_from_input,
+            }
         } else {
             clamped_from_input
-        }
+        };
+        (scroll, ctx.highlighted_node_id.map(str::to_string))
     } else {
-        clamped_from_input
+        let scroll = match graph_result.flatten() {
+            Some(offset) => ensure_visible(
+                graph_start_line + offset,
+                3,
+                clamped_from_input,
+                area.height,
+            ),
+            None => clamped_from_input,
+        };
+        (scroll, ctx.follow_anchor.map(str::to_string))
     };
     let clamped_scroll = scroll.min(max_scroll);
 
@@ -206,6 +265,7 @@ fn render_loop_live_view(
         capacity: strip.capacity,
         total_lines,
         clamped_scroll,
+        follow_anchor: next_follow_anchor,
     }
 }
 
@@ -222,6 +282,32 @@ fn ensure_visible(start: u16, span: u16, scroll: u16, height: u16) -> u16 {
     } else {
         scroll
     }
+}
+
+/// CT8: the always-visible badge naming the current scroll mode. Rendered on
+/// a reserved top row so it never scrolls away with the graph. In manual mode
+/// it also names the key (`Esc`) that returns to auto-follow. Both modes are
+/// labelled outright — the reader never has to infer the mode from behaviour.
+/// The colour fills the whole row (widget `style`, not just the span) so the
+/// badge reads as a solid bar at a glance, matching the interactive preview's
+/// focus state.
+fn mode_indicator(follow: bool, theme: &Theme) -> Paragraph<'static> {
+    let (text, bg) = if follow {
+        (
+            " \u{25cf} AUTO-FOLLOW \u{2014} view tracks the running node ",
+            theme.status_running,
+        )
+    } else {
+        (
+            " \u{2016} MANUAL \u{2014} press Esc to return to auto-follow ",
+            theme.warning,
+        )
+    };
+    let style = Style::default()
+        .fg(theme.accent_fg)
+        .bg(bg)
+        .add_modifier(Modifier::BOLD);
+    Paragraph::new(Line::from(Span::styled(text.to_string(), style))).style(style)
 }
 
 fn status_icon_and_label(
@@ -1211,6 +1297,7 @@ mod tests {
                 &LiveViewContext {
                     state: &state,
                     follow: true,
+                    follow_anchor: None,
                     highlighted_node_id: state.current_node_id.as_deref(),
                     node_info: &node_info,
                     blocked: false,
@@ -1269,6 +1356,7 @@ mod tests {
                 &LiveViewContext {
                     state: &state,
                     follow: false,
+                    follow_anchor: None,
                     highlighted_node_id: Some("n2"),
                     node_info: &node_info,
                     blocked: false,
@@ -1310,6 +1398,7 @@ mod tests {
                 &LiveViewContext {
                     state: &state,
                     follow: true,
+                    follow_anchor: None,
                     highlighted_node_id: None,
                     node_info: &node_info,
                     blocked: false,
@@ -1364,6 +1453,7 @@ mod tests {
                 &LiveViewContext {
                     state: &state,
                     follow: true,
+                    follow_anchor: None,
                     highlighted_node_id: None,
                     node_info: &node_info,
                     blocked: false,
@@ -1440,6 +1530,7 @@ mod tests {
                 &LiveViewContext {
                     state: &state,
                     follow: true,
+                    follow_anchor: None,
                     highlighted_node_id: None,
                     node_info: &node_info,
                     blocked: false,
@@ -1493,6 +1584,7 @@ mod tests {
                 &LiveViewContext {
                     state: &state,
                     follow: true,
+                    follow_anchor: None,
                     highlighted_node_id: None,
                     node_info: &node_info,
                     blocked: false,
@@ -1537,6 +1629,7 @@ mod tests {
                 &LiveViewContext {
                     state: &state,
                     follow: true,
+                    follow_anchor: None,
                     highlighted_node_id: None,
                     node_info: &node_info,
                     blocked: false,
@@ -1567,6 +1660,7 @@ mod tests {
                     &LiveViewContext {
                         state: &state,
                         follow: true,
+                        follow_anchor: None,
                         highlighted_node_id: None,
                         node_info: &node_info,
                         blocked: false,
@@ -1626,6 +1720,7 @@ mod tests {
         let ctx = LiveViewContext {
             state: &state,
             follow: true,
+            follow_anchor: None,
             highlighted_node_id: None,
             node_info: &node_info,
             blocked: false,
@@ -1666,6 +1761,7 @@ mod tests {
                 &LiveViewContext {
                     state: &state,
                     follow: true,
+                    follow_anchor: None,
                     highlighted_node_id: state.current_node_id.as_deref(),
                     node_info: &node_info,
                     blocked: false,
@@ -1805,6 +1901,7 @@ mod tests {
                 &LiveViewContext {
                     state: &state,
                     follow: true,
+                    follow_anchor: None,
                     highlighted_node_id: state.current_node_id.as_deref(),
                     node_info: &node_info,
                     blocked: false,
@@ -1940,6 +2037,7 @@ mod tests {
                 &LiveViewContext {
                     state: &state,
                     follow: true,
+                    follow_anchor: None,
                     highlighted_node_id: state.current_node_id.as_deref(),
                     node_info: &node_info,
                     blocked: false,
@@ -2107,6 +2205,7 @@ mod tests {
                 &LiveViewContext {
                     state: &state,
                     follow: false,
+                    follow_anchor: None,
                     highlighted_node_id: Some("m0"),
                     node_info: &node_info,
                     blocked: false,
@@ -2135,6 +2234,7 @@ mod tests {
                 &LiveViewContext {
                     state: &state,
                     follow: false,
+                    follow_anchor: None,
                     highlighted_node_id: Some("m0"),
                     node_info: &node_info,
                     blocked: false,
@@ -2167,6 +2267,7 @@ mod tests {
                 &LiveViewContext {
                     state: &state,
                     follow: true,
+                    follow_anchor: None,
                     highlighted_node_id: state.current_node_id.as_deref(),
                     node_info: &node_info,
                     blocked: false,
@@ -2200,6 +2301,7 @@ mod tests {
                     &LiveViewContext {
                         state: &state,
                         follow: false,
+                        follow_anchor: None,
                         highlighted_node_id: None,
                         node_info: &node_info,
                         blocked: false,
@@ -2214,7 +2316,9 @@ mod tests {
             })
             .unwrap();
         let (clamped_scroll, total_lines) = clamped.unwrap();
-        let max = total_lines.saturating_sub(15);
+        // The indicator row consumes 1 row of the 15-row viewport, so the
+        // renderer's internal max_scroll is total_lines - 14.
+        let max = total_lines.saturating_sub(14);
         assert_eq!(
             clamped_scroll, max,
             "scroll must clamp to total_lines - height ({max}), got {clamped_scroll} with total {total_lines}"
@@ -2240,6 +2344,7 @@ mod tests {
                 &LiveViewContext {
                     state: &state,
                     follow: true,
+                    follow_anchor: None,
                     highlighted_node_id: Some("m14"),
                     node_info: &node_info,
                     blocked: false,
@@ -2320,6 +2425,7 @@ mod tests {
                 &LiveViewContext {
                     state: &state,
                     follow: true,
+                    follow_anchor: None,
                     highlighted_node_id: state.current_node_id.as_deref(),
                     node_info: &node_info,
                     blocked: false,
@@ -2405,6 +2511,7 @@ mod tests {
                 &LiveViewContext {
                     state: &state,
                     follow: true,
+                    follow_anchor: None,
                     highlighted_node_id: state.current_node_id.as_deref(),
                     node_info: &node_info,
                     blocked: false,
@@ -2488,6 +2595,7 @@ mod tests {
                 &LiveViewContext {
                     state: &state,
                     follow: true,
+                    follow_anchor: None,
                     highlighted_node_id: state.current_node_id.as_deref(),
                     node_info: &node_info,
                     blocked: false,
@@ -2647,4 +2755,330 @@ mod tests {
             fg
         );
     }
+
+    // ---- CT8: scroll ownership + mode indicator ---------------------------
+
+    #[test]
+    fn ct8_auto_follow_user_scroll_survives_when_current_node_unchanged() {
+        // The measured bug: reading a big graph of a running loop, scrolling
+        // down, and being yanked back to the running node every frame.
+        let mut state = running_state();
+        state.effective_nodes = many_nodes(30);
+        state.effective_edges = many_edges(30);
+        state.current_node_id = Some("m1".to_string());
+        let node_info = NodeRunInfo::default();
+
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // Frame 1: anchor is None -> renderer adopts "m1" as the anchor.
+        let mut anchor: Option<String> = None;
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let r = render_loop_live_view(
+                    frame,
+                    area,
+                    &LiveViewContext {
+                        state: &state,
+                        follow: true,
+                        follow_anchor: None,
+                        highlighted_node_id: Some("m1"),
+                        node_info: &node_info,
+                        blocked: false,
+                        now: Utc::now(),
+                        theme: &Theme::classic(),
+                        selected_spec_id: None,
+                        spec_scroll: 0,
+                        scroll: 0,
+                    },
+                );
+                anchor = r.follow_anchor;
+            })
+            .unwrap();
+        assert_eq!(
+            anchor.as_deref(),
+            Some("m1"),
+            "renderer must adopt the current node as the anchor"
+        );
+
+        // Frame 2: user has scrolled to 10, current node is still "m1".
+        let mut clamped = None;
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let r = render_loop_live_view(
+                    frame,
+                    area,
+                    &LiveViewContext {
+                        state: &state,
+                        follow: true,
+                        follow_anchor: anchor.as_deref(),
+                        highlighted_node_id: Some("m1"),
+                        node_info: &node_info,
+                        blocked: false,
+                        now: Utc::now(),
+                        theme: &Theme::classic(),
+                        selected_spec_id: None,
+                        spec_scroll: 0,
+                        scroll: 10,
+                    },
+                );
+                clamped = Some(r.clamped_scroll);
+            })
+            .unwrap();
+        assert_eq!(
+            clamped,
+            Some(10),
+            "auto-follow must NOT override the user's scroll when the current node is unchanged"
+        );
+    }
+    // Breaks if: the `if node_changed` guard is removed and auto-follow
+    // re-centres every frame again.
+
+    #[test]
+    fn ct8_auto_follow_recentres_when_current_node_changes() {
+        let mut state = running_state();
+        state.effective_nodes = many_nodes(30);
+        state.effective_edges = many_edges(30);
+        state.current_node_id = Some("m25".to_string());
+        let node_info = NodeRunInfo::default();
+
+        // User had scrolled far away (anchor still on "m0"); the engine's
+        // current node has moved to "m25". The view must jump to it.
+        let text = render_to_text(80, 20, |frame, area| {
+            render_loop_live_view(
+                frame,
+                area,
+                &LiveViewContext {
+                    state: &state,
+                    follow: true,
+                    follow_anchor: Some("m0"),
+                    highlighted_node_id: Some("m25"),
+                    node_info: &node_info,
+                    blocked: false,
+                    now: Utc::now(),
+                    theme: &Theme::classic(),
+                    selected_spec_id: None,
+                    spec_scroll: 0,
+                    scroll: 0,
+                },
+            );
+        });
+        assert!(
+            text.contains("Node 25"),
+            "a real node transition must re-centre the view on the new current node:\n{text}"
+        );
+    }
+    // Breaks if: auto-follow stops re-centring on node change (e.g. the
+    // node-change branch always returns `clamped_from_input`).
+
+    #[test]
+    fn ct8_auto_follow_ignores_status_or_elapsed_change_for_same_node() {
+        let mut state = running_state();
+        state.effective_nodes = many_nodes(30);
+        state.effective_edges = many_edges(30);
+        state.current_node_id = Some("m1".to_string());
+
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let running = NodeRunInfo {
+            status: Some(LoopRunStatus::Running),
+            started_at: Some(Utc::now() - chrono::Duration::seconds(5)),
+            ..NodeRunInfo::default()
+        };
+        // Frame 1 adopts the anchor "m1".
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_loop_live_view(
+                    frame,
+                    area,
+                    &LiveViewContext {
+                        state: &state,
+                        follow: true,
+                        follow_anchor: None,
+                        highlighted_node_id: Some("m1"),
+                        node_info: &running,
+                        blocked: false,
+                        now: Utc::now(),
+                        theme: &Theme::classic(),
+                        selected_spec_id: None,
+                        spec_scroll: 0,
+                        scroll: 0,
+                    },
+                );
+            })
+            .unwrap();
+
+        // Frame 2: same node "m1", user scrolled to 12, but the node's status
+        // flipped to Pass and elapsed time advanced. Scroll must not move.
+        let passed = NodeRunInfo {
+            status: Some(LoopRunStatus::Pass),
+            started_at: Some(Utc::now() - chrono::Duration::seconds(600)),
+            ..NodeRunInfo::default()
+        };
+        let mut clamped = None;
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let r = render_loop_live_view(
+                    frame,
+                    area,
+                    &LiveViewContext {
+                        state: &state,
+                        follow: true,
+                        follow_anchor: Some("m1"),
+                        highlighted_node_id: Some("m1"),
+                        node_info: &passed,
+                        blocked: false,
+                        now: Utc::now(),
+                        theme: &Theme::classic(),
+                        selected_spec_id: None,
+                        spec_scroll: 0,
+                        scroll: 12,
+                    },
+                );
+                clamped = Some(r.clamped_scroll);
+            })
+            .unwrap();
+        assert_eq!(
+            clamped,
+            Some(12),
+            "a status/elapsed change for the same current node must not move the scroll"
+        );
+    }
+    // Breaks if: re-centring keys off node status/elapsed instead of node id.
+
+    #[test]
+    fn ct8_manual_navigation_keeps_selection_below_viewport_on_screen() {
+        let mut state = running_state();
+        state.effective_nodes = many_nodes(30);
+        state.effective_edges = many_edges(30);
+        state.current_node_id = Some("m0".to_string());
+        let node_info = NodeRunInfo::default();
+
+        // Manual mode, selection near the bottom, user scroll still at the top.
+        let text = render_to_text(80, 20, |frame, area| {
+            render_loop_live_view(
+                frame,
+                area,
+                &LiveViewContext {
+                    state: &state,
+                    follow: false,
+                    follow_anchor: None,
+                    highlighted_node_id: Some("m26"),
+                    node_info: &node_info,
+                    blocked: false,
+                    now: Utc::now(),
+                    theme: &Theme::classic(),
+                    selected_spec_id: None,
+                    spec_scroll: 0,
+                    scroll: 0,
+                },
+            );
+        });
+        assert!(
+            text.contains("Node 26"),
+            "manual navigation must scroll a below-viewport selection into view:\n{text}"
+        );
+    }
+    // Breaks if: the manual branch returns `clamped_from_input` without
+    // calling `ensure_visible`.
+
+    #[test]
+    fn ct8_manual_navigation_keeps_selection_above_viewport_on_screen() {
+        let mut state = running_state();
+        state.effective_nodes = many_nodes(30);
+        state.effective_edges = many_edges(30);
+        state.current_node_id = Some("m0".to_string());
+        let node_info = NodeRunInfo::default();
+
+        // Manual mode, selection back at the top, but user scroll left far down.
+        let text = render_to_text(80, 20, |frame, area| {
+            render_loop_live_view(
+                frame,
+                area,
+                &LiveViewContext {
+                    state: &state,
+                    follow: false,
+                    follow_anchor: None,
+                    highlighted_node_id: Some("m0"),
+                    node_info: &node_info,
+                    blocked: false,
+                    now: Utc::now(),
+                    theme: &Theme::classic(),
+                    selected_spec_id: None,
+                    spec_scroll: 0,
+                    scroll: 250,
+                },
+            );
+        });
+        assert!(
+            text.contains("Node 0"),
+            "manual navigation must scroll an above-viewport selection back into view:\n{text}"
+        );
+    }
+    // Breaks if: the manual branch stops calling `ensure_visible`.
+
+    #[test]
+    fn ct8_mode_indicator_present_in_both_modes_and_names_the_key() {
+        let state = running_state();
+        let node_info = NodeRunInfo::default();
+
+        let follow_text = render_to_text(80, 30, |frame, area| {
+            render_loop_live_view(
+                frame,
+                area,
+                &LiveViewContext {
+                    state: &state,
+                    follow: true,
+                    follow_anchor: None,
+                    highlighted_node_id: state.current_node_id.as_deref(),
+                    node_info: &node_info,
+                    blocked: false,
+                    now: Utc::now(),
+                    theme: &Theme::classic(),
+                    selected_spec_id: None,
+                    spec_scroll: 0,
+                    scroll: 0,
+                },
+            );
+        });
+        assert!(
+            follow_text.contains("AUTO-FOLLOW"),
+            "auto-follow mode must render a labelled indicator:\n{follow_text}"
+        );
+
+        let manual_text = render_to_text(80, 30, |frame, area| {
+            render_loop_live_view(
+                frame,
+                area,
+                &LiveViewContext {
+                    state: &state,
+                    follow: false,
+                    follow_anchor: None,
+                    highlighted_node_id: Some("n2"),
+                    node_info: &node_info,
+                    blocked: false,
+                    now: Utc::now(),
+                    theme: &Theme::classic(),
+                    selected_spec_id: None,
+                    spec_scroll: 0,
+                    scroll: 0,
+                },
+            );
+        });
+        assert!(
+            manual_text.contains("MANUAL"),
+            "manual mode must render a labelled indicator:\n{manual_text}"
+        );
+        assert!(
+            manual_text.contains("Esc"),
+            "the manual indicator must name the key that restores auto-follow:\n{manual_text}"
+        );
+    }
+    // Breaks if: `mode_indicator_line` is removed, stops being rendered, or
+    // drops the "Esc" hint from the manual variant.
 }

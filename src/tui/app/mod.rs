@@ -125,6 +125,7 @@ impl App {
             loop_live_state: None,
             loop_graph_follow: true,
             loop_graph_selected_node: None,
+            loop_graph_follow_anchor: None,
             loop_live_focus: LoopLiveFocus::Graph,
             loop_spec_strip_selected: None,
             loop_spec_strip_scroll: 0,
@@ -1020,6 +1021,7 @@ impl App {
             self.loop_live_state = None;
             self.loop_graph_follow = true;
             self.loop_graph_selected_node = None;
+            self.loop_graph_follow_anchor = None;
             self.loop_live_focus = LoopLiveFocus::Graph;
             self.loop_spec_strip_selected = None;
             self.loop_spec_strip_scroll = 0;
@@ -1046,6 +1048,7 @@ impl App {
             self.loop_selected_node = 0;
             self.loop_graph_follow = true;
             self.loop_graph_selected_node = None;
+            self.loop_graph_follow_anchor = None;
             self.loop_live_focus = LoopLiveFocus::Graph;
             self.loop_spec_strip_selected = None;
             self.loop_spec_strip_scroll = 0;
@@ -1078,6 +1081,7 @@ impl App {
             if !still_present {
                 self.loop_graph_follow = true;
                 self.loop_graph_selected_node = None;
+                self.loop_graph_follow_anchor = None;
             }
         }
 
@@ -1533,6 +1537,7 @@ impl App {
     pub fn loop_graph_reset_follow(&mut self) {
         self.loop_graph_follow = true;
         self.loop_graph_selected_node = None;
+        self.loop_graph_follow_anchor = None;
     }
 
     /// Step the live view's vertical scroll by `dir` lines (positive = down

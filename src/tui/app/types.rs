@@ -834,6 +834,14 @@ pub struct App {
     /// The node id manually highlighted in the live loop view's graph.
     /// Only meaningful while `loop_graph_follow` is `false`.
     pub(crate) loop_graph_selected_node: Option<String>,
+    /// CT8: the node id the live graph last re-centred the scroll onto while
+    /// auto-following. Auto-follow re-centres ONLY when the engine's current
+    /// node changes away from this anchor; every other redraw (same node,
+    /// changed status/elapsed, the user scrolling) leaves the scroll alone.
+    /// `None` forces exactly one re-centre on the next render — set when a
+    /// loop is selected, when `Esc` restores follow, and when a vanished
+    /// manual selection falls back to follow.
+    pub(crate) loop_graph_follow_anchor: Option<String>,
     /// Which sub-region of the live loop view plain arrow keys drive.
     /// Reset to `Graph` whenever the selected loop changes.
     pub(crate) loop_live_focus: LoopLiveFocus,
