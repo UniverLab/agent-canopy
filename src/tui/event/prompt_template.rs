@@ -1045,10 +1045,8 @@ fn handle_dialog_key(
             Ok(build_prompt_action(dialog, db, workdir))
         }
 
-        // Plain Enter: newline in instruction sections, send in others.
-        KeyCode::Enter => {
-            handle_enter_key(dialog, modifiers, section_name, field_width, db, workdir)
-        }
+        // Plain Enter: always a newline in text fields; sending is Ctrl+S.
+        KeyCode::Enter => handle_enter_key(dialog, modifiers, section_name, field_width),
 
         // Navigation: Tab / Shift+Tab / Shift+Up/Down move between fields in
         // visual order, wrapping through the send control at the bottom.
@@ -1165,23 +1163,13 @@ fn handle_enter_key(
     modifiers: KeyModifiers,
     section_name: &str,
     field_width: usize,
-    db: &Database,
-    workdir: &Path,
 ) -> Result<PromptAction> {
     if !modifiers.is_empty() {
         return Ok(PromptAction::None);
     }
 
-    if is_instruction_section(section_name) {
-        dialog.insert_newline_at_cursor(section_name, field_width);
-        return Ok(PromptAction::None);
-    }
-
-    Ok(build_prompt_action(dialog, db, workdir))
-}
-
-fn is_instruction_section(section_name: &str) -> bool {
-    section_name == "instruction" || section_name.starts_with("instruction_")
+    dialog.insert_newline_at_cursor(section_name, field_width);
+    Ok(PromptAction::None)
 }
 
 fn build_prompt_action(dialog: &SimplePromptDialog, db: &Database, workdir: &Path) -> PromptAction {
@@ -2692,31 +2680,6 @@ mod normalize_altgr_char_tests {
 }
 
 #[cfg(test)]
-mod is_instruction_section_tests {
-    use super::is_instruction_section;
-
-    #[test]
-    fn plain_instruction() {
-        assert!(is_instruction_section("instruction"));
-    }
-
-    #[test]
-    fn numbered_instruction() {
-        assert!(is_instruction_section("instruction_1"));
-        assert!(is_instruction_section("instruction_42"));
-    }
-
-    #[test]
-    fn non_instruction_sections() {
-        assert!(!is_instruction_section("tools"));
-        assert!(!is_instruction_section("project_context"));
-        assert!(!is_instruction_section("context"));
-        assert!(!is_instruction_section(""));
-        assert!(!is_instruction_section("instructions"));
-    }
-}
-
-#[cfg(test)]
 mod picker_navigation_tests {
     use super::*;
     use crate::db::Database;
@@ -3251,32 +3214,6 @@ mod utility_function_tests {
         assert_eq!(normalize_altgr_char('@'), '@');
     }
 
-    /// is_instruction_section recognizes "instruction"
-    #[test]
-    fn is_instruction_section_exact_match() {
-        assert!(is_instruction_section("instruction"));
-    }
-
-    /// is_instruction_section recognizes "instruction_*" prefixes
-    #[test]
-    fn is_instruction_section_with_prefix() {
-        assert!(is_instruction_section("instruction_first"));
-        assert!(is_instruction_section("instruction_system"));
-        assert!(is_instruction_section("instruction_"));
-        assert!(is_instruction_section("instruction_complex_name"));
-    }
-
-    /// is_instruction_section rejects non-instruction sections
-    #[test]
-    fn is_instruction_section_rejects_other() {
-        assert!(!is_instruction_section("context"));
-        assert!(!is_instruction_section("knowledge"));
-        assert!(!is_instruction_section("tools"));
-        assert!(!is_instruction_section("instruct"));
-        assert!(!is_instruction_section("instructions"));
-        assert!(!is_instruction_section(""));
-    }
-
     /// should_expand_on_key with various modifier combinations
     #[test]
     fn should_expand_on_key_modifier_combinations() {
@@ -3311,15 +3248,6 @@ mod utility_function_tests {
         );
     }
 
-    /// is_instruction_section with case sensitivity
-    #[test]
-    fn is_instruction_section_case_sensitive() {
-        assert!(is_instruction_section("instruction"));
-        assert!(!is_instruction_section("Instruction"));
-        assert!(!is_instruction_section("INSTRUCTION"));
-        assert!(!is_instruction_section("iNsTrUcTiOn"));
-    }
-
     /// should_expand_on_key exhaustive key coverage
     #[test]
     fn should_expand_on_key_escape_and_special() {
@@ -3336,5 +3264,80 @@ mod utility_function_tests {
             KeyCode::PageDown,
             KeyModifiers::empty()
         ));
+    }
+}
+
+#[cfg(test)]
+mod enter_key_tests {
+    use super::*;
+    use crate::tui::app::dialog::SimplePromptDialog;
+
+    #[test]
+    fn enter_in_context_inserts_newline_does_not_send() {
+        let mut dialog = SimplePromptDialog::new();
+        let id = dialog.add_section_with_content("context", "hello".to_string());
+        let action = handle_enter_key(&mut dialog, KeyModifiers::empty(), &id, 80)
+            .expect("enter handling succeeds");
+        assert!(
+            matches!(action, PromptAction::None),
+            "Enter in a context section must not send"
+        );
+        assert!(
+            dialog.get_section_content(&id).contains('\n'),
+            "Enter in a context section must insert a newline"
+        );
+    }
+
+    #[test]
+    fn enter_in_instruction_inserts_newline() {
+        let mut dialog = SimplePromptDialog::new();
+        let id = dialog.add_section_with_content("instruction", "hello".to_string());
+        let action = handle_enter_key(&mut dialog, KeyModifiers::empty(), &id, 80)
+            .expect("enter handling succeeds");
+        assert!(
+            matches!(action, PromptAction::None),
+            "Enter in an instruction section must not send"
+        );
+        assert!(
+            dialog.get_section_content(&id).contains('\n'),
+            "Enter in an instruction section must insert a newline"
+        );
+    }
+
+    // The raw tab's own key handler already inserts a newline on plain Enter
+    // (it never routes through `handle_enter_key`), so no test is needed here.
+
+    #[test]
+    fn enter_with_nonempty_modifiers_is_noop() {
+        let mut dialog = SimplePromptDialog::new();
+        let id = dialog.add_section_with_content("context", "hello".to_string());
+        let before = dialog.get_section_content(&id);
+        let action = handle_enter_key(&mut dialog, KeyModifiers::CONTROL, &id, 80)
+            .expect("enter handling succeeds");
+        assert!(
+            matches!(action, PromptAction::None),
+            "Enter with modifiers must not send"
+        );
+        assert_eq!(
+            dialog.get_section_content(&id),
+            before,
+            "Enter with modifiers must leave content unchanged"
+        );
+    }
+
+    #[test]
+    fn enter_in_unknown_section_inserts_newline() {
+        let mut dialog = SimplePromptDialog::new();
+        let id = dialog.add_section_with_content("banana", "hello".to_string());
+        let action = handle_enter_key(&mut dialog, KeyModifiers::empty(), &id, 80)
+            .expect("enter handling succeeds");
+        assert!(
+            matches!(action, PromptAction::None),
+            "Enter in an unknown section must not send"
+        );
+        assert!(
+            dialog.get_section_content(&id).contains('\n'),
+            "Enter in an unknown section must insert a newline"
+        );
     }
 }
