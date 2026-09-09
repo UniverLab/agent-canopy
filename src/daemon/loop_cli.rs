@@ -48,11 +48,6 @@ pub(crate) enum LoopAction {
         /// Write the exported JSON to this path instead of stdout.
         #[arg(long)]
         output: Option<String>,
-        /// Include each agent node's/ensemble member's platform/model in the
-        /// exported file. Omit for a shareable design that never pins the
-        /// recipient to a harness or model they may not have.
-        #[arg(long = "with-models")]
-        with_models: bool,
     },
     /// Create a new loop from an exported document — never overwrites an
     /// existing loop.
@@ -148,11 +143,9 @@ pub(crate) async fn handle_loop_action(
     match action {
         LoopAction::List { workdir } => handle_loop_list(&db, workdir.as_deref()),
         LoopAction::Info { id_or_name } => handle_loop_info(&db, &id_or_name),
-        LoopAction::Export {
-            id_or_name,
-            output,
-            with_models,
-        } => handle_loop_export(&db, &id_or_name, output.as_deref(), with_models),
+        LoopAction::Export { id_or_name, output } => {
+            handle_loop_export(&db, &id_or_name, output.as_deref())
+        }
         LoopAction::Import {
             path,
             workdir,
@@ -342,12 +335,7 @@ fn confirm_reset(loop_name: &str) -> Result<bool> {
 /// Read-only, like `list`/`info` — reads the local database directly rather
 /// than round-tripping through the daemon, so exporting a loop never
 /// requires the daemon to be running.
-fn handle_loop_export(
-    db: &Database,
-    id_or_name: &str,
-    output: Option<&str>,
-    with_models: bool,
-) -> Result<()> {
+fn handle_loop_export(db: &Database, id_or_name: &str, output: Option<&str>) -> Result<()> {
     let loops = db.list_loops(None, true)?;
     let lp = resolve_loop(&loops, id_or_name)?;
 
@@ -359,7 +347,6 @@ fn handle_loop_export(
         &graph_nodes,
         &graph_edges,
         &ensembles,
-        with_models,
     )
     .map_err(|e| anyhow!(e))?;
     let json = serde_json::to_string_pretty(&document)?;
@@ -1137,39 +1124,22 @@ mod tests {
     }
 
     #[test]
-    fn export_parses_output_and_with_models() {
+    fn export_parses_output() {
         let cli = TestCli::try_parse_from(["test", "export", "my-loop"]).expect("should parse");
         match cli.action {
-            LoopAction::Export {
-                id_or_name,
-                output,
-                with_models,
-            } => {
+            LoopAction::Export { id_or_name, output } => {
                 assert_eq!(id_or_name, "my-loop");
                 assert!(output.is_none());
-                assert!(!with_models);
             }
             other => panic!("expected Export, got {other:?}"),
         }
 
-        let cli = TestCli::try_parse_from([
-            "test",
-            "export",
-            "my-loop",
-            "--output",
-            "loop.json",
-            "--with-models",
-        ])
-        .expect("should parse");
+        let cli = TestCli::try_parse_from(["test", "export", "my-loop", "--output", "loop.json"])
+            .expect("should parse");
         match cli.action {
-            LoopAction::Export {
-                id_or_name,
-                output,
-                with_models,
-            } => {
+            LoopAction::Export { id_or_name, output } => {
                 assert_eq!(id_or_name, "my-loop");
                 assert_eq!(output.as_deref(), Some("loop.json"));
-                assert!(with_models);
             }
             other => panic!("expected Export, got {other:?}"),
         }
@@ -2090,44 +2060,23 @@ mod tests {
         .unwrap();
 
         let out_path = dir.path().join("export.json");
-        handle_loop_export(&db, "loop-1", Some(out_path.to_str().unwrap()), false)
+        handle_loop_export(&db, "loop-1", Some(out_path.to_str().unwrap()))
             .expect("export should succeed");
 
         let raw = std::fs::read_to_string(&out_path).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(doc["format_version"], 1);
+        assert_eq!(doc["format_version"], 2);
         assert_eq!(doc["name"], "my-loop");
-        assert!(doc["nodes"][0]["config"].get("platform").is_none());
-    }
-
-    #[test]
-    fn handle_loop_export_with_models_keeps_platform() {
-        let (dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Draft);
-        db.insert_loop_node(&crate::domain::loops::LoopNode {
-            id: "n1".to_string(),
-            spec_id: None,
-            loop_id: Some("loop-1".to_string()),
-            name: "implementer".to_string(),
-            kind: crate::domain::loops::LoopNodeKind::Agent,
-            config: serde_json::json!({"platform": "claude", "prompt_template": "go"}),
-            position: 1,
-            created_at: Utc::now(),
-        })
-        .unwrap();
-
-        let out_path = dir.path().join("export.json");
-        handle_loop_export(&db, "loop-1", Some(out_path.to_str().unwrap()), true)
-            .expect("export should succeed");
-
-        let raw = std::fs::read_to_string(&out_path).unwrap();
-        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(doc["nodes"][0]["config"]["platform"], "claude");
+        // No model stored (platform default): exported as explicit null.
+        assert!(doc["nodes"][0]["config"].get("model").is_some());
+        assert!(doc["nodes"][0]["config"]["model"].is_null());
     }
 
     #[test]
     fn handle_loop_export_rejects_unknown_loop_before_touching_disk() {
         let (_dir, db) = db_with_loop("loop-1", "my-loop", LoopStatus::Draft);
-        let err = handle_loop_export(&db, "missing", None, false).unwrap_err();
+        let err = handle_loop_export(&db, "missing", None).unwrap_err();
         assert!(err.to_string().contains("No loop matches"));
     }
 

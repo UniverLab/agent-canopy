@@ -388,7 +388,7 @@ it, and the file is also a diff: review a change to a loop, or keep
 one in a repo next to the code it operates on.
 
 ```
-canopy loop export <loop_id> [--output <path>] [--with-models]
+canopy loop export <loop_id> [--output <path>]
 canopy loop import <path> [--workdir <dir>] [--name <name>]
 ```
 
@@ -399,7 +399,7 @@ current directory, and `--name` overrides the file's own name. If the
 resolved name is already taken in the target workdir, import still
 succeeds under a numeric suffix (`"My Loop (2)"`) and reports which
 name it used. The same two operations exist as MCP tools,
-`loop_export { loop_id, with_models? }` and
+`loop_export { loop_id }` and
 `loop_import { document, workdir?, name? }`, so a loop is drivable end
 to end through MCP as well as the CLI.
 
@@ -410,17 +410,20 @@ loop, or export refuses with the names it found), no `workdir`, no
 specs, and no run/status state. A loop file is a shape and a set of
 instructions, not somebody else's backlog or history.
 
-`platform`/`model` are stripped from every agent node and ensemble
-member by default, for the same reason a [node blueprint](#node-blueprints)
-never carries one: a shared design pinned to a harness or model the
-recipient doesn't have is broken on arrival, and one pinned to a model
-they do have is worse, since it silently spends their quota on someone
-else's choice. Pass `--with-models` (`with_models: true` over MCP) only
-when exporting your own loop to restore later on your own machine.
-`import`'s response always lists every agent node left without a
-platform, so there's exactly one thing to check before running an
-imported loop: `nodes_missing_platform` in the MCP response, or the
-same list printed by the CLI.
+`platform`/`model` are always included for every agent node and
+ensemble member (`format_version: 2`), so an exported file round-trips
+its harness bindings through `import` unchanged. A node that uses its
+platform's default model exports `"model": null` explicitly, and an
+ensemble member without a binding or override exports explicit `null`s
+for the unset fields. Import accepts both `format_version: 1`
+(members with no binding, reported as missing a platform) and `2`
+(bindings restored verbatim); it never rejects a platform the
+importing machine has not configured — validating that a pair is
+usable belongs to `loop_preflight`. `import`'s response always lists
+every agent node left without a platform, so there's exactly one
+thing to check before running an imported loop:
+`nodes_missing_platform` in the MCP response, or the same list
+printed by the CLI.
 
 An [ensemble](#ensembles) round-trips as one ensemble — not as its
 expanded member/quorum nodes — via its own `ensembles` array entry.
@@ -430,7 +433,7 @@ ensemble of reviewers, and a committer the quorum routes to on pass.
 
 ```json
 {
-  "format_version": 1,
+  "format_version": 2,
   "name": "implement-and-review",
   "description": "Implement a spec, get two model opinions, then commit.",
   "nodes": [
@@ -439,6 +442,8 @@ ensemble of reviewers, and a committer the quorum routes to on pass.
       "kind": "agent",
       "position": 1,
       "config": {
+        "platform": "opencode",
+        "model": null,
         "prompt_template": "Implement: {{spec_content}}",
         "timeout_minutes": 30
       }
@@ -448,6 +453,8 @@ ensemble of reviewers, and a committer the quorum routes to on pass.
       "kind": "agent",
       "position": 4,
       "config": {
+        "platform": "opencode",
+        "model": "opencode/muse-spark-1.3-contributor-free",
         "prompt_template": "Review the feedback and commit if satisfied.",
         "commit_rights": true,
         "timeout_minutes": 15
@@ -465,20 +472,21 @@ ensemble of reviewers, and a committer the quorum routes to on pass.
       "min_pass": 2,
       "timeout_minutes": 20,
       "members": [
-        {},
-        {}
+        {"platform": "copilot", "model": null, "prompt_override": null},
+        {"platform": "opencode", "model": "opencode-go/qwen3.7-plus", "prompt_override": null}
       ]
     }
   ]
 }
 ```
 
-Note what is absent: no `id` anywhere, no `platform`/`model` on
-`implementer`/`committer`/the ensemble's members (this file was
-exported without `--with-models` — `import` will report all three as
-`nodes_missing_platform`), and the ensemble's own member/quorum nodes
-never appear in `nodes` — only its `entry_from_node`/`on_pass_to`
-(both plain node names) and its `members` array do.
+Note what is absent: no `id` anywhere, and the ensemble's own
+member/quorum nodes never appear in `nodes` — only its
+`entry_from_node`/`on_pass_to` (both plain node names) and its
+`members` array do. `implementer` uses its platform's default model,
+hence the explicit `"model": null`; a `format_version: 1` document
+with `{}` members still imports, with every unbound node reported as
+`nodes_missing_platform`.
 
 ## Archive and restore
 

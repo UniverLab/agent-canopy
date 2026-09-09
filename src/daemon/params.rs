@@ -1013,12 +1013,6 @@ pub struct LoopGetParams {
 pub struct LoopExportParams {
     /// Loop ID to export.
     pub loop_id: String,
-    /// Include each agent node's/ensemble member's `platform`/`model` in the
-    /// document. Defaults to `false` — a shared design should never pin the
-    /// recipient to a harness or model they may not have; use `true` only
-    /// when exporting your own loop to restore later on your own machine.
-    #[serde(default)]
-    pub with_models: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

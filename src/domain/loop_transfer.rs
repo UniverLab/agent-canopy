@@ -5,9 +5,8 @@
 //!
 //! Deliberately excludes ids, workdir, specs, and run/status state (a loop
 //! design carrying someone else's backlog or run history would be a
-//! surprise on arrival), and excludes `platform`/`model` by default (a
-//! shared design pinned to a harness/model the recipient may not have is
-//! either broken or silently spends their quota).
+//! surprise on arrival), and always includes `platform`/`model` (v2) so an
+//! exported document round-trips its harness bindings.
 //!
 //! This module is pure — it never touches the database. `daemon::handler`'s
 //! `loop_export`/`loop_import` MCP tools (and their `canopy loop
@@ -30,9 +29,11 @@ use crate::domain::validation::{
     validate_ensembles_in_graph, validate_loop_graph, GraphEdgeView, GraphNodeView,
 };
 
-/// The only `format_version` this build understands. An unrecognized or
-/// missing version is a refusal, never a best-effort parse (decision 6).
-pub const LOOP_EXPORT_FORMAT_VERSION: i64 = 1;
+/// The latest `format_version` this build writes. `loop_import` accepts both
+/// `1` (members with no binding) and `2` (bindings included). An
+/// unrecognized or missing version is a refusal, never a best-effort parse
+/// (decision 6).
+pub const LOOP_EXPORT_FORMAT_VERSION: i64 = 2;
 
 /// Ensemble member count bounds — mirrors `daemon::handler`'s
 /// `ENSEMBLE_MIN_MEMBERS`/`ENSEMBLE_MAX_MEMBERS` (`loop_add_ensemble`'s own
@@ -80,11 +81,11 @@ pub struct LoopExportEdge {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LoopExportEnsembleMember {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub platform: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub prompt_override: Option<String>,
 }
 
@@ -121,7 +122,6 @@ pub fn build_export_document(
     graph_nodes: &[LoopNode],
     graph_edges: &[LoopEdge],
     ensembles: &[EnsembleDetails],
-    with_models: bool,
 ) -> Result<LoopExportDocument, String> {
     let owned_ids: std::collections::HashSet<&str> = ensembles
         .iter()
@@ -183,7 +183,7 @@ pub fn build_export_document(
             name: node.name.clone(),
             kind: node.kind,
             position: node.position,
-            config: export_node_config(node.kind, &node.config, with_models),
+            config: export_node_config(node.kind, &node.config),
         })
         .collect();
 
@@ -219,16 +219,17 @@ pub fn build_export_document(
             .map(resolve_name)
             .transpose()?;
 
-        let members = details
-            .members
+        let mut sorted_members: Vec<&EnsembleMember> = details.members.iter().collect();
+        sorted_members.sort_by_key(|m| m.position);
+        let members = sorted_members
             .iter()
             .map(|member| LoopExportEnsembleMember {
-                platform: with_models.then(|| member.platform.clone()),
-                model: if with_models {
-                    member.model.clone()
-                } else {
+                platform: if member.platform.is_empty() {
                     None
+                } else {
+                    Some(member.platform.clone())
                 },
+                model: member.model.clone(),
                 prompt_override: member.prompt_override.clone(),
             })
             .collect();
@@ -265,17 +266,23 @@ pub fn build_export_document(
     })
 }
 
-/// An agent node's config with `platform`/`model` stripped, unless
-/// `with_models` — decision 3. Every other kind's config, and every other
-/// key on an agent node's config, passes through untouched.
-fn export_node_config(kind: LoopNodeKind, config: &Value, with_models: bool) -> Value {
-    if with_models || kind != LoopNodeKind::Agent {
+/// An agent node's config passes through untouched, except that a missing
+/// `model` key is injected as `null` so the export states "platform
+/// default" explicitly, field-for-field with `loop_get`. Every other kind's
+/// config passes through verbatim.
+fn export_node_config(kind: LoopNodeKind, config: &Value) -> Value {
+    if kind != LoopNodeKind::Agent {
         return config.clone();
     }
-    let mut map = config.as_object().cloned().unwrap_or_default();
-    map.remove("platform");
-    map.remove("model");
-    Value::Object(map)
+    if let Some(map) = config.as_object() {
+        if map.contains_key("model") {
+            return config.clone();
+        }
+        let mut map = map.clone();
+        map.insert("model".to_string(), Value::Null);
+        return Value::Object(map);
+    }
+    config.clone()
 }
 
 fn extract_router_labels(config: &Value) -> Vec<String> {
@@ -311,15 +318,15 @@ fn edge_sort_key(edge: &LoopExportEdge) -> String {
 /// (decision 6).
 pub fn parse_export_document_value(value: &Value) -> Result<LoopExportDocument, String> {
     match value.get("format_version").and_then(Value::as_i64) {
-        Some(version) if version == LOOP_EXPORT_FORMAT_VERSION => {}
+        Some(1) | Some(2) => {}
         Some(other) => {
             return Err(format!(
-                "Loop export document has format_version {other}, but this build only supports {LOOP_EXPORT_FORMAT_VERSION}."
+                "Loop export document has format_version {other}, but this build only supports 1 and {LOOP_EXPORT_FORMAT_VERSION}."
             ))
         }
         None => {
             return Err(
-                "Loop export document is missing format_version; refusing to guess. Expected format_version: 1."
+                "Loop export document is missing format_version; refusing to guess. Expected format_version: 2."
                     .to_string(),
             )
         }
@@ -381,9 +388,9 @@ pub fn build_import_plan(
     document: &LoopExportDocument,
     loop_id: &str,
 ) -> Result<LoopImportPlan, String> {
-    if document.format_version != LOOP_EXPORT_FORMAT_VERSION {
+    if document.format_version != 1 && document.format_version != LOOP_EXPORT_FORMAT_VERSION {
         return Err(format!(
-            "Loop export document has format_version {}, but this build only supports {}.",
+            "Loop export document has format_version {}, but this build only supports 1 and {}.",
             document.format_version, LOOP_EXPORT_FORMAT_VERSION
         ));
     }
@@ -769,9 +776,10 @@ pub fn build_import_plan(
 }
 
 /// Names of every agent node (plain or ensemble member) left without a
-/// `platform`/`cli` after import — decision 3's counterpart: since export
-/// strips them by default, `loop_import`'s response calls out exactly which
-/// nodes need one filled in before the loop can run (requirement 4).
+/// `platform`/`cli` after import — a v1 document (or a hand-written one)
+/// may legitimately arrive without one, so `loop_import`'s response calls
+/// out exactly which nodes need one filled in before the loop can run
+/// (requirement 4).
 pub fn agent_nodes_missing_platform(plan: &LoopImportPlan) -> Vec<String> {
     let plain = plan
         .nodes
@@ -908,29 +916,143 @@ mod tests {
     }
 
     #[test]
-    fn export_strips_platform_and_model_by_default() {
+    fn export_v2_always_includes_agent_bindings_and_null_model() {
         let (lp, nodes, edges) = simple_graph();
-        let doc = build_export_document(&lp, &nodes, &edges, &[], false).unwrap();
-        let implementer = doc.nodes.iter().find(|n| n.name == "implementer").unwrap();
-        assert!(implementer.config.get("platform").is_none());
-        assert!(implementer.config.get("model").is_none());
-        assert_eq!(implementer.config["prompt_template"], "implement it");
-    }
-
-    #[test]
-    fn export_with_models_keeps_platform_and_model() {
-        let (lp, nodes, edges) = simple_graph();
-        let doc = build_export_document(&lp, &nodes, &edges, &[], true).unwrap();
+        let doc = build_export_document(&lp, &nodes, &edges, &[]).unwrap();
+        assert_eq!(doc.format_version, LOOP_EXPORT_FORMAT_VERSION);
         let implementer = doc.nodes.iter().find(|n| n.name == "implementer").unwrap();
         assert_eq!(implementer.config["platform"], "claude");
         assert_eq!(implementer.config["model"], "opus");
+        assert_eq!(implementer.config["prompt_template"], "implement it");
+        // The committer stores no model (platform default): export states
+        // it explicitly as null rather than omitting the key.
+        let committer = doc.nodes.iter().find(|n| n.name == "committer").unwrap();
+        assert_eq!(committer.config["platform"], "claude");
+        assert!(committer.config.get("model").is_some());
+        assert!(committer.config["model"].is_null());
+        // Non-binding keys pass through untouched.
+        assert_eq!(committer.config["prompt_template"], "commit it");
+    }
+
+    #[test]
+    fn export_v2_members_carry_bindings_in_position_order() {
+        let lp = make_loop("member-order-loop");
+        let kickoff = make_node(
+            "kickoff",
+            "kickoff",
+            LoopNodeKind::Check,
+            serde_json::json!({"command": "true"}),
+            1,
+        );
+        let downstream = make_node(
+            "downstream",
+            "downstream",
+            LoopNodeKind::Agent,
+            serde_json::json!({"platform": "claude", "prompt_template": "wrap up"}),
+            10,
+        );
+        let member1 = make_node(
+            "m1",
+            "Team [1]",
+            LoopNodeKind::Agent,
+            serde_json::json!({"platform": "copilot", "prompt_template": "draft it", "timeout_minutes": 30}),
+            2,
+        );
+        let member2 = make_node(
+            "m2",
+            "Team [2]",
+            LoopNodeKind::Agent,
+            serde_json::json!({"platform": "opencode", "model": "opencode-go/qwen3.7-plus", "prompt_template": "draft it", "timeout_minutes": 30}),
+            3,
+        );
+        let member3 = make_node(
+            "m3",
+            "Team [3]",
+            LoopNodeKind::Agent,
+            serde_json::json!({"platform": "opencode", "model": "opencode/muse-spark", "prompt_template": "custom", "timeout_minutes": 30}),
+            4,
+        );
+        let join = make_node(
+            "join1",
+            "Team (quorum)",
+            LoopNodeKind::Join,
+            serde_json::json!({"ensemble_id": "ens1"}),
+            5,
+        );
+        let nodes = vec![kickoff, downstream, member1, member2, member3, join];
+        let edges = vec![
+            make_edge("e1", "kickoff", "m1", LoopEdgeCondition::Always),
+            make_edge("e2", "kickoff", "m2", LoopEdgeCondition::Always),
+            make_edge("e3", "kickoff", "m3", LoopEdgeCondition::Always),
+            make_edge("e4", "m1", "join1", LoopEdgeCondition::Always),
+            make_edge("e5", "m2", "join1", LoopEdgeCondition::Always),
+            make_edge("e6", "m3", "join1", LoopEdgeCondition::Always),
+            make_edge("e7", "join1", "downstream", LoopEdgeCondition::Pass),
+        ];
+        // Members stored out of position order on purpose: export must
+        // still emit them in position order.
+        let mut ensemble_details =
+            make_ensemble_details("ens1", "join1", "kickoff", "downstream", &["m1", "m2"]);
+        ensemble_details.members.push(EnsembleMember {
+            ensemble_id: "ens1".to_string(),
+            node_id: "m3".to_string(),
+            position: 2,
+            platform: "opencode".to_string(),
+            model: Some("opencode/muse-spark".to_string()),
+            prompt_override: Some("custom angle".to_string()),
+        });
+        ensemble_details.members[0] = EnsembleMember {
+            ensemble_id: "ens1".to_string(),
+            node_id: "m1".to_string(),
+            position: 0,
+            platform: "copilot".to_string(),
+            model: None,
+            prompt_override: None,
+        };
+        ensemble_details.members[1] = EnsembleMember {
+            ensemble_id: "ens1".to_string(),
+            node_id: "m2".to_string(),
+            position: 1,
+            platform: "opencode".to_string(),
+            model: Some("opencode-go/qwen3.7-plus".to_string()),
+            prompt_override: None,
+        };
+        // Shuffle the stored order so the test pins the sort, not the input.
+        ensemble_details.members.swap(0, 2);
+        ensemble_details.ensemble.name = "Team".to_string();
+
+        let doc = build_export_document(&lp, &nodes, &edges, &[ensemble_details]).unwrap();
+        let team = doc.ensembles.iter().find(|e| e.name == "Team").unwrap();
+        assert_eq!(team.members.len(), 3);
+        assert_eq!(team.members[0].platform.as_deref(), Some("copilot"));
+        assert_eq!(team.members[0].model, None);
+        assert_eq!(team.members[0].prompt_override, None);
+        assert_eq!(team.members[1].platform.as_deref(), Some("opencode"));
+        assert_eq!(
+            team.members[1].model.as_deref(),
+            Some("opencode-go/qwen3.7-plus")
+        );
+        assert_eq!(team.members[2].platform.as_deref(), Some("opencode"));
+        assert_eq!(
+            team.members[2].model.as_deref(),
+            Some("opencode/muse-spark")
+        );
+        assert_eq!(
+            team.members[2].prompt_override.as_deref(),
+            Some("custom angle")
+        );
+        // Optional fields serialize as explicit nulls, never omitted keys.
+        let raw = serde_json::to_string(&doc).unwrap();
+        assert!(raw.contains("\"model\":null"));
+        assert!(raw.contains("\"prompt_override\":null"));
+        assert!(raw.contains("\"platform\":\"copilot\""));
     }
 
     #[test]
     fn export_rejects_duplicate_node_names() {
         let (lp, mut nodes, edges) = simple_graph();
         nodes[1].name = "implementer".to_string();
-        let err = build_export_document(&lp, &nodes, &edges, &[], false).unwrap_err();
+        let err = build_export_document(&lp, &nodes, &edges, &[]).unwrap_err();
         assert!(err.contains("implementer"));
         assert!(err.contains("duplicate"));
     }
@@ -938,10 +1060,10 @@ mod tests {
     #[test]
     fn format_version_first_key_in_serialized_json() {
         let (lp, nodes, edges) = simple_graph();
-        let doc = build_export_document(&lp, &nodes, &edges, &[], false).unwrap();
+        let doc = build_export_document(&lp, &nodes, &edges, &[]).unwrap();
         let raw = serde_json::to_string(&doc).unwrap();
         // struct field order drives serde_json's key order.
-        assert!(raw.starts_with("{\"format_version\":1"));
+        assert!(raw.starts_with("{\"format_version\":2"));
     }
 
     #[test]
@@ -956,10 +1078,22 @@ mod tests {
     #[test]
     fn import_rejects_unsupported_format_version() {
         let value = serde_json::json!({
-            "format_version": 2, "name": "x", "nodes": [], "edges": [], "ensembles": []
+            "format_version": 99, "name": "x", "nodes": [], "edges": [], "ensembles": []
         });
         let err = parse_export_document_value(&value).unwrap_err();
-        assert!(err.contains("2"));
+        assert!(err.contains("99"));
+    }
+
+    #[test]
+    fn import_accepts_format_version_1_and_2() {
+        for version in [1, 2] {
+            let value = serde_json::json!({
+                "format_version": version, "name": "x", "nodes": [], "edges": [], "ensembles": []
+            });
+            let doc = parse_export_document_value(&value)
+                .unwrap_or_else(|e| panic!("version {version} must parse: {e}"));
+            assert_eq!(doc.format_version, version);
+        }
     }
 
     #[test]
@@ -1009,7 +1143,7 @@ mod tests {
     #[test]
     fn import_plan_assigns_fresh_ids_and_loop_id() {
         let (lp, nodes, edges) = simple_graph();
-        let doc = build_export_document(&lp, &nodes, &edges, &[], true).unwrap();
+        let doc = build_export_document(&lp, &nodes, &edges, &[]).unwrap();
         let plan = build_import_plan(&doc, "brand-new-loop-id").unwrap();
         assert_eq!(plan.nodes.len(), 3);
         for node in &plan.nodes {
@@ -1021,9 +1155,48 @@ mod tests {
     }
 
     #[test]
-    fn agent_nodes_missing_platform_reports_stripped_nodes() {
-        let (lp, nodes, edges) = simple_graph();
-        let doc = build_export_document(&lp, &nodes, &edges, &[], false).unwrap();
+    fn agent_nodes_missing_platform_reports_unbound_v1_nodes() {
+        // A v1-style document carries no bindings: every agent node is
+        // reported. Built by hand (not via export, which always binds).
+        let doc = LoopExportDocument {
+            format_version: 1,
+            name: "x".to_string(),
+            description: None,
+            nodes: vec![
+                LoopExportNode {
+                    name: "implementer".to_string(),
+                    kind: LoopNodeKind::Agent,
+                    position: 1,
+                    config: serde_json::json!({"prompt_template": "implement it"}),
+                },
+                LoopExportNode {
+                    name: "gate".to_string(),
+                    kind: LoopNodeKind::Check,
+                    position: 2,
+                    config: serde_json::json!({"command": "cargo test"}),
+                },
+                LoopExportNode {
+                    name: "committer".to_string(),
+                    kind: LoopNodeKind::Agent,
+                    position: 3,
+                    config: serde_json::json!({"prompt_template": "commit it"}),
+                },
+            ],
+            edges: vec![
+                LoopExportEdge {
+                    from_node: "implementer".to_string(),
+                    to_node: "gate".to_string(),
+                    condition: LoopEdgeCondition::Always,
+                },
+                LoopExportEdge {
+                    from_node: "gate".to_string(),
+                    to_node: "committer".to_string(),
+                    condition: LoopEdgeCondition::Always,
+                },
+            ],
+            ensembles: vec![],
+            infra_node: None,
+        };
         let plan = build_import_plan(&doc, "loop-2").unwrap();
         let missing = agent_nodes_missing_platform(&plan);
         assert_eq!(missing.len(), 2);
@@ -1032,9 +1205,9 @@ mod tests {
     }
 
     #[test]
-    fn agent_nodes_missing_platform_empty_with_models() {
+    fn agent_nodes_missing_platform_empty_for_v2_export() {
         let (lp, nodes, edges) = simple_graph();
-        let doc = build_export_document(&lp, &nodes, &edges, &[], true).unwrap();
+        let doc = build_export_document(&lp, &nodes, &edges, &[]).unwrap();
         let plan = build_import_plan(&doc, "loop-2").unwrap();
         assert!(agent_nodes_missing_platform(&plan).is_empty());
     }
@@ -1097,7 +1270,7 @@ mod tests {
     /// The full ensemble round trip: build a graph with a kickoff node, a
     /// 2-member ensemble, and a downstream node; export it, import it under
     /// a new loop id, and export the result again. Requirement 5 (round
-    /// trip with `--with-models` on both ends) and the acceptance
+    /// trip, with bindings included on both ends) and the acceptance
     /// criterion ("an ensemble survives the round trip as an ensemble, not
     /// as expanded member nodes") both pin on this.
     #[test]
@@ -1154,7 +1327,7 @@ mod tests {
             &["m1", "m2"],
         )];
 
-        let first_export = build_export_document(&lp, &nodes, &edges, &ensembles, true).unwrap();
+        let first_export = build_export_document(&lp, &nodes, &edges, &ensembles).unwrap();
 
         // Ensemble survives as one ensemble entry; the plain node list
         // excludes the member/join nodes entirely.
@@ -1192,7 +1365,6 @@ mod tests {
             &imported_all_nodes,
             &plan.edges,
             &imported_ensemble_details,
-            true,
         )
         .unwrap();
 
@@ -1209,13 +1381,12 @@ mod tests {
     #[test]
     fn plain_graph_round_trips_identically_except_name() {
         let (lp, nodes, edges) = simple_graph();
-        let first_export = build_export_document(&lp, &nodes, &edges, &[], true).unwrap();
+        let first_export = build_export_document(&lp, &nodes, &edges, &[]).unwrap();
 
         let plan = build_import_plan(&first_export, "loop-2").unwrap();
         let mut lp2 = make_loop("renamed-on-import");
         lp2.id = "loop-2".to_string();
-        let second_export =
-            build_export_document(&lp2, &plan.nodes, &plan.edges, &[], true).unwrap();
+        let second_export = build_export_document(&lp2, &plan.nodes, &plan.edges, &[]).unwrap();
 
         assert_ne!(first_export.name, second_export.name);
         assert_eq!(second_export.name, "renamed-on-import");
@@ -1223,6 +1394,179 @@ mod tests {
         assert_eq!(first_export.nodes, second_export.nodes);
         assert_eq!(first_export.edges, second_export.edges);
         assert_eq!(first_export.ensembles, second_export.ensembles);
+    }
+
+    /// Export → import → export of a loop holding one multi-member ensemble
+    /// with distinct platform/model per member plus a solo agent node:
+    /// every harness binding must survive identically.
+    #[test]
+    fn v2_export_import_export_preserves_bindings() {
+        let lp = make_loop("bindings-loop");
+        let solo = make_node(
+            "solo",
+            "solo",
+            LoopNodeKind::Agent,
+            serde_json::json!({"platform": "opencode", "model": "opencode/muse-spark", "prompt_template": "go solo", "timeout_minutes": 15}),
+            1,
+        );
+        let downstream = make_node(
+            "downstream",
+            "downstream",
+            LoopNodeKind::Check,
+            serde_json::json!({"command": "true"}),
+            10,
+        );
+        let member1 = make_node(
+            "m1",
+            "Crew [1]",
+            LoopNodeKind::Agent,
+            serde_json::json!({"platform": "copilot", "prompt_template": "draft it", "timeout_minutes": 30}),
+            2,
+        );
+        let member2 = make_node(
+            "m2",
+            "Crew [2]",
+            LoopNodeKind::Agent,
+            serde_json::json!({"platform": "opencode", "model": "opencode-go/qwen3.7-plus", "prompt_template": "draft it", "timeout_minutes": 30}),
+            3,
+        );
+        let join = make_node(
+            "join1",
+            "Crew (quorum)",
+            LoopNodeKind::Join,
+            serde_json::json!({"ensemble_id": "ens1"}),
+            4,
+        );
+        let nodes = vec![solo, downstream, member1, member2, join];
+        let edges = vec![
+            make_edge("e1", "solo", "m1", LoopEdgeCondition::Always),
+            make_edge("e2", "solo", "m2", LoopEdgeCondition::Always),
+            make_edge("e3", "m1", "join1", LoopEdgeCondition::Always),
+            make_edge("e4", "m2", "join1", LoopEdgeCondition::Always),
+            make_edge("e5", "join1", "downstream", LoopEdgeCondition::Pass),
+        ];
+        let mut details =
+            make_ensemble_details("ens1", "join1", "solo", "downstream", &["m1", "m2"]);
+        details.ensemble.name = "Crew".to_string();
+        details.members[0].platform = "copilot".to_string();
+        details.members[0].model = None;
+        details.members[0].prompt_override = Some("first angle".to_string());
+        details.members[1].platform = "opencode".to_string();
+        details.members[1].model = Some("opencode-go/qwen3.7-plus".to_string());
+
+        let first = build_export_document(&lp, &nodes, &edges, &[details]).unwrap();
+        let plan = build_import_plan(&first, "loop-2").unwrap();
+        assert!(agent_nodes_missing_platform(&plan).is_empty());
+
+        let mut imported_all_nodes = plan.nodes.clone();
+        let mut imported_details = Vec::new();
+        for ens in &plan.ensembles {
+            imported_all_nodes.push(ens.join_node.clone());
+            imported_all_nodes.extend(ens.member_nodes.iter().cloned());
+            imported_details.push(EnsembleDetails {
+                ensemble: ens.ensemble.clone(),
+                members: ens.members.clone(),
+            });
+        }
+        let mut lp2 = make_loop("bindings-loop");
+        lp2.id = "loop-2".to_string();
+        let second =
+            build_export_document(&lp2, &imported_all_nodes, &plan.edges, &imported_details)
+                .unwrap();
+
+        // Harness bindings identical across the round trip, node and member.
+        let first_solo = first.nodes.iter().find(|n| n.name == "solo").unwrap();
+        let second_solo = second.nodes.iter().find(|n| n.name == "solo").unwrap();
+        assert_eq!(
+            first_solo.config["platform"],
+            second_solo.config["platform"]
+        );
+        assert_eq!(first_solo.config["model"], second_solo.config["model"]);
+        assert_eq!(first.ensembles, second.ensembles);
+        assert_eq!(first.nodes, second.nodes);
+    }
+
+    /// Import must not fail when the document names a platform the importing
+    /// machine has not configured: the node is created as written, and
+    /// reporting an unusable pair belongs to `loop_preflight`.
+    #[test]
+    fn import_v2_with_unconfigured_platform_succeeds() {
+        let doc = LoopExportDocument {
+            format_version: 2,
+            name: "x".to_string(),
+            description: None,
+            nodes: vec![
+                LoopExportNode {
+                    name: "odd".to_string(),
+                    kind: LoopNodeKind::Agent,
+                    position: 1,
+                    config: serde_json::json!({
+                        "platform": "never-configured-xyz",
+                        "model": "some-model-abc",
+                        "prompt_template": "go",
+                    }),
+                },
+                LoopExportNode {
+                    name: "next".to_string(),
+                    kind: LoopNodeKind::Check,
+                    position: 2,
+                    config: serde_json::json!({"command": "true"}),
+                },
+            ],
+            edges: vec![LoopExportEdge {
+                from_node: "odd".to_string(),
+                to_node: "next".to_string(),
+                condition: LoopEdgeCondition::Always,
+            }],
+            ensembles: vec![],
+            infra_node: None,
+        };
+        let plan = build_import_plan(&doc, "new-loop")
+            .expect("unconfigured platform must import, not error");
+        let odd = plan.nodes.iter().find(|n| n.name == "odd").unwrap();
+        assert_eq!(odd.config["platform"], "never-configured-xyz");
+        assert_eq!(odd.config["model"], "some-model-abc");
+    }
+
+    /// A `format_version: 2` document must stay readable after later fields
+    /// are added: unknown fields are ignored rather than rejected, at the
+    /// document, node, and member levels.
+    #[test]
+    fn unknown_fields_are_ignored() {
+        let value = serde_json::json!({
+            "format_version": 2,
+            "name": "future-loop",
+            "future_field": 123,
+            "nodes": [
+                {"name": "a", "kind": "check", "position": 1, "config": {"command": "true"}, "future_node_field": "x"},
+                {"name": "b", "kind": "check", "position": 2, "config": {"command": "true"}},
+            ],
+            "edges": [
+                {"from_node": "a", "to_node": "b", "condition": "always"}
+            ],
+            "ensembles": [
+                {
+                    "name": "team",
+                    "prompt_template": "go",
+                    "entry_from_node": "a",
+                    "entry_condition": "always",
+                    "on_pass_to": "b",
+                    "min_pass": 2,
+                    "timeout_minutes": 30,
+                    "members": [
+                        {"platform": "claude", "model": null, "prompt_override": null, "future_member_field": [1, 2]},
+                        {"platform": "claude", "model": "opus", "prompt_override": null}
+                    ]
+                }
+            ]
+        });
+        let document = parse_export_document_value(&value)
+            .expect("unknown future fields must not break parsing");
+        let plan = build_import_plan(&document, "new-loop")
+            .expect("unknown future fields must not break import");
+        assert_eq!(plan.nodes.len(), 2);
+        assert_eq!(plan.ensembles.len(), 1);
+        assert_eq!(plan.ensembles[0].members[1].model.as_deref(), Some("opus"));
     }
 
     /// Pins `docs/loops.md`'s worked example to the actual format: if this

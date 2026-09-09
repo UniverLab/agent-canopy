@@ -7126,7 +7126,7 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "loop_export",
-        description = "Export a loop's design — name, description, nodes, edges, and ensembles — as a portable JSON document, so it can be shared as a file and recreated elsewhere with loop_import. Never includes ids, workdir, specs, or run/status state. platform/model are stripped from every agent node/ensemble member by default; pass with_models: true to keep them (only when exporting your own loop to restore later on your own machine)."
+        description = "Export a loop's design — name, description, nodes, edges, and ensembles — as a portable JSON document, so it can be shared as a file and recreated elsewhere with loop_import. Never includes ids, workdir, specs, or run/status state. Includes platform/model for every agent node and ensemble member; format_version 2."
     )]
     async fn loop_export(
         &self,
@@ -7144,8 +7144,6 @@ impl TaskTriggerHandler {
         let Some(lp) = self.db.get_loop(&loop_id).map_err(internal_error)? else {
             return Ok(error_result(&format!("Loop '{loop_id}' not found.")));
         };
-        let with_models = params.with_models.unwrap_or(false);
-
         let graph_nodes = self
             .db
             .list_loop_nodes_for_loop(&loop_id)
@@ -7164,7 +7162,6 @@ impl TaskTriggerHandler {
             &graph_nodes,
             &graph_edges,
             &ensembles,
-            with_models,
         ) {
             Ok(document) => document,
             Err(e) => return Ok(error_result(&e)),
@@ -7177,7 +7174,7 @@ impl TaskTriggerHandler {
 
     #[tool(
         name = "loop_import",
-        description = "Create a new loop from an exported document (the object loop_export returns). Always creates a new loop — never updates or overwrites an existing one; if the name is already taken in workdir, a numeric suffix is applied and the response says which name was used. Validates the document exactly as loop_add_node/loop_add_edge/loop_add_ensemble would, all-or-nothing: nothing is written if any part is rejected. The response lists every agent node left without a platform (the document strips it by default) so the caller knows what to fill in before running the loop."
+        description = "Create a new loop from an exported document (the object loop_export returns). Always creates a new loop — never updates or overwrites an existing one; if the name is already taken in workdir, a numeric suffix is applied and the response says which name was used. Validates the document exactly as loop_add_node/loop_add_edge/loop_add_ensemble would, all-or-nothing: nothing is written if any part is rejected. Accepts format_version 1 (members with no binding, reported as missing a platform) and 2 (bindings restored). The response lists every agent node left without a platform so the caller knows what to fill in before running the loop."
     )]
     async fn loop_import(
         &self,
@@ -19097,7 +19094,6 @@ mod endpoint_tests {
         let result = handler
             .loop_export(Parameters(LoopExportParams {
                 loop_id: "missing".to_string(),
-                with_models: None,
             }))
             .await
             .unwrap();
@@ -19106,37 +19102,18 @@ mod endpoint_tests {
     }
 
     #[tokio::test]
-    async fn loop_export_strips_platform_by_default_and_keeps_it_with_with_models() {
+    async fn loop_export_always_includes_platform_and_model() {
         let (dir, _db, handler) = endpoint_test_handler();
         let workdir = dir.path().to_string_lossy().to_string();
         let (loop_id, ..) = build_simple_loop(&handler, &workdir, "Export Loop").await;
 
-        let stripped = handler
-            .loop_export(Parameters(LoopExportParams {
-                loop_id: loop_id.clone(),
-                with_models: None,
-            }))
+        let exported = handler
+            .loop_export(Parameters(LoopExportParams { loop_id }))
             .await
             .unwrap();
-        assert!(!is_err(&stripped), "{}", text(&stripped));
-        let doc: serde_json::Value = serde_json::from_str(&raw_text(&stripped)).unwrap();
-        assert_eq!(doc["format_version"], 1);
-        let implementer = doc["nodes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|n| n["name"] == "implementer")
-            .unwrap();
-        assert!(implementer["config"].get("platform").is_none());
-
-        let with_models = handler
-            .loop_export(Parameters(LoopExportParams {
-                loop_id,
-                with_models: Some(true),
-            }))
-            .await
-            .unwrap();
-        let doc: serde_json::Value = serde_json::from_str(&raw_text(&with_models)).unwrap();
+        assert!(!is_err(&exported), "{}", text(&exported));
+        let doc: serde_json::Value = serde_json::from_str(&raw_text(&exported)).unwrap();
+        assert_eq!(doc["format_version"], 2);
         let implementer = doc["nodes"]
             .as_array()
             .unwrap()
@@ -19144,6 +19121,10 @@ mod endpoint_tests {
             .find(|n| n["name"] == "implementer")
             .unwrap();
         assert_eq!(implementer["config"]["platform"], "claude");
+        // build_simple_loop's agent configs carry no model: export states
+        // the platform default explicitly as null.
+        assert!(implementer["config"].get("model").is_some());
+        assert!(implementer["config"]["model"].is_null());
     }
 
     /// Decision 2's enforced consequence: `loop_add_node` doesn't itself
@@ -19180,10 +19161,7 @@ mod endpoint_tests {
         }
 
         let result = handler
-            .loop_export(Parameters(LoopExportParams {
-                loop_id,
-                with_models: None,
-            }))
+            .loop_export(Parameters(LoopExportParams { loop_id }))
             .await
             .unwrap();
         assert!(is_err(&result));
@@ -19200,11 +19178,19 @@ mod endpoint_tests {
         let exported = handler
             .loop_export(Parameters(LoopExportParams {
                 loop_id: source_loop_id,
-                with_models: None,
             }))
             .await
             .unwrap();
-        let document: serde_json::Value = serde_json::from_str(&raw_text(&exported)).unwrap();
+        let mut document: serde_json::Value = serde_json::from_str(&raw_text(&exported)).unwrap();
+        // Simulate a v1-style unbound document: strip the harness bindings
+        // the v2 export now always carries, so import must report them.
+        document["format_version"] = serde_json::json!(1);
+        for node in document["nodes"].as_array_mut().unwrap().iter_mut() {
+            if let Some(config) = node["config"].as_object_mut() {
+                config.remove("platform");
+                config.remove("model");
+            }
+        }
 
         let imported = handler
             .loop_import(Parameters(LoopImportParams {
@@ -19250,7 +19236,6 @@ mod endpoint_tests {
         let exported = handler
             .loop_export(Parameters(LoopExportParams {
                 loop_id: source_loop_id,
-                with_models: None,
             }))
             .await
             .unwrap();
@@ -19278,7 +19263,6 @@ mod endpoint_tests {
         let exported = handler
             .loop_export(Parameters(LoopExportParams {
                 loop_id: source_loop_id,
-                with_models: None,
             }))
             .await
             .unwrap();
@@ -19369,7 +19353,7 @@ mod endpoint_tests {
     /// loop that includes an ensemble, which must survive as an ensemble
     /// rather than expanded member nodes.
     #[tokio::test]
-    async fn loop_export_import_round_trip_with_models_preserves_ensemble() {
+    async fn loop_export_import_v2_round_trip_preserves_ensemble() {
         let (dir, _db, handler) = endpoint_test_handler();
         let workdir = dir.path().to_string_lossy().to_string();
 
@@ -19446,10 +19430,7 @@ mod endpoint_tests {
         assert!(!is_err(&ensemble), "{}", text(&ensemble));
 
         let first_export = handler
-            .loop_export(Parameters(LoopExportParams {
-                loop_id,
-                with_models: Some(true),
-            }))
+            .loop_export(Parameters(LoopExportParams { loop_id }))
             .await
             .unwrap();
         let first_doc: serde_json::Value = serde_json::from_str(&raw_text(&first_export)).unwrap();
@@ -19469,8 +19450,8 @@ mod endpoint_tests {
         let imported_body: serde_json::Value = serde_json::from_str(&raw_text(&imported)).unwrap();
         let new_loop_id = imported_body["loop_id"].as_str().unwrap().to_string();
         assert_eq!(imported_body["name"], "Ensemble Loop (2)");
-        // Every member carried its platform/model through with_models — no
-        // node should be flagged.
+        // Every member carried its platform/model through the v2 export —
+        // no node should be flagged.
         assert!(imported_body["nodes_missing_platform"]
             .as_array()
             .unwrap()
@@ -19479,7 +19460,6 @@ mod endpoint_tests {
         let second_export = handler
             .loop_export(Parameters(LoopExportParams {
                 loop_id: new_loop_id,
-                with_models: Some(true),
             }))
             .await
             .unwrap();
@@ -20790,7 +20770,6 @@ mod endpoint_tests {
         let exported = handler
             .loop_export(Parameters(LoopExportParams {
                 loop_id: source_loop_id.clone(),
-                with_models: Some(true),
             }))
             .await
             .unwrap();
@@ -20884,7 +20863,6 @@ mod endpoint_tests {
         let exported = handler
             .loop_export(Parameters(LoopExportParams {
                 loop_id: source_loop_id.clone(),
-                with_models: Some(true),
             }))
             .await
             .unwrap();

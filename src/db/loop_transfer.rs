@@ -181,7 +181,7 @@ mod tests {
     fn simple_document() -> LoopExportDocument {
         use crate::domain::loop_transfer::{LoopExportEdge, LoopExportNode};
         LoopExportDocument {
-            format_version: 1,
+            format_version: 2,
             name: "shared-loop".to_string(),
             description: Some("A shared design".to_string()),
             nodes: vec![
@@ -259,7 +259,7 @@ mod tests {
         };
         let db = test_db();
         let document = LoopExportDocument {
-            format_version: 1,
+            format_version: 2,
             name: "ensemble-loop".to_string(),
             description: None,
             nodes: vec![
@@ -322,7 +322,7 @@ mod tests {
         let graph_edges = db.list_loop_edges_for_loop("loop-1").unwrap();
         let lp_row = db.get_loop("loop-1").unwrap().unwrap();
         let redone =
-            build_export_document(&lp_row, &graph_nodes, &graph_edges, &ensembles, true).unwrap();
+            build_export_document(&lp_row, &graph_nodes, &graph_edges, &ensembles).unwrap();
         assert_eq!(redone.ensembles.len(), 1);
         assert_eq!(redone.nodes.len(), 2);
     }
@@ -334,7 +334,7 @@ mod tests {
         use crate::domain::loop_transfer::{LoopExportEdge, LoopExportNode};
         let db = test_db();
         let document = LoopExportDocument {
-            format_version: 1,
+            format_version: 2,
             name: "infra-loop".to_string(),
             description: None,
             nodes: vec![
