@@ -120,15 +120,16 @@ pub struct TaskModelsParams {
     /// still-fresh local cache — use this to pick up newly published models.
     #[serde(default)]
     pub refresh: Option<bool>,
-    /// When true, bypass the per-provider and per-listing caps to show every
-    /// model. Defaults to false, which truncates long listings with a notice
-    /// naming the provider, how many were shown, and how many exist.
+    /// When true, bypass the per-provider and per-listing caps on the
+    /// **unfiltered** (no-platform) listing to show every model. Defaults to
+    /// false, which truncates long listings with a notice naming the provider,
+    /// how many were shown, and how many exist.
     ///
-    /// An explicit flag rather than a bigger implicit cap for platform-scoped
-    /// queries: a single platform can still map to a provider with a large
-    /// native catalog (e.g. a gateway CLI), so "has a platform filter" isn't
-    /// a reliable proxy for "small enough to show uncapped" — an opt-in flag
-    /// keeps the worst case bounded and predictable regardless of query shape.
+    /// Platform-scoped listings (with `platform` set) are never capped and
+    /// return all models the platform can reach — the `full` flag has no
+    /// effect on them. A caller already narrowed by platform gets the
+    /// complete answer; the cap only applies to the unfiltered, provider-wide
+    /// listing where the catalogue can be pathological.
     #[serde(default)]
     pub full: Option<bool>,
 }
