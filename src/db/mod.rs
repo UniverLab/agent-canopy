@@ -667,9 +667,21 @@ impl Database {
                 owner_type TEXT NOT NULL,
                 owner_id TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'active'
+                status TEXT NOT NULL DEFAULT 'active',
+                cleanup_error TEXT
             );",
         )?;
+
+        // CB42: record cleanup failures on the sandbox run (req 6). A fresh DB
+        // gets the column above; an existing one is migrated idempotently here
+        // using the same pragma-guard pattern as every other ALTER in this file.
+        let has_cleanup_error: bool = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sandbox_runs') WHERE name = 'cleanup_error'",
+            [], |row| Ok(row.get::<_, i32>(0)? > 0)).unwrap_or(false);
+        if !has_cleanup_error {
+            conn.execute("ALTER TABLE sandbox_runs ADD COLUMN cleanup_error TEXT", [])
+                .map_err(|e| anyhow::anyhow!("Migration failed: {e}"))?;
+        }
 
         // CM8: separate operational telemetry from knowledge. The three
         // writers (run, sync, launchpad) used to write `kind='session'`

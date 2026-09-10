@@ -22,6 +22,8 @@ pub(crate) mod process;
 pub(crate) mod project_cli;
 pub(crate) mod prompts_cli;
 pub(crate) mod rag_cli;
+
+pub(crate) mod sandbox_cli;
 pub(crate) mod server;
 pub(crate) mod service_install;
 pub(crate) mod spec_cli;

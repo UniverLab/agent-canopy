@@ -215,6 +215,41 @@ impl HardCascadePlan {
     }
 }
 
+/// A sandbox worktree as input to [`plan_sandbox_cleanup`].
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct SandboxCandidate {
+    pub id: String,
+    pub path: PathBuf,
+    pub loop_id: String,
+    pub branch: String,
+    pub run_over: bool,
+    pub has_unique_commits: Option<bool>,
+}
+
+/// A sandbox worktree `canopy clean` will reclaim in bulk.
+#[derive(Debug, Clone)]
+pub struct SandboxCleanTarget {
+    pub id: String,
+    pub path: PathBuf,
+    pub branch: String,
+}
+
+/// Which sandboxes `canopy clean` may reclaim in bulk (CB42 req 3's rule
+/// with force=false): the run is over AND the branch provably holds no
+/// commits that exist nowhere else. `None` (uncertain) is excluded — keep.
+pub fn plan_sandbox_cleanup(candidates: &[SandboxCandidate]) -> Vec<SandboxCleanTarget> {
+    candidates
+        .iter()
+        .filter(|c| c.run_over && c.has_unique_commits == Some(false))
+        .map(|c| SandboxCleanTarget {
+            id: c.id.clone(),
+            path: c.path.clone(),
+            branch: c.branch.clone(),
+        })
+        .collect()
+}
+
 /// Everything a `canopy clean` run decided to do (or, under `--dry-run`,
 /// decided it *would* do).
 #[derive(Debug, Clone, Default)]
@@ -224,6 +259,11 @@ pub struct CleanPlan {
     pub terminal_dirs: Vec<FileCandidate>,
     pub rag_residue_files: Vec<FileCandidate>,
     pub orphaned_projects: Vec<OrphanProjectReport>,
+    /// Sandbox worktrees to reclaim (bulk discard, never forced).
+    pub sandbox_removals: Vec<SandboxCleanTarget>,
+    /// Anonymous worktree directories with no run record. Reported as
+    /// skipped — never removed.
+    pub sandbox_untracked: Vec<PathBuf>,
 }
 
 impl CleanPlan {
@@ -250,12 +290,14 @@ impl CleanPlan {
     }
 
     /// Whether the plan deletes anything at all (orphaned-project *reports*
-    /// don't count — soft mode never deletes those).
+    /// and untracked-sandbox *skips* don't count — soft mode never deletes
+    /// those).
     pub fn is_empty(&self) -> bool {
         self.session_ids.is_empty()
             && self.log_files.is_empty()
             && self.terminal_dirs.is_empty()
             && self.rag_residue_files.is_empty()
+            && self.sandbox_removals.is_empty()
     }
 }
 
@@ -719,6 +761,8 @@ mod tests {
                 size_bytes: 300,
             }],
             orphaned_projects: vec![],
+            sandbox_removals: vec![],
+            sandbox_untracked: vec![],
         };
         assert_eq!(plan.reclaimed_bytes(), 600);
     }
@@ -736,6 +780,8 @@ mod tests {
                 missing_path: "/missing".to_string(),
                 dependents: ProjectDependentCounts::default(),
             }],
+            sandbox_removals: vec![],
+            sandbox_untracked: vec![],
         };
         assert_eq!(plan.reclaimed_bytes(), 0);
     }
@@ -750,6 +796,8 @@ mod tests {
             terminal_dirs: vec![],
             rag_residue_files: vec![],
             orphaned_projects: vec![],
+            sandbox_removals: vec![],
+            sandbox_untracked: vec![],
         };
         assert!(!plan.is_empty());
     }
@@ -767,6 +815,8 @@ mod tests {
             terminal_dirs: vec![],
             rag_residue_files: vec![],
             orphaned_projects: vec![],
+            sandbox_removals: vec![],
+            sandbox_untracked: vec![],
         };
         assert!(!plan.is_empty());
     }
@@ -784,6 +834,8 @@ mod tests {
                 size_bytes: 5,
             }],
             orphaned_projects: vec![],
+            sandbox_removals: vec![],
+            sandbox_untracked: vec![],
         };
         assert!(!plan.is_empty());
     }
@@ -1180,6 +1232,8 @@ mod tests {
             terminal_dirs: vec![],
             rag_residue_files: vec![],
             orphaned_projects: vec![],
+            sandbox_removals: vec![],
+            sandbox_untracked: vec![],
         };
         // Bytes from log_files must never leak into the row count.
         assert_eq!(plan.deleted_row_count(), 3);
@@ -1203,5 +1257,44 @@ mod tests {
     #[test]
     fn is_rag_residue_name_false_for_no_extension() {
         assert!(!is_rag_residue_name(std::path::Path::new("/noext")));
+    }
+
+    // ── CB42: plan_sandbox_cleanup ─────────────────────────────────────
+
+    fn sandbox_candidate(
+        id: &str,
+        run_over: bool,
+        has_unique_commits: Option<bool>,
+    ) -> SandboxCandidate {
+        SandboxCandidate {
+            id: id.to_string(),
+            path: PathBuf::from(format!("/wt/{id}")),
+            loop_id: "loop-1".to_string(),
+            branch: format!("canopy/sandbox-{id}"),
+            run_over,
+            has_unique_commits,
+        }
+    }
+
+    #[test]
+    fn plan_sandbox_cleanup_keeps_unique_uncertain_and_live() {
+        let candidates = vec![
+            sandbox_candidate("clean-done", true, Some(false)),
+            sandbox_candidate("unique-done", true, Some(true)),
+            sandbox_candidate("uncertain-done", true, None),
+            sandbox_candidate("clean-live", false, Some(false)),
+            sandbox_candidate("unique-live", false, Some(true)),
+        ];
+        let plan = plan_sandbox_cleanup(&candidates);
+        // Only `run_over && Some(false)` is selected — anything else keeps.
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].id, "clean-done");
+        assert_eq!(plan[0].branch, "canopy/sandbox-clean-done");
+    }
+
+    #[test]
+    fn plan_sandbox_cleanup_empty() {
+        let plan = plan_sandbox_cleanup(&[]);
+        assert!(plan.is_empty());
     }
 }

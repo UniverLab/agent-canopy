@@ -39,6 +39,7 @@ use daemon::models_cli::{handle_models_action, ModelsAction};
 use daemon::project_cli::{handle_project_action, ProjectAction};
 use daemon::prompts_cli::{handle_prompts_action, PromptsAction};
 use daemon::rag_cli::{handle_rag_action, RagAction};
+use daemon::sandbox_cli::{handle_sandbox_action, SandboxAction};
 use daemon::server::{run_http_server, run_stdio_server};
 use daemon::spec_cli::{handle_spec_action, SpecAction};
 use daemon::subagent_cli::{handle_subagent_action, SubagentAction};
@@ -161,6 +162,11 @@ enum Commands {
         #[command(subcommand)]
         action: SubagentAction,
     },
+    /// List, land, or discard canopy sandbox worktrees left by sandboxed loop runs.
+    Sandbox {
+        #[command(subcommand)]
+        action: SandboxAction,
+    },
     /// Run a stdio sidecar proxy that injects canopy identity headers.
     Bridge {
         /// Agent session ID to bind this bridge process.
@@ -227,6 +233,7 @@ async fn main() -> Result<()> {
         }) => handle_clean_action(dry_run, older_than, hard, yes, no_reclaim, stop_daemon).await,
         Some(Commands::Prompts { action }) => handle_prompts_action(action).await,
         Some(Commands::Subagent { action }) => handle_subagent_action(action, cli.port).await,
+        Some(Commands::Sandbox { action }) => handle_sandbox_action(action).await,
         Some(Commands::Bridge {
             agent_id,
             port,

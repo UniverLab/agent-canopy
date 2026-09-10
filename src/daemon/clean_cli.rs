@@ -20,8 +20,10 @@ use crate::db::Database;
 use crate::domain::canopy_config::CanopyConfig;
 use crate::domain::clean::{
     self, CleanPlan, FileCandidate, HardCascadeCandidate, HardCascadePlan, ProjectCandidate,
+    SandboxCandidate,
 };
 use crate::domain::db_paths::database_path;
+use crate::domain::loops::LoopStatus;
 
 pub async fn handle_clean_action(
     dry_run: bool,
@@ -196,12 +198,38 @@ fn build_clean_plan(
     }
     let orphaned_projects = clean::plan_orphaned_projects(&project_candidates);
 
+    // CB42: bulk sandbox path — req 3's rule with force=false. Every
+    // finished sandbox row becomes a candidate; `run_over` is true when the
+    // owning loop is completed/failed (or its row is gone — nothing is left
+    // that could still need the sandbox) or the sandbox row itself is no
+    // longer active. `plan_sandbox_cleanup` then keeps only provably-empty
+    // branches; uncertain ones stay.
+    let mut sandbox_candidates = Vec::new();
+    for row in db.list_finished_sandbox_runs().unwrap_or_default() {
+        let loop_over = match db.get_loop(&row.owner_id) {
+            Ok(Some(lp)) => matches!(lp.status, LoopStatus::Completed | LoopStatus::Failed),
+            Ok(None) | Err(_) => true,
+        };
+        sandbox_candidates.push(SandboxCandidate {
+            id: row.id.clone(),
+            path: std::path::PathBuf::from(&row.worktree_path),
+            loop_id: row.owner_id.clone(),
+            branch: row.sandbox_branch.clone(),
+            run_over: loop_over || row.status != "active",
+            has_unique_commits: crate::domain::sandbox::has_unique_commits(&row),
+        });
+    }
+    let sandbox_removals = clean::plan_sandbox_cleanup(&sandbox_candidates);
+    let sandbox_untracked = super::sandbox_cli::scan_untracked_sandbox_dirs(db);
+
     Ok(CleanPlan {
         session_ids,
         log_files: orphan_logs,
         terminal_dirs: orphan_terminals,
         rag_residue_files: rag_residue,
         orphaned_projects,
+        sandbox_removals,
+        sandbox_untracked,
     })
 }
 
@@ -417,6 +445,42 @@ fn execute_plan(db: &Database, plan: &CleanPlan) -> Result<()> {
     }
     for f in &plan.rag_residue_files {
         let _ = std::fs::remove_file(&f.path);
+    }
+    // CB42 bulk path: each candidate is named BEFORE removal (req 7), and a
+    // failure never aborts the rest of clean. Always force=false in bulk —
+    // unique work is never deleted here.
+    for target in &plan.sandbox_removals {
+        println!(
+            "Will remove sandbox {} ({}, branch {})",
+            target.id,
+            target.path.display(),
+            target.branch
+        );
+        let row = match db.get_sandbox_run(&target.id) {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                eprintln!(" Failed to remove sandbox {}: run row is gone", target.id);
+                continue;
+            }
+            Err(e) => {
+                eprintln!(" Failed to remove sandbox {}: {e:#}", target.id);
+                continue;
+            }
+        };
+        match crate::domain::sandbox::discard_sandbox_blocking(&row, false) {
+            Ok(crate::domain::sandbox::DiscardOutcome::Discarded) => {
+                let _ = db.update_sandbox_run_status(&row.id, "discarded");
+            }
+            Ok(crate::domain::sandbox::DiscardOutcome::RefusedUniqueCommits) => {
+                eprintln!(
+                    " Skipped sandbox {}: branch holds commits that exist nowhere else",
+                    target.id
+                );
+            }
+            Err(e) => {
+                eprintln!(" Failed to remove sandbox {}: {e:#}", target.id);
+            }
+        }
     }
     Ok(())
 }
@@ -832,7 +896,7 @@ enum ReclaimWindowOutcome {
         verdict: String,
         daemon_restored: bool,
     },
-    Completed(ReclaimWindowReport),
+    Completed(Box<ReclaimWindowReport>),
 }
 
 struct ReclaimWindowReport {
@@ -961,17 +1025,19 @@ fn run_reclaim_window(
 
     let daemon_restored = restore_daemon_once(restored, ops, owner);
 
-    Ok(ReclaimWindowOutcome::Completed(ReclaimWindowReport {
-        daemon_was_running: daemon_pid.is_some(),
-        daemon_owner: owner,
-        quick_check,
-        plan,
-        retention_days,
-        hard_rows,
-        size_before,
-        size_after,
-        daemon_restored,
-    }))
+    Ok(ReclaimWindowOutcome::Completed(Box::new(
+        ReclaimWindowReport {
+            daemon_was_running: daemon_pid.is_some(),
+            daemon_owner: owner,
+            quick_check,
+            plan,
+            retention_days,
+            hard_rows,
+            size_before,
+            size_after,
+            daemon_restored,
+        },
+    )))
 }
 
 fn print_reclaim_window_outcome(outcome: &ReclaimWindowOutcome) {
@@ -1132,6 +1198,22 @@ fn print_summary(plan: &CleanPlan, retention_days: u64, dry_run: bool) {
         " {verb} {} leftover RAG residue file(s)",
         plan.rag_residue_files.len()
     );
+    println!(
+        " {verb} {} sandbox worktree(s)",
+        plan.sandbox_removals.len()
+    );
+    for t in &plan.sandbox_removals {
+        println!("   {} ({}, branch {})", t.id, t.path.display(), t.branch);
+    }
+    if !plan.sandbox_untracked.is_empty() {
+        println!(
+            " Skipped {} untracked sandbox dir(s) (no sandbox run record; left untouched):",
+            plan.sandbox_untracked.len()
+        );
+        for p in &plan.sandbox_untracked {
+            println!("   {}", p.display());
+        }
+    }
     // Deliberately two separate lines: a row count is not a byte count, and
     // the row deletions above contribute nothing to this figure — it's
     // filesystem bytes from the log/terminal/RAG files only. Freed database
@@ -2305,5 +2387,103 @@ mod tests {
             db.get_project("hash-x").unwrap().is_some(),
             "projecting the hard cascade's row count must never execute it"
         );
+    }
+
+    // ── CB42: sandbox bulk path ────────────────────────────────────────
+
+    fn init_git_repo(path: &Path) {
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@test.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@test.com")
+                .output()
+                .expect("git command");
+            assert!(
+                output.status.success(),
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.email", "test@test.com"]);
+        run(&["config", "user.name", "Test"]);
+        std::fs::write(path.join("README.md"), "# Test\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "initial"]);
+    }
+
+    fn git_branch_exists(repo: &Path, branch: &str) -> bool {
+        let output = std::process::Command::new("git")
+            .args(["branch", "--list", branch])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).contains(branch)
+    }
+
+    #[test]
+    fn sandbox_dry_run_names_before_removing() {
+        let repo_dir = tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+        // A sandbox branch with no unique commits (identical to base).
+        std::process::Command::new("git")
+            .args(["branch", "canopy/sandbox-cleantest"])
+            .current_dir(repo_dir.path())
+            .output()
+            .unwrap();
+
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path();
+        let db = test_db(data_dir);
+
+        // No loop row for this owner: a missing loop means the run is over.
+        let sandbox = crate::domain::sandbox::Sandbox {
+            id: "sandbox-clean-fixture".to_string(),
+            project_hash: "cleanhash".to_string(),
+            base_branch: "main".to_string(),
+            sandbox_branch: "canopy/sandbox-cleantest".to_string(),
+            worktree_path: data_dir.join("wt"),
+            cli_name: "opencode".to_string(),
+            original_workdir: repo_dir.path().to_string_lossy().to_string(),
+            created_at: chrono::Utc::now(),
+        };
+        db.insert_sandbox_run(&sandbox, "loop", "loop-gone")
+            .unwrap();
+        db.update_sandbox_run_status(&sandbox.id, "kept").unwrap();
+
+        let now_ts = chrono::Utc::now().timestamp();
+        let plan = build_clean_plan(data_dir, &db, 7, now_ts).unwrap();
+        // The finished, provably-empty sandbox is named as a removal target.
+        assert!(
+            plan.sandbox_removals
+                .iter()
+                .any(|t| t.id == sandbox.id && t.branch == "canopy/sandbox-cleantest"),
+            "expected sandbox-clean-fixture in removals, got {:?}",
+            plan.sandbox_removals
+        );
+
+        // A dry run removes nothing: branch, worktree path state, and row
+        // are all exactly as before.
+        let dry = run_clean(data_dir, &db, true, 7, now_ts).unwrap();
+        assert!(dry.sandbox_removals.iter().any(|t| t.id == sandbox.id));
+        assert!(git_branch_exists(
+            repo_dir.path(),
+            "canopy/sandbox-cleantest"
+        ));
+        assert_eq!(
+            db.get_sandbox_run(&sandbox.id).unwrap().unwrap().status,
+            "kept"
+        );
+
+        std::process::Command::new("git")
+            .args(["branch", "-D", "canopy/sandbox-cleantest"])
+            .current_dir(repo_dir.path())
+            .output()
+            .unwrap();
     }
 }

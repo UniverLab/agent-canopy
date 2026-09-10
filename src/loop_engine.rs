@@ -764,25 +764,12 @@ impl LoopEngine {
                 .await;
         }
 
-        if let Some(ref sb) = sandbox {
-            match crate::domain::sandbox::merge_sandbox(sb).await {
-                Ok(outcome) => {
-                    tracing::info!("Sandbox '{}' merge outcome: {:?}", sb.id, outcome);
-                    let _ = self.db.update_sandbox_run_status(
-                        &sb.id,
-                        match outcome {
-                            crate::domain::sandbox::MergeOutcome::CleanMerge
-                            | crate::domain::sandbox::MergeOutcome::ConflictResolution => "merged",
-                            crate::domain::sandbox::MergeOutcome::MergeFailed(_) => "failed",
-                        },
-                    );
-                }
-                Err(e) => {
-                    tracing::error!("Sandbox '{}' merge error: {:#}", sb.id, e);
-                    let _ = self.db.update_sandbox_run_status(&sb.id, "failed");
-                }
-            }
-        }
+        // CB42: the `Completed` status above is already written — teardown
+        // runs after the final status, so a crash here cannot leave the loop
+        // in a wrong state. Unique work is kept and recorded; only a
+        // provably-empty branch is removed.
+        self.teardown_sandbox_after_final_status(sandbox, "completed".into())
+            .await;
 
         Ok(())
     }
@@ -3696,6 +3683,30 @@ impl LoopEngine {
     /// unwound out of `run_loop_dispatch`'s scope) — decision-4's broadened
     /// `run_was_terminated_out_of_band` check is what keeps a stale run's
     /// completion from reaching either of those paths in the first place.
+    /// CB42: tear down a sandboxed run's worktree/branch after its final
+    /// status is written. Takes `Option` so the completed and failed paths
+    /// share it; `None` is a no-op. A teardown failure never changes the
+    /// loop's status — it is recorded on the sandbox row by
+    /// `teardown_sandbox_at_end`, never silent.
+    async fn teardown_sandbox_after_final_status(&self, sandbox: Option<Sandbox>, reason: String) {
+        let Some(sb) = sandbox else { return };
+        let row = match self.db.get_sandbox_run(&sb.id) {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                tracing::warn!(
+                    "Sandbox '{}' has no sandbox_runs row; leaving its worktree in place",
+                    sb.id
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("Could not load sandbox run '{}': {e:#}", sb.id);
+                return;
+            }
+        };
+        crate::domain::sandbox::teardown_sandbox_at_end(&self.db, &row, &reason).await;
+    }
+
     async fn fail_loop(
         &self,
         loop_id: &str,
@@ -3761,6 +3772,13 @@ impl LoopEngine {
                 spec_name: spec_name.unwrap_or(summary),
             },
         );
+        // CB42: same teardown as the completed path, after the final status
+        // and after hooks/notifications. `Paused`/`blocked` runs keep their
+        // sandbox (a resumed loop reuses it).
+        if let Ok(sb) = self.db.get_active_sandbox_for_owner("loop", loop_id) {
+            self.teardown_sandbox_after_final_status(sb, format!("failed: {summary}"))
+                .await;
+        }
         Ok(())
     }
 
