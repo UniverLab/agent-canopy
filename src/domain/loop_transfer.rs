@@ -26,7 +26,8 @@ use crate::domain::loops::{
     LoopNode, LoopNodeKind,
 };
 use crate::domain::validation::{
-    validate_ensembles_in_graph, validate_loop_graph, GraphEdgeView, GraphNodeView,
+    validate_ensemble_min_pass, validate_ensembles_in_graph, validate_loop_graph, GraphEdgeView,
+    GraphNodeView,
 };
 
 /// The latest `format_version` this build writes. `loop_import` accepts both
@@ -522,14 +523,11 @@ pub fn build_import_plan(
                 doc_ensemble.members.len()
             ));
         }
-        if doc_ensemble.min_pass < 1 || doc_ensemble.min_pass > doc_ensemble.members.len() as i64 {
-            return Err(format!(
-                "Ensemble '{}' has an invalid min_pass ({}) for {} members.",
-                doc_ensemble.name,
-                doc_ensemble.min_pass,
-                doc_ensemble.members.len()
-            ));
-        }
+        validate_ensemble_min_pass(
+            &doc_ensemble.name,
+            doc_ensemble.min_pass,
+            doc_ensemble.members.len(),
+        )?;
         if doc_ensemble.timeout_minutes < 0 {
             return Err(format!(
                 "Ensemble '{}' has a negative timeout_minutes.",

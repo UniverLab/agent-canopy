@@ -5950,11 +5950,10 @@ impl TaskTriggerHandler {
             .min_pass
             .or_else(|| blueprint.as_ref().and_then(|bp| bp.min_pass))
             .unwrap_or(members.len() as i64);
-        if min_pass < 1 || min_pass > members.len() as i64 {
-            return Ok(error_result(&format!(
-                "min_pass must be between 1 and {} (the member count), got {min_pass}.",
-                members.len()
-            )));
+        if let Err(e) =
+            crate::domain::validation::validate_ensemble_min_pass(name, min_pass, members.len())
+        {
+            return Ok(error_result(&e));
         }
         let timeout_minutes = params
             .timeout_minutes
@@ -6197,6 +6196,27 @@ impl TaskTriggerHandler {
             return Ok(error_result(&e));
         }
 
+        // ── CB40 / FR1–FR4: refuse a write whose RESULTING (min_pass, member count)
+        // pair is one `loop_import` would reject. Pure arithmetic on values already in
+        // hand; runs before any row is written, so a refusal changes nothing (FR4).
+        // Only guards calls that actually touch `members` or `min_pass` (FR2) — an
+        // unrelated edit to a legacy-invalid ensemble is left for `loop_preflight`.
+        if params.members.is_some() || params.min_pass.is_some() {
+            let resulting_member_count = params
+                .members
+                .as_ref()
+                .map(|m| m.len())
+                .unwrap_or(details.members.len());
+            let resulting_min_pass = params.min_pass.unwrap_or(details.ensemble.min_pass);
+            if let Err(e) = crate::domain::validation::validate_ensemble_min_pass(
+                &details.ensemble.name,
+                resulting_min_pass,
+                resulting_member_count,
+            ) {
+                return Ok(error_result(&e));
+            }
+        }
+
         // CM15 / FR5: the ensemble's execution strategy (`kind`) selects the
         // fan-out path (`execute_ensemble` match on `ensemble.kind`) from the
         // per-run snapshot and is not re-read mid-run. Its members, shared
@@ -6414,14 +6434,6 @@ impl TaskTriggerHandler {
             || params.timeout_minutes.is_some()
             || params.straggler_timeout_minutes.is_some()
         {
-            let member_count = details.members.len() as i64;
-            if let Some(min_pass) = params.min_pass {
-                if min_pass < 1 || min_pass > member_count {
-                    return Ok(error_result(&format!(
-                        "min_pass must be between 1 and {member_count} (the member count), got {min_pass}."
-                    )));
-                }
-            }
             if let Some(Some(straggler)) = params.straggler_timeout_minutes {
                 if straggler < 0 {
                     return Ok(error_result(
@@ -7664,6 +7676,48 @@ impl TaskTriggerHandler {
                         } else {
                             break;
                         }
+                    }
+                }
+            }
+        }
+
+        // ── CB40: report pre-existing ensembles with invalid min_pass (FR5) ──────────
+        // These were stored before the write-time validation existed. Report them as
+        // errors rather than spending probe quota on a graph that will fail on export.
+        {
+            let graph_ensembles = self
+                .db
+                .list_ensembles_for_loop(&details.lp.id)
+                .map_err(internal_error)?;
+            for ens in &graph_ensembles {
+                if let Err(e) = crate::domain::validation::validate_ensemble_min_pass(
+                    &ens.ensemble.name,
+                    ens.ensemble.min_pass,
+                    ens.members.len(),
+                ) {
+                    return Ok(error_result(&format!(
+                        "Preflight: {e} Fix with loop_update_ensemble (ensemble_id '{}', min_pass ≤ {}).",
+                        ens.ensemble.id,
+                        ens.members.len()
+                    )));
+                }
+            }
+            for spec in &details.specs {
+                let spec_ensembles = self
+                    .db
+                    .list_ensembles_for_spec(&spec.spec.id)
+                    .map_err(internal_error)?;
+                for ens in &spec_ensembles {
+                    if let Err(e) = crate::domain::validation::validate_ensemble_min_pass(
+                        &ens.ensemble.name,
+                        ens.ensemble.min_pass,
+                        ens.members.len(),
+                    ) {
+                        return Ok(error_result(&format!(
+                            "Preflight: {e} Fix with loop_update_ensemble (ensemble_id '{}', min_pass ≤ {}).",
+                            ens.ensemble.id,
+                            ens.members.len()
+                        )));
                     }
                 }
             }
@@ -21778,7 +21832,7 @@ mod endpoint_tests {
             .await
             .unwrap();
         assert!(is_err(&bad_min_pass));
-        assert!(text(&bad_min_pass).contains("min_pass must be between"));
+        assert!(text(&bad_min_pass).contains("has an invalid min_pass"));
 
         let unknown_entry = handler
             .loop_add_ensemble(Parameters(LoopAddEnsembleParams {
@@ -23166,6 +23220,251 @@ mod endpoint_tests {
             add_entry_condition: None,
             remove_entry_from: None,
         }
+    }
+
+    /// CB40: shrinking members below the stored `min_pass` is refused and
+    /// writes nothing — the resize must not be committed.
+    #[tokio::test]
+    async fn loop_update_ensemble_shrink_below_min_pass_is_refused() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let entry = add_agent_node(&handler, &spec.id, "Entry").await;
+        let arbiter = add_agent_node(&handler, &spec.id, "Arbiter").await;
+        let member = || crate::daemon::params::EnsembleMemberParams {
+            platform: "claude".to_string(),
+            model: None,
+            prompt_override: None,
+        };
+
+        let created = handler
+            .loop_add_ensemble(Parameters(LoopAddEnsembleParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Shrink Ensemble".to_string(),
+                kind: None,
+                prompt_template: Some("Review {{spec_name}}".to_string()),
+                members: Some(vec![member(), member(), member()]),
+                blueprint: None,
+                from_node: entry,
+                condition: "always".to_string(),
+                min_pass: Some(3),
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: arbiter,
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&created), "{}", text(&created));
+        let ensemble_id = extract_id(&created, "ensemble_id");
+
+        let shrunk = handler
+            .loop_update_ensemble(Parameters(LoopUpdateEnsembleParams {
+                ensemble_id: ensemble_id.clone(),
+                kind: None,
+                prompt_template: None,
+                members: Some(vec![member(), member()]),
+                min_pass: None,
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: None,
+                on_fail_to: None,
+                from_node: None,
+                condition: None,
+                add_entry_from: None,
+                add_entry_condition: None,
+                remove_entry_from: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&shrunk), "shrink below min_pass should fail");
+        let msg = text(&shrunk);
+        assert!(msg.contains("has an invalid min_pass"), "{msg}");
+        assert!(msg.contains('3'), "{msg}");
+        assert!(msg.contains('2'), "{msg}");
+        let details = db.get_ensemble_details(&ensemble_id).unwrap().unwrap();
+        assert_eq!(details.members.len(), 3);
+        assert_eq!(details.ensemble.min_pass, 3);
+    }
+
+    /// CB40: raising `min_pass` above the member count is refused.
+    #[tokio::test]
+    async fn loop_update_ensemble_raise_min_pass_above_count_is_refused() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let entry = add_agent_node(&handler, &spec.id, "Entry").await;
+        let arbiter = add_agent_node(&handler, &spec.id, "Arbiter").await;
+        let member = || crate::daemon::params::EnsembleMemberParams {
+            platform: "claude".to_string(),
+            model: None,
+            prompt_override: None,
+        };
+
+        let created = handler
+            .loop_add_ensemble(Parameters(LoopAddEnsembleParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Raise Ensemble".to_string(),
+                kind: None,
+                prompt_template: Some("Review {{spec_name}}".to_string()),
+                members: Some(vec![member(), member()]),
+                blueprint: None,
+                from_node: entry,
+                condition: "always".to_string(),
+                min_pass: Some(2),
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: arbiter,
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&created), "{}", text(&created));
+        let ensemble_id = extract_id(&created, "ensemble_id");
+
+        let raised = handler
+            .loop_update_ensemble(Parameters(LoopUpdateEnsembleParams {
+                ensemble_id: ensemble_id.clone(),
+                kind: None,
+                prompt_template: None,
+                members: None,
+                min_pass: Some(99),
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: None,
+                on_fail_to: None,
+                from_node: None,
+                condition: None,
+                add_entry_from: None,
+                add_entry_condition: None,
+                remove_entry_from: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&raised), "raised min_pass should fail");
+        assert!(
+            text(&raised).contains("has an invalid min_pass"),
+            "{}",
+            text(&raised)
+        );
+        let details = db.get_ensemble_details(&ensemble_id).unwrap().unwrap();
+        assert_eq!(details.ensemble.min_pass, 2);
+    }
+
+    /// CB40: a shrink that also lowers `min_pass` in the same call succeeds.
+    #[tokio::test]
+    async fn loop_update_ensemble_shrink_with_adjusted_min_pass_succeeds() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let entry = add_agent_node(&handler, &spec.id, "Entry").await;
+        let arbiter = add_agent_node(&handler, &spec.id, "Arbiter").await;
+        let member = || crate::daemon::params::EnsembleMemberParams {
+            platform: "claude".to_string(),
+            model: None,
+            prompt_override: None,
+        };
+
+        let created = handler
+            .loop_add_ensemble(Parameters(LoopAddEnsembleParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Adjust Ensemble".to_string(),
+                kind: None,
+                prompt_template: Some("Review {{spec_name}}".to_string()),
+                members: Some(vec![member(), member(), member()]),
+                blueprint: None,
+                from_node: entry,
+                condition: "always".to_string(),
+                min_pass: Some(2),
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: arbiter,
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&created), "{}", text(&created));
+        let ensemble_id = extract_id(&created, "ensemble_id");
+
+        let shrunk = handler
+            .loop_update_ensemble(Parameters(LoopUpdateEnsembleParams {
+                ensemble_id: ensemble_id.clone(),
+                kind: None,
+                prompt_template: None,
+                members: Some(vec![member(), member()]),
+                min_pass: Some(1),
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: None,
+                on_fail_to: None,
+                from_node: None,
+                condition: None,
+                add_entry_from: None,
+                add_entry_condition: None,
+                remove_entry_from: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&shrunk), "{}", text(&shrunk));
+        let details = db.get_ensemble_details(&ensemble_id).unwrap().unwrap();
+        assert_eq!(details.members.len(), 2);
+        assert_eq!(details.ensemble.min_pass, 1);
+    }
+
+    /// CB40: `loop_preflight` names an ensemble stored with `min_pass`
+    /// above its member count (simulating a row predating validation).
+    #[tokio::test]
+    async fn loop_preflight_reports_ensemble_with_invalid_min_pass() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+        let spec = insert_test_spec(&db, &lp.id, 1);
+        let entry = add_agent_node(&handler, &spec.id, "Entry").await;
+        let arbiter = add_agent_node(&handler, &spec.id, "Arbiter").await;
+        let member = || crate::daemon::params::EnsembleMemberParams {
+            platform: "claude".to_string(),
+            model: None,
+            prompt_override: None,
+        };
+
+        let created = handler
+            .loop_add_ensemble(Parameters(LoopAddEnsembleParams {
+                spec_id: Some(spec.id.clone()),
+                loop_id: None,
+                name: "Stale Ensemble".to_string(),
+                kind: None,
+                prompt_template: Some("Review {{spec_name}}".to_string()),
+                members: Some(vec![member(), member()]),
+                blueprint: None,
+                from_node: entry,
+                condition: "always".to_string(),
+                min_pass: Some(2),
+                straggler_timeout_minutes: None,
+                timeout_minutes: None,
+                on_pass_to: arbiter,
+                on_fail_to: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&created), "{}", text(&created));
+        let ensemble_id = extract_id(&created, "ensemble_id");
+        db.update_ensemble_join_config(&ensemble_id, Some(3), None, None)
+            .unwrap();
+
+        let result = handler
+            .loop_preflight(Parameters(LoopPreflightParams {
+                loop_id: lp.id.clone(),
+                timeout_seconds: None,
+                reviewer: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&result), "preflight should flag invalid min_pass");
+        let msg = text(&result);
+        assert!(msg.contains("Stale Ensemble"), "{msg}");
+        assert!(msg.contains("invalid min_pass"), "{msg}");
     }
 
     /// `from_node` moves every entry edge to the new source with the new

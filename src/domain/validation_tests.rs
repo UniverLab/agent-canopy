@@ -744,4 +744,28 @@ mod graph_validation {
             .iter()
             .any(|t| t.node_id == "A" && t.state == "pass"));
     }
+
+    #[test]
+    fn ensemble_min_pass_valid_boundary_values() {
+        // 1 is valid for any count
+        assert!(validate_ensemble_min_pass("E", 1, 3).is_ok());
+        // member_count itself is valid
+        assert!(validate_ensemble_min_pass("E", 3, 3).is_ok());
+    }
+
+    #[test]
+    fn ensemble_min_pass_zero_is_rejected() {
+        let err = validate_ensemble_min_pass("MyEns", 0, 3).unwrap_err();
+        assert!(err.contains("MyEns"));
+        assert!(err.contains('0'));
+        assert!(err.contains('3'));
+    }
+
+    #[test]
+    fn ensemble_min_pass_above_count_is_rejected() {
+        let err = validate_ensemble_min_pass("MyEns", 4, 3).unwrap_err();
+        assert!(err.contains("MyEns"));
+        assert!(err.contains('4'));
+        assert!(err.contains('3'));
+    }
 }

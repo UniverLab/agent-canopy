@@ -60,6 +60,23 @@ pub fn validate_watch_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Returns `Err` when `min_pass` is out of the [1, member_count] range.
+/// Applies to every ensemble kind. Used by every write site so the writer
+/// and the importer (`loop_transfer.rs`) cannot drift apart.
+/// Error text: "Ensemble '<name>' has an invalid min_pass (<n>) for <m> members."
+pub fn validate_ensemble_min_pass(
+    ensemble_name: &str,
+    min_pass: i64,
+    member_count: usize,
+) -> Result<(), String> {
+    if min_pass < 1 || min_pass > member_count as i64 {
+        return Err(format!(
+            "Ensemble '{ensemble_name}' has an invalid min_pass ({min_pass}) for {member_count} members."
+        ));
+    }
+    Ok(())
+}
+
 /// Validate every ensemble (F1) found within one graph (a loop's top-level
 /// graph, or a single spec's own graph — never both mixed together, since an
 /// ensemble belongs to exactly one) as a unit: entry reachable, every member
