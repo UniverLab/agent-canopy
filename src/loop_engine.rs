@@ -1221,13 +1221,10 @@ impl LoopEngine {
             None
         };
 
-        // 5. Record provenance: which loop and event launched this loop.
-        let _ = self
-            .db
-            .record_hook_launch_provenance(&target_id, &lp.id, event.as_str());
-
-        // 6. Launch the target loop in-process. Fire-and-forget.
-        self.launch_loop_from_hook(
+        // 6. Launch the target loop in-process. Fire-and-forget on success;
+        //    on a refused launch, `launch_loop_from_hook` hands back the
+        //    engine's own refusal text and nothing was started.
+        match self.launch_loop_from_hook(
             target_id.clone(),
             queue_id.map(str::to_string),
             hook.workdir_override
@@ -1235,16 +1232,32 @@ impl LoopEngine {
                 .filter(|s| !s.trim().is_empty())
                 .map(str::to_string),
             rendered_idea.clone(),
-        );
-
-        HookExecution {
-            status: LoopRunStatus::Pass,
-            output: serde_json::json!({
-                "launched_loop_id": target_id,
-                "queue_id": queue_id,
-                "idea": rendered_idea,
-            }),
-            summary: format!("Loop hook launched '{}' in background.", target_lp.name),
+        ) {
+            Ok(()) => {
+                // Record provenance only for a launch that actually started.
+                let _ = self
+                    .db
+                    .record_hook_launch_provenance(&target_id, &lp.id, event.as_str());
+                HookExecution {
+                    status: LoopRunStatus::Pass,
+                    output: serde_json::json!({
+                        "launched_loop_id": target_id,
+                        "queue_id": queue_id,
+                        "idea": rendered_idea,
+                    }),
+                    summary: format!("Loop hook launched '{}' in background.", target_lp.name),
+                }
+            }
+            Err(message) => HookExecution {
+                status: LoopRunStatus::Fail,
+                output: serde_json::json!({
+                    "error": message,
+                    "target_loop_id": target_id,
+                    "queue_id": queue_id,
+                    "idea": rendered_idea,
+                }),
+                summary: message,
+            },
         }
     }
 
@@ -1258,7 +1271,18 @@ impl LoopEngine {
         queue_id: Option<String>,
         workdir_override: Option<String>,
         idea: Option<String>,
-    ) {
+    ) -> Result<(), String> {
+        // CB41: refuse here with the engine's own pre-claim gate — the same check
+        // `run_loop_dispatch` runs before it claims the loop
+        // (see `empty_launch_check`, ~loop_engine.rs:408). The in-process launch
+        // would return `EmptySpecSetError(message)` for exactly this `message`;
+        // propagating it is the whole point. The hook reports whether the launch
+        // was accepted, never whether the launched loop's work succeeds.
+        match self.empty_launch_check(&loop_id, queue_id.as_deref(), idea.as_deref()) {
+            Ok(Some(message)) => return Err(message),
+            Ok(None) => {}
+            Err(e) => return Err(e.to_string()),
+        }
         // Mark this loop as hook-launched before spawning, so when
         // run_loop_dispatch begins, it knows to enforce the depth cap.
         let _ = self.db.mark_loop_as_hook_launched(&loop_id);
@@ -1291,6 +1315,7 @@ impl LoopEngine {
                 }
             }
         });
+        Ok(())
     }
 
     /// Fire `lp`'s `on_completed` hook (N2), if configured — a no-op
@@ -22679,6 +22704,41 @@ exit 0
         Ok(id.to_string())
     }
 
+    fn create_target_loop_no_specs(db: &Database, id: &str, name: &str) -> Result<String> {
+        let lp = crate::domain::loops::Loop {
+            archived: false,
+            paused_by_reconciliation: false,
+            infra_node_id: None,
+            id: id.to_string(),
+            name: name.to_string(),
+            description: None,
+            workdir: "/tmp".to_string(),
+            status: LoopStatus::Draft,
+            trigger: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            completed_at: None,
+            autorun_at: None,
+            auto_continue_at: None,
+            auto_continue_action: None,
+            active_run_queue_id: None,
+            hooks: std::collections::BTreeMap::new(),
+        };
+        db.insert_loop(&lp)?;
+        let node = crate::domain::loops::LoopNode {
+            id: format!("{id}-node-1"),
+            spec_id: None,
+            loop_id: Some(id.to_string()),
+            name: "Check".to_string(),
+            kind: crate::domain::loops::LoopNodeKind::Check,
+            config: serde_json::json!({"command": "true"}),
+            position: 1,
+            created_at: chrono::Utc::now(),
+        };
+        db.insert_loop_node(&node)?;
+        Ok(id.to_string())
+    }
+
     /// Helper: set up a source loop with an on_completed hook that launches
     /// a target loop.
     fn setup_loop_hook_source(
@@ -22813,6 +22873,119 @@ exit 0
             target.status == LoopStatus::Running || target.status == LoopStatus::Completed,
             "target should be running or completed, got {:?}",
             target.status
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_hook_refused_launch_is_recorded_failed() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
+        let target_id = create_target_loop_no_specs(&db, "target-empty", "Target Empty").unwrap();
+        // Hook has only target_loop_id: no idea, no queue_id.
+        setup_loop_hook_source(&db, "source-empty", &target_id, None, None).unwrap();
+
+        let engine = LoopEngine::new(Arc::clone(&db), Arc::new(DefaultNotificationService));
+        let result = engine
+            .run_loop("source-empty".to_string(), None, None, None, None)
+            .await;
+        assert!(result.is_ok(), "source loop should complete: {result:?}");
+
+        // Constraint: a failed hook does not fail the loop that fired it.
+        let source = db.get_loop("source-empty").unwrap().unwrap();
+        assert_eq!(source.status, LoopStatus::Completed);
+
+        // Target never ran.
+        let target = db.get_loop(&target_id).unwrap().unwrap();
+        assert_eq!(target.status, LoopStatus::Draft);
+        assert!(db
+            .list_loop_node_runs(&target_id, None, None, 100, 0)
+            .unwrap()
+            .is_empty());
+
+        // The hook run is recorded failed, with the engine's refusal text.
+        let runs = db.list_loop_completion_hook_runs("source-empty").unwrap();
+        assert_eq!(runs.len(), 1);
+        let run = &runs[0];
+        assert_eq!(run.status, LoopRunStatus::Fail);
+        let summary = run.summary.as_deref().unwrap_or("");
+        assert!(
+            summary.contains("has no specs to run") && summary.contains("0 bound specs"),
+            "summary should carry the engine refusal verbatim, got: {summary:?}"
+        );
+        // No launched_loop_id when nothing started.
+        assert!(
+            !run.output
+                .as_ref()
+                .is_some_and(|o| o.get("launched_loop_id").is_some()),
+            "refused launch must not write launched_loop_id, got: {:?}",
+            run.output
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_hook_with_idea_launches_and_target_runs() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
+        let target_id = create_target_loop_no_specs(&db, "target-idea2", "Target Idea 2").unwrap();
+        setup_loop_hook_source(&db, "source-idea2", &target_id, None, Some("Do the thing"))
+            .unwrap();
+
+        let engine = LoopEngine::new(Arc::clone(&db), Arc::new(DefaultNotificationService));
+        let result = engine
+            .run_loop("source-idea2".to_string(), None, None, None, None)
+            .await;
+        assert!(result.is_ok(), "source loop should complete: {result:?}");
+
+        // Let the fire-and-forget launch start.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let target = db.get_loop(&target_id).unwrap().unwrap();
+        assert!(
+            target.status == LoopStatus::Running || target.status == LoopStatus::Completed,
+            "target should have started, got {:?}",
+            target.status
+        );
+
+        let runs = db.list_loop_completion_hook_runs("source-idea2").unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, LoopRunStatus::Pass);
+        assert_eq!(
+            runs[0]
+                .output
+                .as_ref()
+                .and_then(|o| o.get("launched_loop_id"))
+                .and_then(|v| v.as_str()),
+            Some(target_id.as_str()),
+            "accepted launch still reports launched_loop_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_hook_nonexistent_target_is_recorded_failed() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(Database::new(&dir.path().join("test.db")).unwrap());
+        // Source's hook points at an id no loop has.
+        setup_loop_hook_source(&db, "source-missing", "does-not-exist-xyz", None, None).unwrap();
+
+        let engine = LoopEngine::new(Arc::clone(&db), Arc::new(DefaultNotificationService));
+        let result = engine
+            .run_loop("source-missing".to_string(), None, None, None, None)
+            .await;
+        assert!(result.is_ok(), "source loop should complete: {result:?}");
+
+        let source = db.get_loop("source-missing").unwrap().unwrap();
+        assert_eq!(source.status, LoopStatus::Completed);
+
+        let runs = db.list_loop_completion_hook_runs("source-missing").unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, LoopRunStatus::Fail);
+        assert!(
+            runs[0]
+                .summary
+                .as_deref()
+                .is_some_and(|s| s.contains("not found")),
+            "summary should name the missing target, got: {:?}",
+            runs[0].summary
         );
     }
 
