@@ -7575,7 +7575,7 @@ impl TaskTriggerHandler {
 
         // Graph-level structural validation (CB8) — same validate_loop_graph
         // used by loop_import, before spending quota on platform probes.
-        let terminal_list: Vec<String> = {
+        let (terminal_list, graph_warnings): (Vec<String>, Vec<serde_json::Value>) = {
             let router_labels: Vec<Vec<String>> = details
                 .graph_nodes
                 .iter()
@@ -7640,7 +7640,7 @@ impl TaskTriggerHandler {
             // ends the run there (the engine treats a missing edge as an
             // ending). Name nodes the way the operator sees them — by name,
             // with the id in parentheses, matching the error text's shape.
-            validation_report
+            let terminal_list: Vec<String> = validation_report
                 .terminals
                 .iter()
                 .map(|t| {
@@ -7652,7 +7652,39 @@ impl TaskTriggerHandler {
                         .unwrap_or_else(|| t.node_id.clone());
                     format!("{} ends on '{}'", display, t.state)
                 })
-                .collect()
+                .collect();
+            // CM19: non-terminal agent/check/gate nodes whose `fail` status
+            // has nowhere to go. A warning, never a refusal — the graph may be
+            // exactly what its author meant. Deliberate terminals are already
+            // excluded upstream (they land in `terminals`, not here).
+            let graph_warnings: Vec<serde_json::Value> = validation_report
+                .fail_dead_ends
+                .iter()
+                .map(|d| {
+                    let node = details.graph_nodes.iter().find(|n| n.id == d.node_id);
+                    let name = node.map(|n| n.name.clone()).unwrap_or_default();
+                    let kind = node.map(|n| n.kind.as_str()).unwrap_or("node");
+                    let display = node
+                        .map(|n| format!("{} ({})", n.name, n.id))
+                        .unwrap_or_else(|| d.node_id.clone());
+                    let infra_clause = if d.has_break_path {
+                        " Its 'break' edge still routes infrastructure failures, but a genuine 'fail' verdict is not."
+                    } else {
+                        " It has no 'break' edge either, so an infrastructure failure would dead-end here as well."
+                    };
+                    serde_json::json!({
+                        "node_id": d.node_id,
+                        "node_name": name,
+                        "kind": kind,
+                        "missing_edge": "fail",
+                        "has_break_path": d.has_break_path,
+                        "warning": format!(
+                            "Node {display} [{kind}] has no outgoing 'fail' edge. If it returns a fail verdict the spec terminates at this node with \"no outgoing edge for that status\" and the run stays blocked until a human intervenes.{infra_clause} Add a 'fail' or 'always' edge with loop_add_edge if this failure should route somewhere.",
+                        ),
+                    })
+                })
+                .collect();
+            (terminal_list, graph_warnings)
         };
 
         // CM1: validate {{output:NodeName}} references
@@ -7776,6 +7808,7 @@ impl TaskTriggerHandler {
                         params.loop_id
                     ),
                     "spec_warnings": spec_warnings,
+                    "graph_warnings": graph_warnings,
                     "review": reviewer_out,
                     "terminals": terminal_list,
                 }))
@@ -7855,6 +7888,7 @@ impl TaskTriggerHandler {
                 "probes": probes,
                 "effort_warnings": effort_warnings,
                 "spec_warnings": spec_warnings,
+                "graph_warnings": graph_warnings,
                 "review": reviewer_out,
                 "terminals": terminal_list,
             }))
@@ -19673,6 +19707,101 @@ mod endpoint_tests {
         assert!(
             msg.contains("alpha") && msg.contains("beta"),
             "preflight error should name the concrete nodes, got: {msg}"
+        );
+    }
+
+    /// (CM19) `loop_preflight` reports a non-terminal node with no `fail`
+    /// edge as a structured `graph_warnings` entry — advisory, not a tool
+    /// error, and it does not change the verdict. A declared terminal with
+    /// the same missing edge is not reported.
+    #[tokio::test]
+    async fn loop_preflight_warns_for_node_with_no_fail_edge() {
+        let (dir, db, handler) = endpoint_test_handler();
+        let lp = insert_test_loop(&db, dir.path());
+
+        let mk_node = |name: &str, position: i64| LoopNode {
+            id: uuid::Uuid::new_v4().to_string(),
+            spec_id: None,
+            loop_id: Some(lp.id.clone()),
+            name: name.to_string(),
+            kind: LoopNodeKind::Agent,
+            // Unconfigured platform -> probe returns NotConfigured instantly,
+            // no quota spent, preflight still succeeds.
+            config: serde_json::json!({"platform": "cm19-unconfigured-platform"}),
+            position,
+            created_at: chrono::Utc::now(),
+        };
+        let alpha = mk_node("alpha", 1);
+        let beta = mk_node("beta", 2);
+        let gamma = mk_node("gamma", 3);
+        db.insert_loop_node(&alpha).unwrap();
+        db.insert_loop_node(&beta).unwrap();
+        db.insert_loop_node(&gamma).unwrap();
+
+        let mk_edge = |from: &str, to: &str, cond: LoopEdgeCondition| LoopEdge {
+            id: uuid::Uuid::new_v4().to_string(),
+            spec_id: None,
+            loop_id: Some(lp.id.clone()),
+            from_node: from.to_string(),
+            to_node: to.to_string(),
+            condition: cond,
+        };
+        // alpha: pass + fail -> fully routed (not a dead end, not a terminal)
+        db.insert_loop_edge(&mk_edge(&alpha.id, &beta.id, LoopEdgeCondition::Pass))
+            .unwrap();
+        db.insert_loop_edge(&mk_edge(&alpha.id, &beta.id, LoopEdgeCondition::Fail))
+            .unwrap();
+        // beta: pass only -> continues on success, dead-ends on fail => WARN
+        db.insert_loop_edge(&mk_edge(&beta.id, &gamma.id, LoopEdgeCondition::Pass))
+            .unwrap();
+        // gamma: no outgoing edges -> deliberate terminal => NOT warned
+
+        let result = handler
+            .loop_preflight(Parameters(LoopPreflightParams {
+                loop_id: lp.id.clone(),
+                timeout_seconds: Some(5),
+                reviewer: None,
+            }))
+            .await
+            .unwrap();
+        assert!(
+            !is_err(&result),
+            "a preflight warning must not be a tool error: {}",
+            text(&result)
+        );
+        let body: serde_json::Value = serde_json::from_str(&raw_text(&result)).unwrap();
+
+        let warnings = body["graph_warnings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("preflight must include graph_warnings: {body}"));
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one graph warning: {body}"
+        );
+        assert_eq!(warnings[0]["node_id"], beta.id);
+        assert_eq!(warnings[0]["node_name"], "beta");
+        assert_eq!(warnings[0]["missing_edge"], "fail");
+        assert_eq!(warnings[0]["has_break_path"], false);
+        let warn_text = warnings[0]["warning"].as_str().unwrap_or_default();
+        assert!(
+            warn_text.contains("beta") && warn_text.contains("no outgoing edge for that status"),
+            "warning must name the node and state the consequence: {body}"
+        );
+
+        // gamma (declared terminal) must be in `terminals`, not in warnings.
+        let terminals = body["terminals"].as_array().unwrap();
+        assert!(
+            terminals
+                .iter()
+                .any(|t| t.as_str().unwrap_or_default().contains("gamma")),
+            "gamma should be listed as a terminal: {body}"
+        );
+
+        // Verdict is unaffected by the warning (requirement 4).
+        assert!(
+            body.get("would_fail").is_some(),
+            "verdict fields intact: {body}"
         );
     }
 

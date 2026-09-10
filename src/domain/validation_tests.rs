@@ -572,6 +572,82 @@ mod graph_validation {
             .any(|t| t.node_id == "A" && t.state == "fail"));
     }
 
+    #[test]
+    fn fail_dead_end_reported_for_non_terminal_node_missing_fail_edge() {
+        // A (entry) --pass--> B, A --fail--> B ; B --pass--> C ; C terminal.
+        // B continues on pass but has no fail edge -> one fail dead end (B).
+        // C has no outgoing edges at all -> deliberate terminal, NOT reported.
+        let pass = LoopEdgeCondition::Pass;
+        let fail = LoopEdgeCondition::Fail;
+        let nodes = vec![agent_node("A"), agent_node("B"), agent_node("C")];
+        let edges = vec![
+            edge("A", "B", &pass),
+            edge("A", "B", &fail),
+            edge("B", "C", &pass),
+        ];
+        let report = validate_loop_graph(&nodes, &edges).expect("should validate");
+        assert_eq!(
+            report.fail_dead_ends.len(),
+            1,
+            "exactly one fail dead end: {:?}",
+            report.fail_dead_ends
+        );
+        assert_eq!(report.fail_dead_ends[0].node_id, "B");
+        assert!(!report.fail_dead_ends[0].has_break_path);
+    }
+
+    #[test]
+    fn declared_terminal_missing_fail_edge_is_not_a_fail_dead_end() {
+        // A (entry) --pass--> B ; B has no outgoing edges: a deliberate
+        // terminal on BOTH pass and fail. B must never be a fail dead end.
+        let pass = LoopEdgeCondition::Pass;
+        let nodes = vec![agent_node("A"), agent_node("B")];
+        let edges = vec![edge("A", "B", &pass)];
+        let report = validate_loop_graph(&nodes, &edges).expect("should validate");
+        assert!(
+            report.fail_dead_ends.iter().all(|d| d.node_id != "B"),
+            "B is a declared terminal, not a fail dead end: {:?}",
+            report.fail_dead_ends
+        );
+    }
+
+    #[test]
+    fn no_fail_dead_ends_when_every_node_has_a_failure_path() {
+        // A --always--> B ; A routes every status, B is a pure terminal.
+        let always = LoopEdgeCondition::Always;
+        let nodes = vec![agent_node("A"), agent_node("B")];
+        let edges = vec![edge("A", "B", &always)];
+        let report = validate_loop_graph(&nodes, &edges).expect("should validate");
+        assert!(
+            report.fail_dead_ends.is_empty(),
+            "no fail dead ends expected: {:?}",
+            report.fail_dead_ends
+        );
+    }
+
+    #[test]
+    fn fail_dead_end_notes_break_edge_when_present() {
+        // B has pass + break but no fail/always: break covers infra failures
+        // but a real fail verdict still dead-ends. has_break_path must be true.
+        let pass = LoopEdgeCondition::Pass;
+        let brk = LoopEdgeCondition::Break;
+        let fail = LoopEdgeCondition::Fail;
+        let nodes = vec![agent_node("A"), agent_node("B"), agent_node("C")];
+        let edges = vec![
+            edge("A", "B", &pass),
+            edge("A", "B", &fail),
+            edge("B", "C", &pass),
+            edge("B", "C", &brk),
+        ];
+        let report = validate_loop_graph(&nodes, &edges).expect("should validate");
+        let b = report
+            .fail_dead_ends
+            .iter()
+            .find(|d| d.node_id == "B")
+            .expect("B is a fail dead end");
+        assert!(b.has_break_path, "B has a break edge");
+    }
+
     /// Spec guideline: "The real shape of `cascade-v2-sonnet-fixes` — a resilience
     /// node ending on `fail`, and a last node ending on `pass` — validates as a fixture."
     #[test]

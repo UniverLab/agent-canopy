@@ -303,11 +303,35 @@ pub struct GraphTerminal {
     pub state: String,
 }
 
+/// A non-terminal agent/check/gate node with no outgoing edge for the `fail`
+/// status (CM19). When such a node returns a fail verdict the engine has no
+/// edge to route it down: the spec terminates at that node with the message
+/// "no outgoing edge for that status" and the run sits blocked until a human
+/// intervenes.
+///
+/// Deliberate terminals are excluded: if the node's `pass` status also has no
+/// outgoing edge the graph is meant to end there, and that is reported in
+/// [`GraphValidationReport::terminals`] instead.
+///
+/// `has_break_path` records whether the node has an outgoing `break` edge —
+/// the infrastructure-failure path, normally wired to the graph's infra node.
+/// A `break` edge does NOT satisfy the `fail` requirement (a real fail verdict
+/// is never routed down it); this flag only tells the reader whether an
+/// infrastructure crash would also dead-end at this node.
+#[derive(Debug)]
+pub struct FailDeadEnd {
+    pub node_id: String,
+    pub has_break_path: bool,
+}
+
 /// Result of structural graph validation.
 #[derive(Debug)]
 pub struct GraphValidationReport {
     /// Nodes where a state ends the graph (no outgoing edge for that state).
     pub terminals: Vec<GraphTerminal>,
+    /// Non-terminal agent/check/gate nodes with no outgoing `fail`/`always`
+    /// edge (CM19). Advisory — does not affect the Ok verdict.
+    pub fail_dead_ends: Vec<FailDeadEnd>,
 }
 
 /// A node as seen by graph-level validation — identified by an opaque
@@ -344,6 +368,7 @@ pub fn validate_loop_graph(
     if nodes.is_empty() {
         return Ok(GraphValidationReport {
             terminals: Vec::new(),
+            fail_dead_ends: Vec::new(),
         });
     }
 
@@ -450,6 +475,7 @@ pub fn validate_loop_graph(
     }
 
     let mut terminals: Vec<GraphTerminal> = Vec::new();
+    let mut fail_dead_ends: Vec<FailDeadEnd> = Vec::new();
 
     for node in nodes {
         if node.kind == LoopNodeKind::Join {
@@ -527,10 +553,29 @@ pub fn validate_loop_graph(
                     state: "fail".to_string(),
                 });
             }
+            // CM19: a node that continues on `pass` (has a pass/always edge)
+            // but has no `fail`/`always` edge dead-ends when it fails — the
+            // engine terminates the spec there. `Break` does NOT count: a
+            // real fail verdict is never routed down a break edge. A node
+            // with no `pass` edge either is a deliberate terminal (already in
+            // `terminals`) and is not reported here.
+            let has_fail_verdict_edge = conds
+                .iter()
+                .any(|c| **c == LoopEdgeCondition::Fail || **c == LoopEdgeCondition::Always);
+            let has_break_edge = conds.iter().any(|c| **c == LoopEdgeCondition::Break);
+            if has_pass && !has_fail_verdict_edge {
+                fail_dead_ends.push(FailDeadEnd {
+                    node_id: node.id.to_string(),
+                    has_break_path: has_break_edge,
+                });
+            }
         }
     }
 
-    Ok(GraphValidationReport { terminals })
+    Ok(GraphValidationReport {
+        terminals,
+        fail_dead_ends,
+    })
 }
 
 #[cfg(test)]
