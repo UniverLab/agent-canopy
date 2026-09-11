@@ -1308,6 +1308,10 @@ pub struct SubagentSpawnParams {
     pub workdir: Option<String>,
     /// Optional provider/model string.
     pub model: Option<String>,
+    /// Optional effort level (e.g. "low", "medium", "high"). Values accepted
+    /// depend on the target platform; an unsupported value is refused before
+    /// the subagent is spawned. Omit for the platform's own default.
+    pub effort: Option<String>,
     /// MCP servers to expose (by name). Empty/omitted = blind (no MCP).
     /// Include "canopy" to make the canopy server visible.
     pub mcp_servers: Option<Vec<String>>,

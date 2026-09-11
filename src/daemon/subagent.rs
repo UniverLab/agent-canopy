@@ -48,6 +48,39 @@ impl SubagentResult {
     }
 }
 
+/// Resolve how `effort` applies on `platform` before any process is spawned.
+///
+/// `Ok(None)`: no effort requested, or the platform accepts this value —
+/// spawn normally. `Ok(Some(reason))`: the platform declares no way to
+/// express effort at all — spawn anyway, but the caller must surface
+/// `reason` in the spawn result (FR3: ignored, not dropped, not fatal).
+/// `Err(reason)`: the platform DOES declare effort support but rejects this
+/// specific value — refused here, before any process starts, so spawning it
+/// costs nothing.
+fn resolve_effort_for_spawn(
+    strategy: &crate::domain::cli_strategy::CliStrategy,
+    platform: &str,
+    effort: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(value) = effort else {
+        return Ok(None);
+    };
+    let declares_support = strategy
+        .effort_declaration
+        .as_ref()
+        .is_some_and(|d| !d.values.is_empty());
+    let reason = crate::domain::cli_config::effort_rejection_reason(
+        strategy.effort_declaration.as_ref(),
+        platform,
+        value,
+    );
+    match reason {
+        None => Ok(None),
+        Some(reason) if declares_support => Err(anyhow::anyhow!(reason)),
+        Some(reason) => Ok(Some(reason)),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn spawn_subagent(
     db: &Arc<Database>,
@@ -58,9 +91,11 @@ pub async fn spawn_subagent(
     mcp_servers: &[String],
     timeout_minutes: u64,
     ttl_minutes: u64,
-) -> Result<String> {
+    effort: Option<&str>,
+) -> Result<(String, Option<String>)> {
     let cli = Cli::resolve(Some(platform_name)).map_err(|e| anyhow::anyhow!(e))?;
     let strategy = cli.strategy();
+    let effort_not_applied = resolve_effort_for_spawn(&strategy, platform_name, effort)?;
 
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
@@ -100,6 +135,7 @@ pub async fn spawn_subagent(
         model,
         Some(workdir),
         mcp_config_arg,
+        effort,
     )?;
 
     command.stdout(std::process::Stdio::piped());
@@ -185,7 +221,7 @@ pub async fn spawn_subagent(
         let _ = std::fs::remove_file(&config_path);
     });
 
-    Ok(run_id)
+    Ok((run_id, effort_not_applied))
 }
 
 pub fn collect_subagent(db: &Arc<Database>, id: &str) -> Result<Option<SubagentResult>> {
@@ -201,4 +237,82 @@ fn find_platform(cli: &Cli) -> Result<Platform> {
         .into_iter()
         .find(|p| p.name == cli.as_str())
         .ok_or_else(|| anyhow::anyhow!("Platform '{}' not found in registry", cli.as_str()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::cli_config::EffortDeclaration;
+    use crate::domain::cli_strategy::CliStrategy;
+    use std::collections::HashMap;
+
+    fn strategy_with_declaration(decl: Option<EffortDeclaration>) -> CliStrategy {
+        CliStrategy {
+            binary: "/usr/local/bin/test-cli".to_string(),
+            headless_mode: String::new(),
+            model_flag: None,
+            supports_working_dir: false,
+            working_dir_flag: None,
+            env_vars: HashMap::new(),
+            prompt_via_stdin: false,
+            session_id_set_flag: None,
+            session_list_cmd: None,
+            session_list_format_args: None,
+            session_id_pattern: None,
+            session_resume_cmd: None,
+            trust_flag: None,
+            invocation_template: None,
+            effort_declaration: decl,
+        }
+    }
+
+    #[test]
+    fn resolve_effort_for_spawn_none_requested_is_noop() {
+        let strategy = strategy_with_declaration(None);
+        assert_eq!(
+            resolve_effort_for_spawn(&strategy, "claude", None).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_effort_for_spawn_unsupported_platform_spawns_with_notice() {
+        let strategy = strategy_with_declaration(None);
+        let notice = resolve_effort_for_spawn(&strategy, "opencode", Some("high")).unwrap();
+        assert!(notice.unwrap().contains("does not support effort"));
+    }
+
+    #[test]
+    fn resolve_effort_for_spawn_empty_values_spawns_with_notice() {
+        let strategy = strategy_with_declaration(Some(EffortDeclaration {
+            form: Some(String::new()),
+            values: vec![],
+        }));
+        let notice = resolve_effort_for_spawn(&strategy, "cline", Some("high")).unwrap();
+        assert!(notice.unwrap().contains("does not support effort"));
+    }
+
+    #[test]
+    fn resolve_effort_for_spawn_accepted_value_applies_cleanly() {
+        let strategy = strategy_with_declaration(Some(EffortDeclaration {
+            form: Some("--effort".to_string()),
+            values: vec!["low".to_string(), "medium".to_string(), "high".to_string()],
+        }));
+        assert_eq!(
+            resolve_effort_for_spawn(&strategy, "claude", Some("high")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_effort_for_spawn_rejected_value_is_refused_before_spawn() {
+        let strategy = strategy_with_declaration(Some(EffortDeclaration {
+            form: Some("--effort".to_string()),
+            values: vec!["low".to_string(), "medium".to_string(), "high".to_string()],
+        }));
+        let err = resolve_effort_for_spawn(&strategy, "claude", Some("ultra")).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("not in platform's accepted values"));
+    }
 }

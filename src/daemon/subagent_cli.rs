@@ -13,6 +13,8 @@ pub(crate) enum SubagentAction {
         cli: Option<String>,
         #[arg(long)]
         model: Option<String>,
+        #[arg(long)]
+        effort: Option<String>,
         #[arg(long = "mcp-server")]
         mcp_servers: Vec<String>,
         #[arg(long = "timeout", default_value = "15")]
@@ -40,6 +42,7 @@ pub(crate) async fn handle_subagent_action(
             prompt,
             cli,
             model,
+            effort,
             mcp_servers,
             timeout_minutes,
             ttl_minutes,
@@ -54,6 +57,9 @@ pub(crate) async fn handle_subagent_action(
             }
             if let Some(model) = model {
                 args["model"] = serde_json::json!(model);
+            }
+            if let Some(effort) = effort {
+                args["effort"] = serde_json::json!(effort);
             }
             if !mcp_servers.is_empty() {
                 args["mcp_servers"] = serde_json::json!(mcp_servers);

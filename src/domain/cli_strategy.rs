@@ -274,8 +274,9 @@ impl CliStrategy {
         model: Option<&str>,
         working_dir: Option<&str>,
         mcp_config_path: Option<&str>,
+        effort: Option<&str>,
     ) -> Result<Command> {
-        self.build_headless_command(prompt, model, working_dir, None, mcp_config_path, None)
+        self.build_headless_command(prompt, model, working_dir, None, mcp_config_path, effort)
     }
 
     /// Build a headless command that RESUMES an existing session by id (RS2).
@@ -1693,5 +1694,28 @@ mod tests {
         let argv = s.build_argv_from_template(template, "hello", None, None, None, None, None);
         assert!(!argv.iter().any(|w| w.contains("mcp")));
         assert_eq!(argv, vec!["-p", "hello"]);
+    }
+
+    #[test]
+    fn build_command_with_mcp_config_with_effort_reaches_argv() {
+        let template = "-p {{prompt}} --mcp-config {{mcp_config}} --effort {{effort}}";
+        let s = strategy_with_template(template);
+        let cmd = s
+            .build_command_with_mcp_config("hello", None, None, Some("/tmp/mcp.json"), Some("high"))
+            .unwrap();
+        let cmd_str = format!("{:?}", cmd);
+        assert!(cmd_str.contains("--effort"));
+        assert!(cmd_str.contains("high"));
+    }
+
+    #[test]
+    fn build_command_with_mcp_config_without_effort_elides_flag() {
+        let template = "-p {{prompt}} --mcp-config {{mcp_config}} --effort {{effort}}";
+        let s = strategy_with_template(template);
+        let cmd = s
+            .build_command_with_mcp_config("hello", None, None, Some("/tmp/mcp.json"), None)
+            .unwrap();
+        let cmd_str = format!("{:?}", cmd);
+        assert!(!cmd_str.contains("--effort"));
     }
 }

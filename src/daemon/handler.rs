@@ -9005,6 +9005,7 @@ impl TaskTriggerHandler {
         let db = Arc::clone(&self.db);
         let prompt = params.prompt.clone();
         let model = params.model.clone();
+        let effort = params.effort.clone();
         let workdir_clone = workdir.clone();
 
         match crate::daemon::subagent::spawn_subagent(
@@ -9016,15 +9017,19 @@ impl TaskTriggerHandler {
             &mcp_servers,
             timeout_minutes,
             ttl_minutes,
+            effort.as_deref(),
         )
         .await
         {
-            Ok(id) => {
-                let result = serde_json::json!({
+            Ok((id, effort_not_applied)) => {
+                let mut result = serde_json::json!({
                     "id": id,
                     "status": "running",
                     "handle": id,
                 });
+                if let Some(reason) = effort_not_applied {
+                    result["effort_not_applied"] = serde_json::json!(reason);
+                }
                 Ok(CallToolResult::success(vec![Content::text(
                     serde_json::to_string_pretty(&result).unwrap_or_default(),
                 )]))
@@ -9179,12 +9184,13 @@ async fn spawn_preflight_reviewer(
             &["canopy".to_string()],
             15,
             60,
+            None,
         )
         .await
     })
     .await;
     match spawned {
-        Ok(Ok(id)) => serde_json::json!({
+        Ok(Ok((id, _))) => serde_json::json!({
             "status": "running",
             "id": id,
             "platform": platform,
