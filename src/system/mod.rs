@@ -248,6 +248,30 @@ fn read_boot_id_from(path: &Path) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// Whether `pid` refers to a live process on this host.
+///
+/// `kill(pid, 0)`: `0` means it exists and is ours; `EPERM` means it exists
+/// but is owned by another user (still alive from our point of view);
+/// `ESRCH` means it's gone. Sends no signal, touches no PTY, wakes nothing —
+/// safe to call from a read-only surface. Mirrors the private helper in
+/// `tui::app` that the session-resume path uses; kept separate so the daemon
+/// handler need not depend on the TUI module.
+#[cfg(unix)]
+pub fn process_is_alive(pid: i64) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Non-Unix hosts: no cheap liveness probe, so report "not alive" and let
+/// callers treat the session as unattached.
+#[cfg(not(unix))]
+pub fn process_is_alive(_pid: i64) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,5 +494,27 @@ mod tests {
         assert!(gpu.vram_total.is_none());
         assert!(gpu.power_watts.is_none());
         assert!(gpu.power_limit_watts.is_none());
+    }
+
+    #[test]
+    fn process_is_alive_true_for_own_pid() {
+        if cfg!(unix) {
+            assert!(process_is_alive(std::process::id() as i64));
+        }
+    }
+
+    #[test]
+    fn process_is_alive_false_for_unused_pid() {
+        if cfg!(unix) {
+            assert!(!process_is_alive(999_999_999));
+        }
+    }
+
+    #[test]
+    fn process_is_alive_false_for_nonpositive() {
+        if cfg!(unix) {
+            assert!(!process_is_alive(0));
+            assert!(!process_is_alive(-1));
+        }
     }
 }

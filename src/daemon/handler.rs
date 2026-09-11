@@ -48,6 +48,7 @@ use crate::daemon::helpers::{data_dir, error_result, notify_run_result, success_
 use crate::daemon::params::*;
 use crate::daemon::params_extract::Parameters;
 use crate::db::intelligence::IntelligenceNodeRecord;
+use crate::db::session::InteractiveSession;
 use crate::db::Database;
 use crate::domain::blueprints::{merge_blueprint_config, validate_blueprint_deletable, Blueprint};
 use crate::domain::loops::{
@@ -91,6 +92,17 @@ pub(crate) const MCP_RESULT_BUDGET_BYTES: usize = 32_000;
 /// against longer-than-average names.
 const SPEC_LIST_COMPACT_ROW_BYTES: usize = 200;
 
+/// Default `session_list` page derived from the MCP result budget. The
+/// compact row estimate leaves room for long names while keeping the default
+/// response within the result budget.
+const SESSION_LIST_COMPACT_ROW_BYTES: usize = 160;
+pub(crate) const SESSION_LIST_DEFAULT_LIMIT: u32 =
+    MCP_RESULT_BUDGET_BYTES as u32 / SESSION_LIST_COMPACT_ROW_BYTES as u32;
+const _: () = assert!(
+    SESSION_LIST_DEFAULT_LIMIT >= 1 && SESSION_LIST_DEFAULT_LIMIT <= 200,
+    "session_list default page must stay within [1, 200]"
+);
+
 /// Default `spec_list` page derived from the budget, not a round number:
 /// `MCP_RESULT_BUDGET_BYTES / SPEC_LIST_COMPACT_ROW_BYTES`, clamped to
 /// `[1, 200]` like `loop_node_runs_list` (the quotient is 160, so the upper
@@ -104,6 +116,26 @@ const _: () = assert!(
 
 fn missing_sync_identity_error() -> McpError {
     McpError::invalid_params(MISSING_SYNC_IDENTITY_MESSAGE.to_string(), None)
+}
+
+/// Whether an interactive session is attached to a live CLI process on this
+/// host right now (CM16). `true` only when provable: the row was recorded on
+/// the current boot AND its PID is still alive. A different boot id, a NULL
+/// boot id, or a missing/dead PID all read as `false` — the session may
+/// still be a valid hook target (an enqueued send is delivered when a TUI
+/// next attaches), it just is not attached at this moment. Side-effect-free:
+/// no PTY touched, no session woken.
+fn session_is_attached(session: &InteractiveSession) -> bool {
+    match (
+        session.boot_id.as_deref(),
+        crate::system::boot_id().as_deref(),
+    ) {
+        (Some(stored), Some(current)) if stored == current => session
+            .pid
+            .map(crate::system::process_is_alive)
+            .unwrap_or(false),
+        _ => false,
+    }
 }
 
 pub(crate) fn validate_non_empty(value: &str, field: &str) -> Result<(), String> {
@@ -2926,6 +2958,77 @@ impl TaskTriggerHandler {
             ));
         }
 
+        Ok(CallToolResult::success(vec![Content::text(
+            lines.join("\n"),
+        )]))
+    }
+
+    fn format_session_info(session: &InteractiveSession) -> String {
+        let attached = if session_is_attached(session) {
+            "yes"
+        } else {
+            "no"
+        };
+        let hook_target = if session.status == "active" {
+            "yes".to_string()
+        } else {
+            format!(
+                "no (status: {} — an interactive hook rejects this id until the session is live again)",
+                session.status
+            )
+        };
+        format!(
+            "- id: {} | name: {} | platform: {} | workdir: {} | attached: {} | hook_target: {}",
+            session.id, session.name, session.cli, session.working_dir, attached, hook_target
+        )
+    }
+
+    /// List interactive sessions that an interactive hook can address.
+    #[tool(
+        name = "session_list",
+        description = "List live interactive sessions with the exact ids an interactive loop hook's target_session_id accepts. Pass session_id to look one up; read-only, no session is woken."
+    )]
+    async fn session_list(
+        &self,
+        Parameters(params): Parameters<SessionListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = params
+            .limit
+            .unwrap_or(SESSION_LIST_DEFAULT_LIMIT)
+            .clamp(1, 200) as i64;
+
+        let session_id = params.session_id.as_deref().map(str::trim);
+        if let Some(session_id) = session_id {
+            if session_id.is_empty() {
+                return Ok(error_result("No session found with ID ''"));
+            }
+
+            let session = self
+                .db
+                .get_hookable_session(session_id)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let Some(session) = session else {
+                return Ok(error_result(&format!(
+                    "No session found with ID '{session_id}'"
+                )));
+            };
+
+            return Ok(success_result(&Self::format_session_info(&session)));
+        }
+
+        let sessions = self
+            .db
+            .list_hookable_sessions(limit)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        if sessions.is_empty() {
+            return Ok(success_result("No live interactive sessions found."));
+        }
+
+        let mut lines = vec![format!(
+            "Found {} live interactive session(s):\n",
+            sessions.len()
+        )];
+        lines.extend(sessions.iter().map(Self::format_session_info));
         Ok(CallToolResult::success(vec![Content::text(
             lines.join("\n"),
         )]))
@@ -8559,7 +8662,6 @@ impl TaskTriggerHandler {
         Parameters(params): Parameters<GetToolsParams>,
         OptionalExtension(parts): OptionalExtension<Parts>,
     ) -> Result<CallToolResult, McpError> {
-        self.reject_if_nursery(parts.as_ref())?;
         let scope = params.scope.trim().to_lowercase();
         if !matches!(
             scope.as_str(),
@@ -8570,7 +8672,11 @@ impl TaskTriggerHandler {
             ));
         }
 
-        let out = if scope == "file_write" {
+        if self.resolve_sync_agent_id(parts.as_ref()).is_ok() {
+            self.reject_if_nursery(parts.as_ref())?;
+        }
+
+        let mut out = if scope == "file_write" {
             let mut result = build_get_tools_response(&scope);
             if let Some(obj) = result.as_object_mut() {
                 obj.insert(
@@ -8582,6 +8688,21 @@ impl TaskTriggerHandler {
         } else {
             build_get_tools_response(&scope)
         };
+
+        if scope == "session_start" {
+            if let Some(obj) = out.as_object_mut() {
+                if let Ok(session_id) = self.resolve_sync_agent_id(parts.as_ref()) {
+                    obj.insert("session_id".to_string(), serde_json::json!(session_id));
+                    obj.insert(
+                        "session_hint".to_string(),
+                        serde_json::json!(format!(
+                            "Your interactive session id is '{}'. It is the exact string an interactive loop hook's 'target_session_id' accepts. Call session_list to see every live session.",
+                            session_id
+                        )),
+                    );
+                }
+            }
+        }
 
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&out).unwrap_or_default(),
@@ -18072,6 +18193,182 @@ mod endpoint_tests {
         assert!(text(&result).contains("No agents registered"));
     }
 
+    #[tokio::test]
+    async fn session_list_round_trip_id_is_hook_acceptable() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        db.insert_interactive_session(
+            "s-live",
+            "boletus",
+            "opencode",
+            "/tmp",
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+
+        let result = handler
+            .session_list(Parameters(SessionListParams {
+                session_id: None,
+                limit: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&result), "{}", text(&result));
+        let out = raw_text(&result);
+        let listed_id = out
+            .lines()
+            .find_map(|line| line.strip_prefix("- id: "))
+            .and_then(|line| line.split(" | ").next())
+            .expect("session id line");
+        assert_eq!(listed_id, "s-live");
+        assert!(db
+            .get_active_sessions()
+            .unwrap()
+            .iter()
+            .any(|session| session.id == listed_id));
+    }
+
+    #[tokio::test]
+    async fn session_list_active_session_without_live_tui_is_marked_unattached_but_targetable() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        db.insert_interactive_session(
+            "s-unattached",
+            "unattached",
+            "claude",
+            "/tmp",
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+
+        let result = handler
+            .session_list(Parameters(SessionListParams {
+                session_id: None,
+                limit: None,
+            }))
+            .await
+            .unwrap();
+        let out = raw_text(&result);
+        assert!(out.contains("s-unattached"));
+        assert!(out.contains("attached: no"));
+        assert!(out.contains("hook_target: yes"));
+    }
+
+    #[tokio::test]
+    async fn session_list_attached_session_is_marked_attached() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        let Some(boot) = crate::system::boot_id() else {
+            return;
+        };
+        db.insert_interactive_session(
+            "s-attached",
+            "attached",
+            "claude",
+            "/tmp",
+            None,
+            Some(std::process::id() as i64),
+            "interactive",
+            Some(&boot),
+        )
+        .unwrap();
+
+        let result = handler
+            .session_list(Parameters(SessionListParams {
+                session_id: None,
+                limit: None,
+            }))
+            .await
+            .unwrap();
+        let out = raw_text(&result);
+        assert!(out.contains("s-attached"), "{out}");
+        assert!(out.contains("attached: yes"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn session_list_lookup_returns_verbatim_hookable_id() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        db.insert_interactive_session(
+            "agent-7f3a",
+            "boletus",
+            "opencode",
+            "/tmp/w",
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+
+        let result = handler
+            .session_list(Parameters(SessionListParams {
+                session_id: Some("  agent-7f3a  ".to_string()),
+                limit: None,
+            }))
+            .await
+            .unwrap();
+        assert!(!is_err(&result));
+        let out = raw_text(&result);
+        assert!(out.contains("id: agent-7f3a "), "{out}");
+        assert!(db
+            .get_active_sessions()
+            .unwrap()
+            .iter()
+            .any(|s| s.id == "agent-7f3a"));
+    }
+
+    #[tokio::test]
+    async fn session_list_unknown_id_is_not_found() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let result = handler
+            .session_list(Parameters(SessionListParams {
+                session_id: Some("nope".to_string()),
+                limit: None,
+            }))
+            .await
+            .unwrap();
+        assert!(is_err(&result));
+        let out = text(&result);
+        assert!(out.contains("No session found"));
+        assert!(out.contains("nope"));
+    }
+
+    #[tokio::test]
+    async fn session_list_omits_args_and_output() {
+        let (_dir, db, handler) = endpoint_test_handler();
+        db.insert_interactive_session(
+            "s-cloak",
+            "private",
+            "opencode",
+            "/tmp",
+            Some("--token secret"),
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+
+        let result = handler
+            .session_list(Parameters(SessionListParams {
+                session_id: None,
+                limit: None,
+            }))
+            .await
+            .unwrap();
+        let out = raw_text(&result);
+        // The session is listed (otherwise the assertions below pass
+        // vacuously)…
+        assert!(out.contains("id: s-cloak"), "{out}");
+        assert!(out.contains("name: private"), "{out}");
+        // …but its launch args / secrets never appear in the row.
+        assert!(!out.contains("secret"), "{out}");
+        assert!(!out.contains("--token"), "{out}");
+        assert!(!out.contains("args"), "{out}");
+    }
+
     // ── task_remove / agent_remove ───────────────────────────────
 
     #[tokio::test]
@@ -24044,6 +24341,14 @@ mod endpoint_tests {
             }
             AgentIdVar { prev }
         }
+
+        fn clear() -> Self {
+            let prev = std::env::var_os(crate::shared::sync_identity::CANOPY_AGENT_ID_ENV);
+            unsafe {
+                std::env::remove_var(crate::shared::sync_identity::CANOPY_AGENT_ID_ENV);
+            }
+            AgentIdVar { prev }
+        }
     }
 
     impl Drop for AgentIdVar {
@@ -24875,6 +25180,52 @@ mod endpoint_tests {
             .unwrap();
         assert!(!is_err(&session_start));
         assert!(raw_text(&session_start).contains("session_start"));
+    }
+
+    #[tokio::test]
+    async fn get_tools_session_start_carries_own_session_id() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let _agent_guard = AgentIdVar::set("agent-session-start-1");
+
+        let result = handler
+            .get_tools(
+                Parameters(GetToolsParams {
+                    scope: "session_start".to_string(),
+                    path: None,
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+
+        assert!(!is_err(&result), "{}", text(&result));
+        let value: serde_json::Value = serde_json::from_str(&raw_text(&result)).unwrap();
+        assert_eq!(value["session_id"].as_str(), Some("agent-session-start-1"));
+        assert!(value["session_hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("target_session_id")));
+    }
+
+    #[tokio::test]
+    async fn get_tools_without_sync_identity_still_returns_protocol() {
+        let (_dir, _db, handler) = endpoint_test_handler();
+        let _agent_guard = AgentIdVar::clear();
+
+        let result = handler
+            .get_tools(
+                Parameters(GetToolsParams {
+                    scope: "session_start".to_string(),
+                    path: None,
+                }),
+                OptionalExtension(None),
+            )
+            .await
+            .unwrap();
+
+        assert!(!is_err(&result), "{}", text(&result));
+        let value: serde_json::Value = serde_json::from_str(&raw_text(&result)).unwrap();
+        assert_eq!(value["scope"].as_str(), Some("session_start"));
+        assert!(value.get("session_id").is_none());
     }
 
     // ── project_search / project_update ─────────────────────────

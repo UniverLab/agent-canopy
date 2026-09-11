@@ -1,12 +1,12 @@
 ---
 title: MCP Tools
-description: All 83 MCP tools exposed by the canopy daemon, by category.
+description: All 84 MCP tools exposed by the canopy daemon, by category.
 order: 11
 ---
 
 # MCP Tools
 
-The daemon exposes **83 MCP tools** over Streamable HTTP (port 7755) and
+The daemon exposes **84 MCP tools** over Streamable HTTP (port 7755) and
 stdio. Connect any MCP-capable AI CLI with `canopy mcp`.
 
 ## Agent management (14)
@@ -129,4 +129,10 @@ readable until `spec_convert` migrates them.
 
 | Tool | Description |
 |---|---|
-| `get_tools` | Scope-sensitive action protocols with recommended tool sets |
+| `get_tools` | Scope-sensitive action protocols with recommended tool sets; the `session_start` scope also returns the caller's own session id |
+
+## Interactive sessions (1)
+
+| Tool | Description |
+|---|---|
+| `session_list` | List live interactive sessions with the exact ids an interactive loop hook's `target_session_id` accepts, each with platform, workdir, name, and whether a TUI is attached; pass `session_id` to look one up |

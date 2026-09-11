@@ -1113,6 +1113,14 @@ pub struct LoopArchiveParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SessionListParams {
+    /// Exact session id to look up. Omit to list live sessions.
+    pub session_id: Option<String>,
+    /// Max rows when listing. Defaults to fit the result budget, capped at 200.
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LoopRestoreParams {
     /// Loop ID to restore from the archive back to the main list.
     pub loop_id: String,

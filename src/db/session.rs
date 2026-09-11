@@ -124,6 +124,76 @@ impl Database {
         Ok(rows)
     }
 
+    /// List sessions an interactive hook can target (CM16): rows with
+    /// `status = 'active'`, excluding bridge sidecars. This is byte-for-byte
+    /// the acceptance set `execute_interactive_hook` enforces (via
+    /// `get_active_sessions`), so every id returned here is hook-acceptable.
+    /// Read-only; touches no PTY and wakes no session. Most-recent-first,
+    /// capped at `limit` rows.
+    ///
+    /// NOTE: `status = 'active'` does NOT mean a TUI is attached right now —
+    /// attachment lives in TUI-process memory, not in this table, and a row
+    /// stays `active` with no TUI running. The hook contract already promises
+    /// an enqueued send is delivered when a TUI later starts, so such rows
+    /// are legitimate targets and are listed with `hook_target: yes` by the
+    /// `session_list` surface.
+    pub fn list_hookable_sessions(&self, limit: i64) -> Result<Vec<InteractiveSession>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, cli, working_dir, args, started_at, status, session_type, pid, boot_id
+             FROM interactive_sessions WHERE status = 'active' AND session_type != 'bridge'
+             ORDER BY started_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit], |row| {
+                Ok(InteractiveSession {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    cli: row.get(2)?,
+                    working_dir: row.get(3)?,
+                    args: row.get(4)?,
+                    started_at: row.get(5)?,
+                    status: row.get(6)?,
+                    session_type: row.get(7)?,
+                    pid: row.get(8)?,
+                    boot_id: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Fetch one hook-addressable session by id (CM16): any status, but never
+    /// bridge sidecars (MCP harness proxies, never hook targets). Returns
+    /// `None` for unknown ids AND for bridge ids, letting the caller report a
+    /// clear not-found. Read-only; touches no PTY and wakes no session.
+    pub fn get_hookable_session(&self, id: &str) -> Result<Option<InteractiveSession>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, cli, working_dir, args, started_at, status, session_type, pid, boot_id
+             FROM interactive_sessions WHERE id = ?1 AND session_type != 'bridge'",
+        )?;
+        let result = match stmt.query_row(params![id], |row| {
+            Ok(InteractiveSession {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                cli: row.get(2)?,
+                working_dir: row.get(3)?,
+                args: row.get(4)?,
+                started_at: row.get(5)?,
+                status: row.get(6)?,
+                session_type: row.get(7)?,
+                pid: row.get(8)?,
+                boot_id: row.get(9)?,
+            })
+        }) {
+            Ok(session) => Some(session),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e.into()),
+        };
+        Ok(result)
+    }
+
     /// Get all sessions with status = 'orphaned', excluding bridge sidecars.
     ///
     /// Populates the TUI's orphaned-sessions dialog, which lets the user
@@ -534,6 +604,98 @@ mod tests {
         let db = test_db();
         let sessions = db.get_orphaned_sessions().unwrap();
         assert!(sessions.is_empty());
+    }
+
+    // ── list_hookable_sessions / get_hookable_session (CM16) ───────────
+
+    #[test]
+    fn list_hookable_sessions_returns_only_active_non_bridge() {
+        let db = test_db();
+        db.insert_interactive_session(
+            "hook-live",
+            "boletus",
+            "opencode",
+            "/tmp/proj",
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+        db.insert_interactive_session(
+            "hook-done",
+            "done-name",
+            "opencode",
+            "/tmp/proj",
+            None,
+            None,
+            "interactive",
+            None,
+        )
+        .unwrap();
+        db.finish_interactive_session("hook-done", 0).unwrap();
+        db.insert_interactive_session(
+            "hook-sidecar",
+            "sidecar",
+            "opencode",
+            "/tmp/proj",
+            None,
+            None,
+            "bridge",
+            None,
+        )
+        .unwrap();
+
+        let sessions = db.list_hookable_sessions(200).unwrap();
+        assert_eq!(sessions.len(), 1);
+        let s = &sessions[0];
+        assert_eq!(s.id, "hook-live");
+        assert_eq!(s.name, "boletus");
+        assert_eq!(s.cli, "opencode");
+        assert_eq!(s.working_dir, "/tmp/proj");
+        assert_eq!(s.status, "active");
+        // Same acceptance set the interactive hook enforces: the listed id
+        // must be present in get_active_sessions.
+        let active = db.get_active_sessions().unwrap();
+        assert!(active.iter().any(|a| a.id == s.id));
+    }
+
+    #[test]
+    fn get_hookable_session_unknown_returns_none() {
+        let db = test_db();
+        db.insert_interactive_session(
+            "hook-sidecar",
+            "sidecar",
+            "opencode",
+            "/tmp",
+            None,
+            None,
+            "bridge",
+            None,
+        )
+        .unwrap();
+        assert!(db.get_hookable_session("missing-id").unwrap().is_none());
+        assert!(db.get_hookable_session("hook-sidecar").unwrap().is_none());
+    }
+
+    #[test]
+    fn list_hookable_sessions_respects_limit() {
+        let db = test_db();
+        for i in 0..3 {
+            db.insert_interactive_session(
+                &format!("s{i}"),
+                &format!("n{i}"),
+                "opencode",
+                "/tmp",
+                None,
+                None,
+                "interactive",
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!(db.list_hookable_sessions(2).unwrap().len(), 2);
+        assert_eq!(db.list_hookable_sessions(200).unwrap().len(), 3);
     }
 
     // ── get_resumable_sessions (C25 regression) ────────────────────
